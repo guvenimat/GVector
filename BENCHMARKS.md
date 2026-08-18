@@ -1,5 +1,35 @@
 # Benchmark Kayıtları
 
+## Segment sayısı × latency/recall eğrisi — 2026-08-18 (SIFT 100K, filtresiz, ef=50)
+
+Merge politikası girdisi: aynı veri farklı seal eşikleriyle bölündü.
+
+| segment | p50 | p99 | recall@10 | inşa |
+|---------|-----|-----|-----------|------|
+| 1 | 57.3µs | 99.2µs | 0.9889 | 16.4s |
+| 2 | 110µs | 177µs | 0.9980 | 12.0s |
+| 4 | 197.9µs | 321.9µs | 1.0000 | 10.1s |
+| 5 | 272.2µs | 557.1µs | 1.0000 | 9.8s |
+| 8 | 385.3µs | 596µs | 1.0000 | 8.9s |
+| 10 | 466µs | 705.8µs | 1.0000 | 8.4s |
+
+Okumalar:
+- Eğri hafif alt-doğrusal ama doğrusala yakın: segment başına ~+45µs
+  (10 segment = tek segmentin 8.1 katı, 10 katı değil). Küçük segmentin
+  kısalan gezintisi maliyeti tam telafi etmiyor çünkü her segment kendi
+  ef genişliğinde aranıyor.
+- Recall bonusu gerçek: 1 segment 0.9889, ≥4 segment 1.0000 (toplamda
+  5×ef aday havuzu). Merge bu bonusu geri öder.
+- **Adil karşılaştırma** (eşit ~0.998 recall'da): merge edilmiş tek indeks
+  ef=100 → 222µs (Aşama 2 süpürmesinden); 5 segment ef=50 → 272µs.
+  Tam merge'in net kazancı ~%20, naif "5x" değil. Merge acil DEĞİL.
+- İnşa süresi segment sayısıyla DÜŞÜYOR (16.4s → 8.4s): küçük graf ucuz
+  kurulum. Merge = yeniden inşa olduğundan (grafları birleştirmenin ucuz
+  yolu yok) yazma amplifikasyonu LSM'den pahalı → politika muhafazakâr
+  olmalı: segment sayısı tavanı (ör. 8–10) aşılınca en eski/küçük çifti
+  birleştir; her mühürlemede değil.
+
+
 ## Filtre seçicilik süpürmesi + planlayıcı — 2026-08-18 (SIFT, k=10, ef=50)
 
 Üç eşleşme dağılımı: uniform (id-uzayı), clustered (vektör-uzayı: merkezin

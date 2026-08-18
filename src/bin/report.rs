@@ -308,7 +308,8 @@ fn main() {
     let metric = Metric::L2; // SIFT literatürde L2 ile değerlendirilir
 
     let (base, queries, label) = match mode {
-        "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter" => {
+        "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter"
+        | "segcurve" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -345,6 +346,38 @@ fn main() {
 
     if mode == "filter" {
         filter_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "segcurve" {
+        // Segment sayısı × latency/recall eğrisi (merge politikası girdisi).
+        // Aynı veri farklı seal eşikleriyle bölünür; arama filtresiz.
+        use vector_gvector::index::segmented::SegmentedIndex;
+        let truth = ground_truth(&base, &queries, k, metric);
+        println!("| segment | p50 | p99 | recall@{k} | inşa |");
+        println!("|---------|-----|-----|-----------|------|");
+        for parts in [1usize, 2, 4, 5, 8, 10] {
+            let seal = base.len().div_ceil(parts);
+            let idx = SegmentedIndex::new(dim, metric, HnswParams::default(), seal);
+            let t = Instant::now();
+            for (i, v) in base.iter().enumerate() {
+                idx.insert_shared(VectorId(i as u64), v).expect("insert");
+            }
+            let build = t.elapsed();
+            let (n_seg, n_buf) = idx.shape();
+            let results: Vec<Vec<VectorId>> = queries
+                .iter()
+                .map(|q| idx.search_shared(q, k).iter().map(|r| r.id).collect())
+                .collect();
+            let recall = recall_at_k(&results, &truth, k);
+            let stats = measure_latency(&queries, |q| {
+                std::hint::black_box(idx.search_shared(q, k));
+            });
+            println!(
+                "| {n_seg} (+{n_buf} buffer) | {:?} | {:?} | {recall:.4} | {build:.1?} |",
+                stats.p50, stats.p99
+            );
+        }
         return;
     }
 
