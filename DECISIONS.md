@@ -1,5 +1,31 @@
 # Mimari Kararlar
 
+## Aşama 2 — 2026-08-18
+
+### 7. HNSW komşu seçimi: Algorithm 4 heuristic + keepPrunedConnections
+Naif top-M yerine makaledeki heuristic: aday, seçili bir komşuya query'den
+daha yakınsa elenir. Bu, küme içi gereksiz kenarları kırpıp kümeler arası
+köprüleri korur; recall'un veri kümelenmesine dayanıklılığı buradan gelir.
+Elenenlerle M'e tamamlama (keepPrunedConnections) açık — düşük dereceli
+node kalmasın diye.
+
+### 8. Budama sonrası graf yönlüdür
+`shrink_links` bir node'un listesini kırptığında karşı taraftaki kenar
+silinmez (hnswlib ile aynı davranış). Çift yönlülüğü zorlamak her budamada
+karşı listeleri de taramayı gerektirir ve pratik fayda sağlamaz; testler
+sadece derece limitini ve komşu geçerliliğini doğrular.
+
+### 9. Seviye ataması ve parametre varsayılanları
+`level = floor(-ln(U) * mL)`, `mL = 1/ln(M)` (makale 4.1 optimumu),
+`M_max0 = 2M`. Varsayılan M=16, ef_c=200. Süpürme sonucu tatlı nokta:
+M=16 + ef_search 25–50 (BENCHMARKS.md Aşama 2 tablosu).
+
+### 10. `search_layer`'da visited için `Vec<bool>`
+HashSet yerine slot başına bayrak: 100K node'da sorgu başına tek 100KB
+allocation, dallanma başına hash maliyeti yok. Eşzamanlılık aşamasında
+sorgu-yerel kaldığı için paylaşım sorunu yaratmaz.
+
+
 ## Aşama 0 — 2026-08-18
 
 ### 1. `VectorIndex::insert` imzası: `&mut self`

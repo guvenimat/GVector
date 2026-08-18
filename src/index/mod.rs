@@ -4,6 +4,7 @@
 //! Aşama 2: `hnsw`.
 
 pub mod bruteforce;
+pub mod hnsw;
 
 use crate::types::{SearchResult, VectorId};
 use thiserror::Error;
@@ -16,6 +17,8 @@ pub enum IndexError {
     DuplicateId(VectorId),
     #[error("id bulunamadı: {0:?}")]
     NotFound(VectorId),
+    #[error("desteklenmiyor: {0}")]
+    Unsupported(&'static str),
 }
 
 /// Tüm indeks implementasyonlarının ortak arayüzü.
