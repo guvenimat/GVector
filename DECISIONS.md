@@ -1,5 +1,76 @@
 # Mimari Kararlar
 
+## Aşama 9 ÖN-KAYIT — 2026-08-18 (Aşama 8 ölçümü KOŞULMADAN önce yazıldı)
+
+### 40. Go/no-go eşikleri ve kabul kriterleri
+Kural: eşikler ölçümden önce yazılır ve sonuç görüldükten sonra
+DEĞİŞTİRİLEMEZ. Hepsi aynı koşuda ölçülen bir **tabana oranlıdır**; tabanlar
+da burada tanımlı ki "hangi tabanı kullanalım" tartışması kapalı olsun.
+
+#### 9a — Merge'in bağımsız task'e alınması: KOŞULSUZ YAPILIR
+Eşik burada go/no-go kapısı DEĞİL, **kabul kriteridir**. Gerekçe: merge
+~250K kayıtlık yeniden inşa demek ve yazıcı task'ini bloke ediyor; 100K
+ölçümlerinden ekstrapole edilen pencere 10–40 s, yani herhangi bir makul
+eşik üç mertebe aşılacak. "Zaten belli" bir kapıya bütçe harcamak yerine
+ölçüm 9a'nın *gerekçesini* belgeler, eşik ise 9a'nın *başarısını* sınar.
+
+- **Taban:** merge penceresi DIŞINDA, aynı yük altında ölçülen yazma p99.
+- **Kabul (9a sonrası):** merge penceresine denk gelen yazmaların p99'u,
+  taban p99'un **50 katını aşmıyorsa** 9a başarılıdır. (50x ≈ 100–150 ms:
+  bir HTTP yazma isteğinde "yavaş ama kabul edilebilir"in üst sınırı.)
+  Aşıyorsa 9a **kabul edilmemiştir**, nedeni araştırılır.
+- **ASIL kabul kriteri latency değil, tombstone yarışıdır:** mühürlü segment
+  insert almaz ama delete (tombstone) alır. Merge sürerken kaynak
+  segmentlere düşen tombstone'lar, takas anında write kilidi altında
+  birleşiğe diff-replay edilmelidir. Bu yarış yanlışsa pencere kapansa bile
+  **sessizce veri kaybedilir** ve latency ölçümü bunu asla yakalamaz.
+  Bu senaryoya özel test 9a'nın birincil kabul koşuludur.
+
+#### 9b — mmap ile lazy load (unsafe izin kapısı)
+- **Taban:** 1M soğuk başlangıç süresi ve arama p50 (ef=50, filtresiz).
+- **Go (izin istenir) — İKİ koşul birlikte:**
+  1. Soğuk başlangıç **≥ %40** kısalmalı **ve** mutlak kazanç **≥ 2 s**
+     olmalı (yüzde küçük tabanda anlamsızlaşmasın diye ikinci çapa);
+  2. Arama p50 regresyonu **%10'u aşmamalı**.
+- **No-go:** koşullardan biri sağlanmazsa `unsafe` açılmaz,
+  `deny(unsafe_code)` crate genelinde kalır. **Yeniden bakma koşulu:**
+  vektör verisi RAM'e sığmaz hale gelirse (>%70 fiziksel bellek) mmap bir
+  optimizasyon değil gereklilik olur; eşik o noktada yeniden tanımlanır.
+- **Recall kuralı (eşik değil):** mmap aynı baytları farklı yoldan okur;
+  recall'ın değişmesi eşik meselesi değil **bug göstergesidir**. Fark
+  çıkarsa karar verilmez — **durulur ve hata bulunur**.
+
+#### 9c — Mühürlü segment metadata sıkıştırması
+- **Taban — konfigürasyon açıkça f32:** toplam indeks belleği = vektör +
+  graf, **f32 modunda** (sistemin varsayılan çalışma modu; `QuantizedHnsw`
+  segment modeline entegre değil). int8'de vektör payı 4x küçüldüğü için
+  aynı metadata otomatik olarak çok daha büyük bir oran tutardı — eşik iki
+  farklı sayı verirdi, bu yüzden taban sabitlendi.
+- **Ölçüm yöntemi:** eşik **hesaplanan** yapı boyutlarına göre değerlendirilir
+  (RSS'te metadata ayrıştırılamaz); RSS de raporlanır, aradaki fark
+  (allocator fragmentasyonu + Vec capacity payı) kendi başına bilgidir.
+- **Go:** metadata belleği toplam indeks belleğinin **%25'ini aşarsa**.
+  Gerekçe: bu oranın üstünde metadata, vektörlerin yanında ikinci sınıf bir
+  yolcu olmaktan çıkıp kapasite belirleyen kalem haline gelir.
+- **No-go:** %25'in altındaysa reddedilir. **Yeniden bakma koşulu:** sayısal
+  alan sayısı 3'ten fazlaya çıkarsa ya da 10M ölçeğine gidilirse (mutlak
+  bellek tavanı devreye girer) yeniden ölçülür.
+- 9c yapılırsa kendi kabul kriteri: kol örtüşmesi %100 kalmalı, filtre
+  recall'ı değişmemeli, mühürlemedeki O(n log n) dönüşüm maliyeti ölçülmeli.
+
+### 41. Aşama 8 ölçüm protokolü (eşiklerin ölçülebilirliği için)
+- **Merge penceresi:** pencerenin hem ÖNCESİNDE hem SONRASINDA birkaç bin op
+  toplanır; aksi halde taban p99 gürültüden ibaret olur. Merge, 9. segment
+  mühürlemesiyle kasten tetiklenir (tavan 8).
+- **Bellek:** hesaplanan boyutlar (vektör, graf, metadata yapıları ayrı ayrı)
+  + süreç RSS'i birlikte raporlanır.
+- **1M kaza testi:** Aşama 7'nin matrisi küçük veriyle koştu; 1M snapshot +
+  dolu WAL ile en az bir kesme senaryosu tekrarlanır — replay süresinin
+  155 ms/100K'dan doğrusal gidip gitmediği burada görülür.
+- **Karışık yük:** 8 okuyucu + 1 yazıcı × 3 fsync politikası. Bu, Aşama 5'in
+  "okuyucular asla durmaz" sözleşmesinin ilk gerçek sınavı: fsync beklemesi
+  okuyucu QPS'ine bindiriyorsa sözleşme pratikte zayıflamış demektir.
+
 ## Aşama 7b/7c — WAL ve kurtarma — 2026-08-18
 
 ### 36. HTTP 200 sözleşmesi politikaya göre tanımlıdır
