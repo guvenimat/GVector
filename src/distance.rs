@@ -41,24 +41,56 @@ impl Metric {
     }
 }
 
-/// İç çarpım.
+// SIMD notu: `map().sum()` float toplama sırasını korumak zorunda olduğundan
+// LLVM reduction'ı vektörleştiremez (ölçüm: 128d dot ~60 ns, target-cpu=native
+// ile bile). Açık f32x8 + iki akümülatör hem 8-yol SIMD hem ILP sağlar;
+// toplama sırası değişir ama mesafe karşılaştırmalarında ~1 ulp fark önemsizdir.
+// `wide` crate'i güvenli API sunar; #![deny(unsafe_code)] korunur.
+
+use wide::f32x8;
+
 #[inline]
-pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    // zip ile iterasyon: bounds check'leri optimizer'ın eleyebildiği,
-    // auto-vectorize edilebilen kanonik form.
-    a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
+fn as_f32x8(chunk: &[f32]) -> f32x8 {
+    f32x8::from(<[f32; 8]>::try_from(chunk).expect("8'lik parça"))
 }
 
-/// Kare L2 mesafesi.
+/// İç çarpım (f32x8 SIMD, 16 eleman/iterasyon).
+#[inline]
+pub fn dot(a: &[f32], b: &[f32]) -> f32 {
+    let mut acc0 = f32x8::ZERO;
+    let mut acc1 = f32x8::ZERO;
+    let mut ca = a.chunks_exact(16);
+    let mut cb = b.chunks_exact(16);
+    for (x, y) in (&mut ca).zip(&mut cb) {
+        acc0 += as_f32x8(&x[..8]) * as_f32x8(&y[..8]);
+        acc1 += as_f32x8(&x[8..]) * as_f32x8(&y[8..]);
+    }
+    let mut sum = (acc0 + acc1).reduce_add();
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        sum += x * y;
+    }
+    sum
+}
+
+/// Kare L2 mesafesi (f32x8 SIMD, 16 eleman/iterasyon).
 #[inline]
 pub fn l2_squared(a: &[f32], b: &[f32]) -> f32 {
-    a.iter()
-        .zip(b.iter())
-        .map(|(x, y)| {
-            let d = x - y;
-            d * d
-        })
-        .sum()
+    let mut acc0 = f32x8::ZERO;
+    let mut acc1 = f32x8::ZERO;
+    let mut ca = a.chunks_exact(16);
+    let mut cb = b.chunks_exact(16);
+    for (x, y) in (&mut ca).zip(&mut cb) {
+        let d0 = as_f32x8(&x[..8]) - as_f32x8(&y[..8]);
+        let d1 = as_f32x8(&x[8..]) - as_f32x8(&y[8..]);
+        acc0 += d0 * d0;
+        acc1 += d1 * d1;
+    }
+    let mut sum = (acc0 + acc1).reduce_add();
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        let d = x - y;
+        sum += d * d;
+    }
+    sum
 }
 
 /// Vektörü yerinde birim norma getirir.

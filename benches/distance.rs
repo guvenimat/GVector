@@ -19,6 +19,16 @@ fn bench_distances(c: &mut Criterion) {
     c.bench_function("cosine_prenormalized_128", |bch| {
         bch.iter(|| Metric::Cosine.distance(black_box(&an), black_box(&bn)))
     });
+
+    // ADC (quantize arama yolu) — f32 yollarla karşılaştırmak için
+    use vector_gvector::index::quant::ScalarQuantizer;
+    let base = random_vectors(100, 128, 43);
+    let quant = ScalarQuantizer::fit(base.iter().map(|v| v.as_slice()), 128);
+    let mut code = Vec::new();
+    quant.encode(b, &mut code);
+    c.bench_function("adc_l2_128", |bch| {
+        bch.iter(|| quant.dist(Metric::L2, black_box(a), black_box(&code)))
+    });
 }
 
 criterion_group!(benches, bench_distances);

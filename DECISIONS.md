@@ -1,5 +1,15 @@
 # Mimari Kararlar
 
+## SIMD — 2026-08-18
+
+### 25. Açık SIMD: `wide::f32x8`, unsafe'siz
+`std::simd` nightly istiyor, intrinsics unsafe istiyor; `wide` güvenli API
+ile ikisinden de kaçınıyor (`deny(unsafe_code)` korundu). Float toplama
+sırasının değişmesi bilinçli kabul: mesafeler yalnız karşılaştırılıyor,
+~1 ulp fark sonucu etkilemez. `target-cpu=native` .cargo/config.toml'da —
+binary taşınabilirliği yerine yerel performans (öğrenme projesi).
+
+
 ## Aşama 6 — 2026-08-18
 
 ### 22. Quantization mimarisi: f32 ile inşa, dondurup quantize et, ADC ile ara

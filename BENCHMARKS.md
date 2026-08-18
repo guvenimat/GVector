@@ -1,5 +1,33 @@
 # Benchmark Kayıtları
 
+## SIMD — 2026-08-18 (wide f32x8 + target-cpu=native)
+
+Micro (128d):
+
+| fonksiyon | önce | sonra | hızlanma |
+|---|---|---|---|
+| dot | 60.4 ns | 6.4 ns | 9.4x |
+| l2_squared | 65.2 ns | 7.4 ns | 8.8x |
+| ADC (quantize L2) | ~130 ns (skaler) | 15.6 ns | ~8x |
+
+Uçtan uca (SIFT 100K, M=16/ef_c=200):
+
+| ölçüm | önce | sonra |
+|---|---|---|
+| HNSW inşa | 40.4 s | 17.1 s |
+| HNSW p50 (ef=50) | 124.3 µs | 52.7 µs |
+| int8 p50 (ef=50) | 142.9 µs | 61.2 µs |
+| brute-force p50 (rayon) | 547 µs | 160 µs |
+| recall'lar | — | birebir aynı (determinizm korundu) |
+
+Not: `target-cpu=native` tek başına kazandırmadı — `map().sum()` float
+toplama sırası sabit olduğundan LLVM reduction'ı vektörleştiremiyor.
+Kazanç, açık f32x8 + çift akümülatörden geldi (sıra değişimi ~1 ulp fark
+yaratır, mesafe karşılaştırmasında önemsiz). Brute-force artık o kadar
+hızlı ki 100K'da HNSW'nin görünür "hızlanma çarpanı" düştü — iki taraf da
+aynı çekirdeği kullandığı için bu beklenen bir yeniden dengelenme.
+
+
 ## SIFT1M tam set — 2026-08-18 (stres testi, resmi ivecs ground truth)
 
 M=16, ef_c=200. İnşa: **802 s (13.4 dk)**, segment başına süre sabit

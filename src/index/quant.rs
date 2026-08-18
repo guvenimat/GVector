@@ -80,29 +80,63 @@ impl ScalarQuantizer {
 
     /// ADC mesafe: f32 query vs u8 kod, kod elemanları anlık dequantize edilir.
     /// distance modülündeki "küçük = yakın" sözleşmesine uyar.
+    ///
+    /// SIMD: dequantize (min + scale·kod) ve mesafe birikimi f32x8 şeritlerde;
+    /// u8→f32 dönüşümü 8'lik sabit boy diziyle yapılır ki derleyici cvt
+    /// komutlarına indirebilsin.
     #[inline]
     pub fn dist(&self, metric: Metric, query: &[f32], code: &[u8]) -> f32 {
+        use wide::f32x8;
         debug_assert_eq!(query.len(), code.len());
-        match metric {
-            Metric::L2 => {
-                let mut acc = 0.0f32;
-                for d in 0..code.len() {
-                    let x = self.mins[d] + self.scales[d] * code[d] as f32;
-                    let diff = query[d] - x;
-                    acc += diff * diff;
-                }
-                acc
+        #[inline]
+        fn f8(chunk: &[f32]) -> f32x8 {
+            f32x8::from(<[f32; 8]>::try_from(chunk).expect("8'lik parça"))
+        }
+        #[inline]
+        fn u8_to_f8(chunk: &[u8]) -> f32x8 {
+            let mut arr = [0.0f32; 8];
+            for (o, &c) in arr.iter_mut().zip(chunk) {
+                *o = c as f32;
             }
-            // Cosine sözleşmesi: kodlanan vektörler normalize edilmiş haliyle
-            // kodlandı, query'yi çağıran normalize eder → -dot yeterli.
-            Metric::Dot | Metric::Cosine => {
-                let mut acc = 0.0f32;
-                for d in 0..code.len() {
-                    let x = self.mins[d] + self.scales[d] * code[d] as f32;
-                    acc += query[d] * x;
-                }
-                -acc
+            f32x8::from(arr)
+        }
+        let mut acc = f32x8::ZERO;
+        let mut cq = query.chunks_exact(8);
+        let mut cc = code.chunks_exact(8);
+        let mut cm = self.mins.chunks_exact(8);
+        let mut cs = self.scales.chunks_exact(8);
+        let l2 = matches!(metric, Metric::L2);
+        for (((q, c), m), s) in (&mut cq).zip(&mut cc).zip(&mut cm).zip(&mut cs) {
+            let x = f8(m) + f8(s) * u8_to_f8(c);
+            if l2 {
+                let d = f8(q) - x;
+                acc += d * d;
+            } else {
+                acc += f8(q) * x;
             }
+        }
+        let mut sum = acc.reduce_add();
+        for (((q, c), m), s) in cq
+            .remainder()
+            .iter()
+            .zip(cc.remainder())
+            .zip(cm.remainder())
+            .zip(cs.remainder())
+        {
+            let x = m + s * *c as f32;
+            if l2 {
+                let d = q - x;
+                sum += d * d;
+            } else {
+                sum += q * x;
+            }
+        }
+        // Cosine sözleşmesi: kodlar normalize edilmiş vektörlerden üretildi,
+        // query'yi çağıran normalize eder → benzerlikler için -dot.
+        if l2 {
+            sum
+        } else {
+            -sum
         }
     }
 }
