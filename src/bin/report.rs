@@ -8,7 +8,7 @@
 //! kullanırken GT'yi exact taramayla kendimiz üretiriz (aksi yanlış recall verir).
 
 use std::time::Instant;
-use vector_gvector::dataset::{random_vectors, read_fvecs_subset, DEFAULT_SEED};
+use vector_gvector::dataset::{random_vectors, read_fvecs_subset, read_ivecs, DEFAULT_SEED};
 use vector_gvector::distance::Metric;
 use vector_gvector::eval::{ground_truth, measure_latency, recall_at_k};
 use vector_gvector::index::bruteforce::BruteForceIndex;
@@ -83,7 +83,7 @@ fn main() {
     let metric = Metric::L2; // SIFT literatürde L2 ile değerlendirilir
 
     let (base, queries, label) = match mode {
-        "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" => {
+        "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -172,6 +172,82 @@ fn main() {
             "compaction sonrası recall@{k} = {:.4}",
             recall_of(&hnsw, &bf)
         );
+        return;
+    }
+
+    if mode == "sift1m" {
+        // Tam 1M stres testi: resmi ground truth (sift_groundtruth.ivecs)
+        // burada GEÇERLİ — alt kümelerdeki gibi kendimiz üretmiyoruz.
+        use vector_gvector::index::quant::QuantizedHnsw;
+        let gt = read_ivecs(std::path::Path::new("data/sift/sift_groundtruth.ivecs"))
+            .expect("ground truth okunamadı");
+        let truth: Vec<Vec<VectorId>> = gt
+            .iter()
+            .take(queries.len())
+            .map(|row| row.iter().take(k).map(|&i| VectorId(i as u64)).collect())
+            .collect();
+        assert_eq!(truth.len(), queries.len(), "GT/query sayısı uyuşmalı");
+
+        let t = Instant::now();
+        let mut hnsw = HnswIndex::new(dim, metric, HnswParams::default());
+        for (i, v) in base.iter().enumerate() {
+            hnsw.insert(VectorId(i as u64), v).expect("insert");
+            if (i + 1) % 100_000 == 0 {
+                println!("  insert {} / {} ({:?})", i + 1, base.len(), t.elapsed());
+            }
+        }
+        println!("inşa: {:?} ({} vektör)", t.elapsed(), hnsw.len());
+        let (vmem, lmem) = hnsw.memory_bytes();
+        println!(
+            "bellek: vektör {:.0} MB + graf {:.0} MB (graf {:.0} B/vektör)",
+            vmem as f64 / 1048576.0,
+            lmem as f64 / 1048576.0,
+            lmem as f64 / base.len() as f64
+        );
+        for ef in [50, 100, 200] {
+            let results: Vec<Vec<VectorId>> = queries
+                .iter()
+                .map(|q| hnsw.search_with_ef(q, k, ef).iter().map(|r| r.id).collect())
+                .collect();
+            let recall = recall_at_k(&results, &truth, k);
+            let stats = measure_latency(&queries, |q| {
+                std::hint::black_box(hnsw.search_with_ef(q, k, ef));
+            });
+            println!(
+                "f32  ef={ef}: recall@{k}={recall:.4} p50={:?} p99={:?}",
+                stats.p50, stats.p99
+            );
+        }
+        let t = Instant::now();
+        let quant = QuantizedHnsw::from_hnsw(&hnsw);
+        drop(hnsw); // f32 kopyasını bırak: bellekte yalnız kodlar + graf kalır
+        println!("quantize: {:?}", t.elapsed());
+        let (cmem, qlmem) = quant.memory_bytes();
+        println!(
+            "quantize bellek: kod {:.0} MB + graf {:.0} MB",
+            cmem as f64 / 1048576.0,
+            qlmem as f64 / 1048576.0
+        );
+        for ef in [50, 100, 200] {
+            let results: Vec<Vec<VectorId>> = queries
+                .iter()
+                .map(|q| {
+                    quant
+                        .search_with_ef(q, k, ef)
+                        .iter()
+                        .map(|r| r.id)
+                        .collect()
+                })
+                .collect();
+            let recall = recall_at_k(&results, &truth, k);
+            let stats = measure_latency(&queries, |q| {
+                std::hint::black_box(quant.search_with_ef(q, k, ef));
+            });
+            println!(
+                "int8 ef={ef}: recall@{k}={recall:.4} p50={:?} p99={:?}",
+                stats.p50, stats.p99
+            );
+        }
         return;
     }
 
