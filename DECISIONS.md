@@ -1,5 +1,43 @@
 # Mimari Kararlar
 
+## Filtre planlayıcısı — 2026-08-18
+
+### 28. Ölçüm bulgusu: kırılganlık recall'da değil latency'de (#26 revizyonu)
+Seçicilik süpürmesi (BENCHMARKS, filtre bölümü) hipotezin tersini gösterdi:
+gezinti-içi filtre recall'u KORUYOR (en kötü hücre 0.952) çünkü kabul kümesi
+dolana dek genişlemeye devam ediyor — bedeli, kümelenmiş eşleşme + uzak
+sorguda gezintinin tüm grafa yayılması (kabul/ziyaret oranı 0.19'dan 0.01'e
+çöküyor, p50 25µs→1.3ms). Eski ikili fallback (found < k) bu patolojiyi hiç
+yakalamıyordu (süpürmede 0 kez tetiklendi). Ölçekli ef kolu test edildi ve
+REDDEDİLDİ: recall zaten yüksek, sadece latency ekliyor.
+
+### 29. Üç kollu planlayıcı: tarama / post-filter (over-fetch) / gezinti-içi
+- **Kardinalite tahmini O(1)**: Eq için (alan, değer) → yaşayan id kümesi
+  posting-list'leri (insert/delete'te bakım; tutarlılık testli). O(n)
+  metadata sayımı planlayıcı için reddedildi: 100K'da 14.4ms — planlanan
+  aramanın yüzlerce katı. Range koşulları tahmine katılmaz.
+- **Kol 1 — tarama**: est ≤ max(16k, 0.05n) → graf hiç açılmaz, en küçük
+  posting listesinde exact top-k. Maliyet est ile sınırlı, sorgu konumundan
+  bağımsız (100K'da 12µs–1ms).
+- **Kol 2 — post-filter (over-fetch)**: est daha büyükse FİLTRESİZ graf
+  araması `ef'' = clamp(5k/ŝ, ef, 8ef)` ile, filtre sonuçlara uygulanır.
+  Kritik içgörü (100K ölçümü): gezinti-içi filtre kümelenmiş eşleşme + uzak
+  sorguda grafın tamamına yayılıyor (35ms) ve ölçekle sessiz recall düşüşü
+  başlıyordu (0.948, fallback hiç tetiklenmeden — visited/admitted çöküşü
+  tek sinyaldi). Filtresiz gezinti bu patolojiye YAPISAL olarak bağışık.
+  ŝ Eq-minimum üst sınırı; sonuç < 2k kalırsa (pencere ıskaladı ya da tahmin
+  şişkin — VE bağlacı korelasyonu) exact taramaya düşülür. β=5: β=3'te sonuç
+  sayısı yetip kalite kaçıyordu (0.979 hücresi), 2k eşiği bunu yakalamıyordu.
+- **Kol 3 — gezinti-içi**: yalnız Eq'suz (Range-only) filtrelerde, eski
+  found<k güvenlik ağıyla. Tahminsiz durumda tek seçenek.
+- Denenip REDDEDİLENLER: ölçekli ef (gezinti-içi ile — recall'u zaten
+  koruyordu, sadece latency ekledi); ziyaret bütçesi + tarama fallback'i
+  (10K'da çalıştı, 100K'da yanlış kesmeler 30K'lık taramalara mal oldu —
+  bütçe API'ı ölçüm enstrümantasyonu olarak duruyor).
+- Kalibre sonuç (10K): 21 hücrenin HEPSİNDE recall 1.000; en kötü hücre
+  1.03ms (tarama tabanı), eski en kötü 1.3ms + 0.952 recall idi.
+
+
 ## Metadata filtreleme — 2026-08-18
 
 ### 26. Gezinti-içi filtre + brute-force fallback

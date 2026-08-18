@@ -69,6 +69,23 @@ impl Default for HnswParams {
     }
 }
 
+/// Filtreli aramanın gezinti istatistikleri (ölçüm ve ileride planlayıcı
+/// sinyali). `admitted/visited` oranının çökmesi, fallback tetiklenmeden
+/// yaşanan "sessiz recall düşüşü"nün imzasıdır.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct FilterSearchStats {
+    /// Taban katmanda ziyaret edilen node sayısı.
+    pub visited: usize,
+    /// Sonuç kümesine kabul edilen aday sayısı (eviction öncesi).
+    pub admitted: usize,
+    /// Graf araması k'dan az sonuç bulup doğrusal taramaya düşüldü mü?
+    pub fallback_used: bool,
+    /// Ziyaret bütçesi doldu da arama erken kesildi mi? (Kabul/ziyaret
+    /// oranının çöktüğü patolojik durumun canlı tespiti — ölçümdeki
+    /// "kümelenmiş × uzak sorgu" hücresi. Kesilince fallback taramaya geçilir.)
+    pub budget_exhausted: bool,
+}
+
 /// Vektör verisinin nerede durduğu: bellekte sahipli blok ya da diskten
 /// memmap ile lazy yüklenmiş bölge. Mmap yoluna yazılamaz; ilk insert'te
 /// veri sahipli Vec'e kopyalanır (copy-on-write).
@@ -187,7 +204,12 @@ impl HnswIndex {
     ///
     /// `filter`: metadata filtresi aynı ilkeyle çalışır — eşleşmeyen node
     /// gezilir (bağlantılılık), sonuca girmez. None = filtre yok.
-    #[allow(clippy::type_complexity)]
+    ///
+    /// Dönüş: (sonuçlar, ziyaret edilen node sayısı, sonuç kümesine kabul
+    /// edilen aday sayısı). Sayaçlar iki increment'ten ibaret — üretim yolu
+    /// bedavaya enstrümante olur; filtreli aramada kabul/ziyaret oranının
+    /// çökmesi "sessiz recall düşüşü"nün imzasıdır (plan: filtre ölçümü).
+    #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn search_layer(
         &self,
         query: &[f32],
@@ -196,10 +218,13 @@ impl HnswIndex {
         level: usize,
         exclude_deleted: bool,
         filter: Option<&dyn Fn(usize) -> bool>,
-    ) -> Vec<Cand> {
+        visited_budget: Option<usize>,
+    ) -> (Vec<Cand>, usize, usize) {
         // visited: slot başına bayrak. HashSet yerine Vec<bool>: n=100K'da bile
         // 100KB'lik tek allocation, dal başına hash maliyeti yok.
         let mut visited = vec![false; self.links.len()];
+        let mut visited_count = 0usize;
+        let mut admitted_count = 0usize;
         // candidates: en YAKIN tepede (min-heap, Reverse ile).
         let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
         // results: en UZAK tepede (max-heap) — kötüleri atmak için.
@@ -210,6 +235,7 @@ impl HnswIndex {
                 continue;
             }
             visited[ep] = true;
+            visited_count += 1;
             let c = Cand {
                 dist: self.dist_to(query, ep),
                 slot: ep,
@@ -218,10 +244,16 @@ impl HnswIndex {
             let admissible = !(exclude_deleted && self.deleted[ep]) && filter.is_none_or(|f| f(ep));
             if admissible {
                 results.push(c);
+                admitted_count += 1;
             }
         }
 
         while let Some(Reverse(cur)) = candidates.pop() {
+            // Bütçe: filtreli aramada kabul oranı çökünce gezinti tüm grafa
+            // yayılabilir; bütçe bunu keser, çağıran taramaya geçer.
+            if visited_budget.is_some_and(|b| visited_count >= b) {
+                break;
+            }
             // Erken çıkış: en yakın aday bile sonuç kümesinin en kötüsünden
             // uzaksa bu katmanda daha iyisi bulunamaz (makaledeki durdurma koşulu).
             if let Some(worst) = results.peek() {
@@ -234,6 +266,7 @@ impl HnswIndex {
                     continue;
                 }
                 visited[nb] = true;
+                visited_count += 1;
                 let d = self.dist_to(query, nb);
                 let within =
                     results.len() < ef || results.peek().is_none_or(|worst| d < worst.dist);
@@ -245,6 +278,7 @@ impl HnswIndex {
                         !(exclude_deleted && self.deleted[nb]) && filter.is_none_or(|f| f(nb));
                     if admissible {
                         results.push(c);
+                        admitted_count += 1;
                         if results.len() > ef {
                             results.pop();
                         }
@@ -254,7 +288,7 @@ impl HnswIndex {
         }
         let mut out = results.into_vec();
         out.sort();
-        out
+        (out, visited_count, admitted_count)
     }
 
     /// Algorithm 4 — SELECT-NEIGHBORS-HEURISTIC.
@@ -345,12 +379,15 @@ impl HnswIndex {
         let mut ep = entry;
         for level in (1..=top).rev() {
             // İnişte tombstone da geçerli durak: sadece yol gösteriyor.
-            ep = self.search_layer(query, &[ep], 1, level, false, None)[0].slot;
+            ep = self
+                .search_layer(query, &[ep], 1, level, false, None, None)
+                .0[0]
+                .slot;
         }
         // Taban katmanda geniş arama; ef en az k olmalı yoksa k sonuç çıkmaz.
         // Tombstone'lar burada sonuç dışı.
         let ef = ef.max(k);
-        let found = self.search_layer(query, &[ep], ef, 0, true, None);
+        let (found, _, _) = self.search_layer(query, &[ep], ef, 0, true, None, None);
         found
             .into_iter()
             .take(k)
@@ -371,11 +408,26 @@ impl HnswIndex {
         ef: usize,
         allow: &dyn Fn(VectorId) -> bool,
     ) -> Vec<SearchResult> {
+        self.search_filtered_stats(query, k, ef, allow, None).0
+    }
+
+    /// `search_filtered_with_ef`'in enstrümante hali — üretim yolu bu
+    /// fonksiyonu sarar, dönüş tipi ekstra alan gerektiğinde imza bozulmadan
+    /// `FilterSearchStats`'a alan eklenerek genişler.
+    pub fn search_filtered_stats(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        allow: &dyn Fn(VectorId) -> bool,
+        visited_budget: Option<usize>,
+    ) -> (Vec<SearchResult>, FilterSearchStats) {
+        let mut stats = FilterSearchStats::default();
         let Some(entry) = self.entry else {
-            return Vec::new();
+            return (Vec::new(), stats);
         };
         if k == 0 {
-            return Vec::new();
+            return (Vec::new(), stats);
         }
         let normalized_query;
         let query: &[f32] = if self.metric.requires_normalization() {
@@ -387,26 +439,46 @@ impl HnswIndex {
         let top = self.links[entry].len() - 1;
         let mut ep = entry;
         for level in (1..=top).rev() {
-            ep = self.search_layer(query, &[ep], 1, level, false, None)[0].slot;
+            ep = self
+                .search_layer(query, &[ep], 1, level, false, None, None)
+                .0[0]
+                .slot;
         }
         let ef = ef.max(k);
         let slot_allow = |slot: usize| allow(self.ids[slot]);
-        let found = self.search_layer(query, &[ep], ef, 0, true, Some(&slot_allow));
-        if found.len() >= k {
-            return found
+        let (found, visited, admitted) =
+            self.search_layer(query, &[ep], ef, 0, true, Some(&slot_allow), visited_budget);
+        stats.visited = visited;
+        stats.admitted = admitted;
+        stats.budget_exhausted = visited_budget.is_some_and(|b| visited >= b);
+        // Bütçe dolduysa kısmi sonuçları OLDUĞU GİBİ döndür — ne yapılacağına
+        // (posting-list taraması vb.) çağıran karar verir; buradaki O(n)
+        // fallback'i koşmak bütçenin amacını boşa çıkarırdı.
+        if stats.budget_exhausted {
+            let out = found
                 .into_iter()
                 .take(k)
                 .map(|c| SearchResult::new(self.ids[c.slot], c.dist))
                 .collect();
+            return (out, stats);
+        }
+        if found.len() >= k {
+            let out = found
+                .into_iter()
+                .take(k)
+                .map(|c| SearchResult::new(self.ids[c.slot], c.dist))
+                .collect();
+            return (out, stats);
         }
         // Fallback: seçicilik gezilen bölgeyi aştı — doğrusal tarama.
+        stats.fallback_used = true;
         let mut all: Vec<SearchResult> = (0..self.ids.len())
             .filter(|&s| !self.deleted[s] && slot_allow(s))
             .map(|s| SearchResult::new(self.ids[s], self.dist_to(query, s)))
             .collect();
         all.sort();
         all.truncate(k);
-        all
+        (all, stats)
     }
 
     /// Graf kenar belleği dahil toplam indeks belleği (byte).
@@ -466,15 +538,22 @@ impl VectorIndex for HnswIndex {
         // 1. faz: yeni node'un seviyesinin ÜSTÜNDEKİ katmanlarda sadece
         // greedy iniş — buralara kenar eklenmeyecek, sadece yaklaşıyoruz.
         for lc in ((level + 1)..=top).rev() {
-            ep = self.search_layer(&query, &[ep], 1, lc, false, None)[0].slot;
+            ep = self.search_layer(&query, &[ep], 1, lc, false, None, None).0[0].slot;
         }
 
         // 2. faz: level..0 arası her katmanda ef_construction genişliğinde ara,
         // heuristic ile komşu seç, çift yönlü bağla, limit aşan komşuları kırp.
         let mut eps = vec![ep];
         for lc in (0..=level.min(top)).rev() {
-            let found =
-                self.search_layer(&query, &eps, self.params.ef_construction, lc, false, None);
+            let (found, _, _) = self.search_layer(
+                &query,
+                &eps,
+                self.params.ef_construction,
+                lc,
+                false,
+                None,
+                None,
+            );
             let neighbors = self.select_neighbors_heuristic(&found, self.params.m);
             for &nb in &neighbors {
                 self.links[slot][lc].push(nb);
@@ -573,6 +652,12 @@ impl HnswIndex {
     /// id bu indekste yaşıyor mu (tombstone'lular hariç)?
     pub fn contains(&self, id: VectorId) -> bool {
         self.slot_of.contains_key(&id)
+    }
+
+    /// Yaşayan bir kaydın (normalize edilmiş olabilecek) vektörü.
+    /// Planlayıcının tarama kolu id listesinden doğrudan mesafe hesaplar.
+    pub fn vector_of(&self, id: VectorId) -> Option<&[f32]> {
+        self.slot_of.get(&id).map(|&s| self.vector_at(s))
     }
 
     /// Tombstone oranı (test ve gözlem için).

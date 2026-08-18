@@ -109,6 +109,11 @@ impl BruteForceIndex {
         self.slot_of.contains_key(&id)
     }
 
+    /// id'nin (cosine'da normalize edilmiş) vektörü.
+    pub fn vector_of(&self, id: VectorId) -> Option<&[f32]> {
+        self.slot_of.get(&id).map(|&s| self.vector_at(s))
+    }
+
     /// (id, vektör) çiftleri — segment mühürleme buffer'ı boşaltırken kullanır.
     /// Cosine'da dönen vektörler normalize edilmiş halidir (idempotent).
     pub fn entries(&self) -> impl Iterator<Item = (VectorId, &[f32])> {

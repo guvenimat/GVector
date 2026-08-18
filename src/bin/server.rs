@@ -139,10 +139,7 @@ async fn delete_vector(
     }
 }
 
-async fn search(
-    State(app): State<AppState>,
-    Json(req): Json<SearchReq>,
-) -> Json<Vec<SearchHit>> {
+async fn search(State(app): State<AppState>, Json(req): Json<SearchReq>) -> Json<Vec<SearchHit>> {
     // Arama CPU işi: blocking havuzunda koş ki tokio worker'ları tıkanmasın.
     let index = app.index.clone();
     let hits = tokio::task::spawn_blocking(move || {

@@ -1,5 +1,50 @@
 # Benchmark Kayıtları
 
+## Filtre seçicilik süpürmesi + planlayıcı — 2026-08-18 (SIFT, k=10, ef=50)
+
+Üç eşleşme dağılımı: uniform (id-uzayı), clustered (vektör-uzayı: merkezin
+en yakın s·n komşusu; sorgular merkeze uzaklıkla yakın/orta/uzak), contig
+(id-bitişik). Referans: brute-force filtreli tarama.
+
+### Ölçüm bulguları (gezinti-içi filtre, ham HNSW, 100K)
+
+- Sessiz recall düşüşü ölçekle GERÇEK: clustered×uzak×s=0.3 → **0.948**
+  (10K'da 0.952 en kötüydü), fallback sayacı her hücrede 0 — tek sinyal
+  kabul/ziyaret oranının 0.167'den 0.002'ye çöküşü.
+- Asıl hasar latency: clustered×uzak hücrelerinde gezinti grafın tamamına
+  yayılıyor — s=0.001'de p50 **35.3ms** (filtresiz arama 65µs).
+- Ölçekli ef kolu (ef'=k/s) reddedildi: recall'u zaten koruyan mekanizmaya
+  sadece latency ekliyor (39ms'e kadar).
+- O(n) planlama sayımı reddedildi: 100K'da 14.4ms.
+- İlk planlayıcı denemesi (ziyaret bütçesi 24·ef/√ŝ + tarama fallback)
+  10K'da çalıştı, 100K'da yanlış kesmelerle geriledi → üretim yolundan
+  çıkarıldı (enstrümantasyon olarak duruyor).
+
+### Nihai planlayıcı (posting-list + tarama / filtresiz over-fetch)
+
+10K: 21 hücrenin HEPSİNDE recall 1.000; en kötü p50 1.03ms (tarama tabanı).
+100K örnek hücreler (önce = gezinti-içi ham, sonra = planlayıcı):
+
+| hücre | önce recall/p50 | sonra recall/p50 |
+|---|---|---|
+| uniform s=0.001 | 1.000 / 20.2ms | 1.000 / 12µs |
+| clustered×uzak s=0.001 | 1.000 / 35.3ms | 1.000 / 12µs |
+| clustered×uzak s=0.01 | 1.000 / 25.8ms | 1.000 / 179µs |
+| clustered×uzak s=0.05 | 1.000 / 20.3ms | 1.000 / 1.03ms |
+| clustered×orta s=0.1 | 0.997 / 866µs | 0.997 / 1.6ms |
+| clustered×uzak s=0.3 (kritik hücre) | **0.948** / 13.6ms | **1.000** / 10.8ms |
+| clustered×uzak s=0.5 | 0.985 / 10.1ms | 1.000 / 20.4ms |
+| contig s=0.5 | 0.998 / 127µs | 1.000 / 621µs |
+| s=1.0 satırları | 0.989 / ~90µs | 1.000 / ~550–610µs |
+
+Not: 100K'da en düşük hücre 0.988 (clustered×orta s=0.3) — eski 0.948
+tabanının üstünde. Üst-bant uzak hücrelerinde latency tarama tabanına
+dayanıyor (scan_candidates'in id→vektör bulma ek yükü ~4x brute-force;
+iyileştirme adayı). s=1.0'daki ~550µs, 4 segment × over-fetch bedeli —
+filtresiz `search_shared` yolu (65µs) filtre boşsa zaten kullanılıyor,
+bu satır "her kayıt eşleşiyor ama filtre yazılmış" ucunu ölçüyor.
+
+
 ## SIMD — 2026-08-18 (wide f32x8 + target-cpu=native)
 
 Micro (128d):

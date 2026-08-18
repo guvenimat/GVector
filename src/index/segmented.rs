@@ -30,7 +30,7 @@ use crate::distance::Metric;
 use crate::index::bruteforce::BruteForceIndex;
 use crate::index::hnsw::{HnswIndex, HnswParams};
 use crate::index::{IndexError, VectorIndex};
-use crate::meta::{Filter, Metadata};
+use crate::meta::{Filter, MetaKey, Metadata};
 use crate::types::{SearchResult, VectorId};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -60,6 +60,50 @@ pub struct SegmentedIndex {
     /// id → metadata. Vektör verisinden ayrı tutulur: segmentler immutable
     /// ama metadata idare (silme, yeniden ekleme) id düzeyinde akar.
     metadata: RwLock<HashMap<VectorId, Metadata>>,
+    /// Eq posting-list'leri: (alan, değer) → yaşayan id kümesi.
+    /// Planlayıcının O(1) kardinalite tahmini ve tarama kolunun id kaynağı.
+    /// Insert/delete'te bakımı yapılır; Range koşulları kapsam dışı (DECISIONS #28).
+    postings: RwLock<HashMap<(String, MetaKey), HashSet<VectorId>>>,
+    /// Planlayıcı eşikleri (sorgu planlama parametreleri; graf parametresi değil).
+    /// Değerler seçicilik ölçümünden (BENCHMARKS, filtre süpürmesi) türetildi.
+    planner: PlannerConfig,
+}
+
+/// Planlayıcı yapılandırması. Değerler 10K + 100K seçicilik süpürmelerinden
+/// (BENCHMARKS) türetildi.
+///
+/// Neden gezinti-içi filtre üretim yolundan çıktı: 100K ölçümü, kümelenmiş
+/// eşleşme + uzak sorguda gezinti-içi filtrenin grafın tamamına yayıldığını
+/// (35ms'e kadar) VE ölçekle sessiz recall düşüşü başladığını (0.948) gösterdi.
+/// Filtresiz gezinti bu patolojiye yapısal olarak bağışık: gezinti filtreye
+/// hiç bakmaz, aynı ~µs yolunu yürür; filtre sonuçlara over-fetch ile uygulanır.
+#[derive(Debug, Clone)]
+pub struct PlannerConfig {
+    /// est ≤ scan_factor·k → tarama kolu (küçük mutlak eşleşme).
+    pub scan_factor: usize,
+    /// est ≤ scan_fraction·n → tarama kolu. 0.05: bu bandın altında
+    /// over-fetch'in beklenen eşleşmesi k'yı garanti edemiyor; taramanın
+    /// maliyeti est ile sınırlı ve her sorgu konumunda öngörülebilir.
+    pub scan_fraction: f64,
+    /// Post-filter kolunda over-fetch: ef'' = overfetch_beta·k/ŝ.
+    /// β=5: beklenen eşleşme 5k. β=3 ile sonuç SAYISI yetiyordu ama orta-band
+    /// kümelenmiş sorguda gerçek top-k'nın bir kısmı pencere dışında kalıp
+    /// recall 0.979'a düşüyordu (10K ölçümü); β=5 pencereyi kalite için genişletir.
+    pub overfetch_beta: f64,
+    /// ef'' üst tavanı = overfetch_cap_factor·ef (tahmin hatası ef''e çarpan
+    /// olarak girer; tavan bunu sınırlar — kullanıcı geri bildirimi).
+    pub overfetch_cap_factor: usize,
+}
+
+impl Default for PlannerConfig {
+    fn default() -> Self {
+        Self {
+            scan_factor: 16,
+            scan_fraction: 0.05,
+            overfetch_beta: 5.0,
+            overfetch_cap_factor: 8,
+        }
+    }
 }
 
 impl SegmentedIndex {
@@ -74,6 +118,8 @@ impl SegmentedIndex {
             buffer: RwLock::new(BruteForceIndex::new(dim, metric)),
             ef_search,
             metadata: RwLock::new(HashMap::new()),
+            postings: RwLock::new(HashMap::new()),
+            planner: PlannerConfig::default(),
         }
     }
 
@@ -86,22 +132,62 @@ impl SegmentedIndex {
     ) -> Result<(), IndexError> {
         self.insert_shared(id, vector)?;
         if !meta.is_empty() {
+            let mut postings = self.postings.write().expect("kilit");
+            for (key, value) in &meta {
+                postings
+                    .entry((key.clone(), value.key()))
+                    .or_default()
+                    .insert(id);
+            }
+            drop(postings);
             self.metadata.write().expect("kilit").insert(id, meta);
         }
         Ok(())
     }
 
-    /// Filtreli arama: her segmentte gezinti-içi filtre + buffer'da filtreli
-    /// tarama, sonuçlar id bazında birleştirilir.
-    pub fn search_filtered(&self, query: &[f32], k: usize, filter: &Filter) -> Vec<SearchResult> {
-        if filter.must.is_empty() {
-            return self.search_shared(query, k);
+    /// Kardinalite tahmini: Eq koşullarının posting sayılarının minimumu
+    /// (VE bağlacı için üst sınır — kesişim daha küçük olabilir, büyük olamaz).
+    /// Eq koşulu yoksa None (Range için histogram tutmuyoruz).
+    /// Dönen küme: en küçük posting listesi (tarama kolunun aday kaynağı).
+    fn estimate(&self, filter: &Filter) -> Option<(usize, HashSet<VectorId>)> {
+        let keys = filter.eq_keys();
+        if keys.is_empty() {
+            return None;
         }
-        if k == 0 {
-            return Vec::new();
+        let postings = self.postings.read().expect("kilit");
+        let mut best: Option<&HashSet<VectorId>> = None;
+        for (k, mk) in keys {
+            match postings.get(&(k.to_string(), mk)) {
+                // Herhangi bir Eq koşulunun hiç eşleşmesi yoksa sonuç boştur.
+                None => return Some((0, HashSet::new())),
+                Some(set) => {
+                    if best.is_none_or(|b| set.len() < b.len()) {
+                        best = Some(set);
+                    }
+                }
+            }
         }
+        best.map(|s| (s.len(), s.clone()))
+    }
+
+    /// Tarama kolu: aday id'ler (en küçük posting listesi) üzerinde tam filtre
+    /// + doğrudan mesafe. Exact — graf hiç açılmaz.
+    fn scan_candidates(
+        &self,
+        query: &[f32],
+        k: usize,
+        candidates: &HashSet<VectorId>,
+        filter: &Filter,
+    ) -> Vec<SearchResult> {
+        let normalized_query;
+        let query: &[f32] = if self.metric.requires_normalization() {
+            normalized_query = crate::distance::normalized(query);
+            &normalized_query
+        } else {
+            query
+        };
         let meta = self.metadata.read().expect("kilit");
-        let allow = |id: VectorId| filter.matches_id(&meta, id);
+        let buffer = self.buffer.read().expect("kilit");
         let segments: Vec<Arc<Segment>> = self
             .segments
             .read()
@@ -109,27 +195,138 @@ impl SegmentedIndex {
             .iter()
             .cloned()
             .collect();
-        let mut all: Vec<SearchResult> = Vec::new();
-        for seg in &segments {
-            let tombs = seg.tombstones.read().expect("kilit");
-            let allow_live = |id: VectorId| !tombs.contains(&id) && allow(id);
-            let want = k + tombs.len().min(k);
-            all.extend(seg.index.search_filtered_with_ef(
-                query,
-                want,
-                self.ef_search.max(want),
-                &allow_live,
-            ));
+        let mut out: Vec<SearchResult> = Vec::new();
+        'cand: for &id in candidates {
+            if !filter.matches_id(&meta, id) {
+                continue;
+            }
+            // Yaşayan kopyayı bul: önce buffer (en yeni), sonra segmentler
+            // yeniden eskiye (tombstone'lu eski kopyalar atlanır).
+            if let Some(v) = buffer.vector_of(id) {
+                out.push(SearchResult::new(id, self.metric.distance(query, v)));
+                continue;
+            }
+            for seg in segments.iter().rev() {
+                if seg.index.contains(id) && !seg.tombstones.read().expect("kilit").contains(&id) {
+                    if let Some(v) = seg.index.vector_of(id) {
+                        out.push(SearchResult::new(id, self.metric.distance(query, v)));
+                    }
+                    continue 'cand;
+                }
+            }
         }
-        {
-            let buffer = self.buffer.read().expect("kilit");
-            all.extend(buffer.search_filtered(query, k, &allow));
+        out.sort();
+        out.truncate(k);
+        out
+    }
+
+    /// Filtreli arama — üç kollu planlayıcı (gerekçe: BENCHMARKS filtre
+    /// süpürmesi; DECISIONS #28):
+    /// 1. Eq tahmini küçükse (≤ scan_factor·k): grafı açmadan posting
+    ///    listesinde doğrudan tarama — exact ve ucuz.
+    /// 2. Aksi halde gezinti-içi filtreli graf araması, ziyaret bütçesiyle:
+    ///    kabul/ziyaret oranı çökerse (kümelenmiş eşleşme + uzak sorgu
+    ///    patolojisi) bütçe dolup segment-içi taramaya düşülür.
+    /// 3. Eq koşulu yoksa (tahmin yok) 2. kol bütçeli çalışır — güvenlik
+    ///    ağı aynı.
+    pub fn search_filtered(&self, query: &[f32], k: usize, filter: &Filter) -> Vec<SearchResult> {
+        if filter.must.is_empty() {
+            return self.search_shared(query, k);
         }
-        all.sort();
-        let mut seen = HashSet::with_capacity(all.len());
-        all.retain(|r| seen.insert(r.id));
-        all.truncate(k);
-        all
+        if k == 0 {
+            return Vec::new();
+        }
+        let estimate = self.estimate(filter);
+        match &estimate {
+            Some((0, _)) => Vec::new(),
+            Some((est, candidates)) => {
+                let n = self.len_shared().max(1);
+                let scan_limit = (self.planner.scan_factor * k)
+                    .max((self.planner.scan_fraction * n as f64) as usize);
+                if *est <= scan_limit {
+                    // Küçük eşleşme: grafı hiç açma, posting listesinde exact top-k.
+                    return self.scan_candidates(query, k, candidates, filter);
+                }
+                // Post-filter kolu: FİLTRESİZ gezinti (patolojiye bağışık) +
+                // over-fetch + sonuçta filtre. ŝ Eq minimumundan gelen ÜST
+                // sınır; gerçek seçicilik küçükse sonuç k'nın altında kalır
+                // ve exact tarama fallback'i devreye girer.
+                let s_hat = (*est as f64 / n as f64).clamp(1e-6, 1.0);
+                let ef_over = ((self.planner.overfetch_beta * k as f64 / s_hat) as usize).clamp(
+                    self.ef_search.max(2 * k),
+                    (self.planner.overfetch_cap_factor * self.ef_search).max(4 * k),
+                );
+                let mut all: Vec<SearchResult> = Vec::new();
+                {
+                    let meta = self.metadata.read().expect("kilit");
+                    let allow = |id: VectorId| filter.matches_id(&meta, id);
+                    let segments: Vec<Arc<Segment>> = self
+                        .segments
+                        .read()
+                        .expect("kilit")
+                        .iter()
+                        .cloned()
+                        .collect();
+                    for seg in &segments {
+                        let tombs = seg.tombstones.read().expect("kilit");
+                        let res = seg.index.search_with_ef(query, ef_over, ef_over);
+                        all.extend(
+                            res.into_iter()
+                                .filter(|r| !tombs.contains(&r.id) && allow(r.id)),
+                        );
+                    }
+                    let buffer = self.buffer.read().expect("kilit");
+                    all.extend(buffer.search_filtered(query, k, &allow));
+                } // kilitler düşer — fallback scan_candidates yeniden alacak
+                all.sort();
+                let mut seen = HashSet::with_capacity(all.len());
+                all.retain(|r| seen.insert(r.id));
+                if all.len() < 2 * k && *est >= 2 * k {
+                    // Over-fetch penceresi eşleşme bölgesini ıskaladı (sorgu
+                    // eşleşmelerden uzak) ya da tahmin şişkindi: k'yı kıl payı
+                    // geçen sonuç kümesi de güvenilmez — exact taramaya düş.
+                    // (2k eşiği: 10K ölçümünde kümelenmiş/orta bandın 0.979'a
+                    // sessizce düşmesini yakalayan sinyal buydu.)
+                    return self.scan_candidates(query, k, candidates, filter);
+                }
+                all.truncate(k);
+                all
+            }
+            // Eq yok (yalnız Range): tahmin yok — gezinti-içi filtre +
+            // found<k güvenlik ağı (eski davranış) tek seçenek.
+            None => {
+                let meta = self.metadata.read().expect("kilit");
+                let allow = |id: VectorId| filter.matches_id(&meta, id);
+                let segments: Vec<Arc<Segment>> = self
+                    .segments
+                    .read()
+                    .expect("kilit")
+                    .iter()
+                    .cloned()
+                    .collect();
+                let mut all: Vec<SearchResult> = Vec::new();
+                for seg in &segments {
+                    let tombs = seg.tombstones.read().expect("kilit");
+                    let allow_live = |id: VectorId| !tombs.contains(&id) && allow(id);
+                    let want = k + tombs.len().min(k);
+                    all.extend(seg.index.search_filtered_with_ef(
+                        query,
+                        want,
+                        self.ef_search.max(want),
+                        &allow_live,
+                    ));
+                }
+                {
+                    let buffer = self.buffer.read().expect("kilit");
+                    all.extend(buffer.search_filtered(query, k, &allow));
+                }
+                all.sort();
+                let mut seen = HashSet::with_capacity(all.len());
+                all.retain(|r| seen.insert(r.id));
+                all.truncate(k);
+                all
+            }
+        }
     }
 
     /// Paylaşımlı (&self) insert — tek yazıcı thread'inden çağrılmalı.
@@ -208,7 +405,16 @@ impl SegmentedIndex {
     pub fn delete_shared(&self, id: VectorId) -> Result<(), IndexError> {
         let res = self.delete_vector_only(id);
         if res.is_ok() {
-            self.metadata.write().expect("kilit").remove(&id);
+            // Posting-list'ler yalnız yaşayan id'leri içerir: metadata'yı
+            // düşürmeden önce anahtarlarını okuyup listelerden çıkar.
+            if let Some(meta) = self.metadata.write().expect("kilit").remove(&id) {
+                let mut postings = self.postings.write().expect("kilit");
+                for (key, value) in &meta {
+                    if let Some(set) = postings.get_mut(&(key.clone(), value.key())) {
+                        set.remove(&id);
+                    }
+                }
+            }
         }
         res
     }
@@ -543,6 +749,51 @@ mod tests {
         let res = idx.search_filtered(&vecs[7].clone(), 1, &f_v2);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].id, VectorId(7));
+    }
+
+    /// Posting-list'ler her mutasyon dizisinden sonra metadata deposuyla
+    /// birebir tutarlı olmalı (planlayıcının tahmini buna dayanıyor).
+    #[test]
+    fn postings_consistent_after_insert_delete_reinsert() {
+        let vecs = random_vectors(200, 4, 42);
+        let idx = SegmentedIndex::new(4, Metric::L2, HnswParams::default(), 80);
+        for (i, v) in vecs.iter().enumerate() {
+            let meta: Metadata = [("g".to_string(), MetaValue::Int((i % 5) as i64))].into();
+            idx.insert_with_meta(VectorId(i as u64), v, meta).unwrap();
+        }
+        for i in (0..200).step_by(3) {
+            idx.delete_shared(VectorId(i)).unwrap();
+        }
+        // birkaç yeniden ekleme, farklı grupla
+        for i in (0..30).step_by(3) {
+            idx.insert_with_meta(
+                VectorId(i),
+                &vecs[i as usize],
+                [("g".to_string(), MetaValue::Int(99))].into(),
+            )
+            .unwrap();
+        }
+        // yeniden say ve karşılaştır
+        let meta_store = idx.metadata.read().unwrap();
+        let postings = idx.postings.read().unwrap();
+        for ((key, mk), set) in postings.iter() {
+            let recount: HashSet<VectorId> = meta_store
+                .iter()
+                .filter(|(_, m)| m.get(key).is_some_and(|v| v.key() == *mk))
+                .map(|(&id, _)| id)
+                .collect();
+            assert_eq!(*set, recount, "posting tutarsız: {key}/{mk:?}");
+        }
+        // tahmin, gerçek eşleşme sayısına eşit (tek Eq'de kesin)
+        let f = Filter {
+            must: vec![Predicate::Eq {
+                key: "g".into(),
+                value: MetaValue::Int(99),
+            }],
+        };
+        let (est, cands) = idx.estimate(&f).unwrap();
+        assert_eq!(est, 10);
+        assert_eq!(cands.len(), 10);
     }
 
     /// Stres testi: çok okuyucu + tek yazıcı. Yazıcı insert+delete yaparken

@@ -10,7 +10,7 @@
 use std::time::Instant;
 use vector_gvector::dataset::{random_vectors, read_fvecs_subset, read_ivecs, DEFAULT_SEED};
 use vector_gvector::distance::Metric;
-use vector_gvector::eval::{ground_truth, measure_latency, recall_at_k};
+use vector_gvector::eval::{exact_top_k, ground_truth, measure_latency, recall_at_k};
 use vector_gvector::index::bruteforce::BruteForceIndex;
 use vector_gvector::index::hnsw::{HnswIndex, HnswParams};
 use vector_gvector::index::VectorIndex;
@@ -76,6 +76,231 @@ fn hnsw_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     }
 }
 
+/// Filtre seçicilik süpürmesi (plan: fallback ölçümü).
+///
+/// Üç eşleşme dağılımı:
+/// - uniform: id-uzayında düzgün serpilmiş (taban çizgisi)
+/// - clustered: VEKTÖR uzayında kümelenmiş — merkezin en yakın s·n komşusu.
+///   Sorgular merkeze uzaklığa göre yakın/orta/uzak gruplanır: kırılganlık
+///   sorgu eşleşme bölgesinden UZAKKEN bekleniyor.
+/// - contig: id-bitişik ilk s·n kayıt (segment sınırı etkileşimi için ayrı)
+fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric) {
+    use std::collections::HashSet;
+    use vector_gvector::meta::{Filter, MetaValue, Metadata, Predicate};
+
+    let n = base.len();
+    let dim = base[0].len();
+    let ef = 50usize;
+    let ef_cap = 4096usize; // ölçekli ef tavanı (kullanıcı geri bildirimi)
+
+    let mut hnsw = HnswIndex::new(dim, metric, HnswParams::default());
+    let mut bf = BruteForceIndex::new(dim, metric);
+    for (i, v) in base.iter().enumerate() {
+        hnsw.insert(VectorId(i as u64), v).expect("insert");
+        bf.insert(VectorId(i as u64), v).expect("insert");
+    }
+
+    // Filtresiz referans (s=1.0 satırının sabit maliyet karşılaştırması).
+    let unfiltered = measure_latency(queries, |q| {
+        std::hint::black_box(hnsw.search_with_ef(q, k, ef));
+    });
+    println!(
+        "filtresiz search p50 = {:?} (s=1.0 karşılaştırması)",
+        unfiltered.p50
+    );
+
+    // Planlama maliyeti: O(n) metadata taraması bir sorgu planlayıcısına ne
+    // kadar pahalı olurdu? Gerçekçi bir metadata haritası kurup tam sayım süresi.
+    let meta_store: std::collections::HashMap<VectorId, Metadata> = (0..n)
+        .map(|i| {
+            (
+                VectorId(i as u64),
+                [("b".to_string(), MetaValue::Int(i as i64))].into(),
+            )
+        })
+        .collect();
+    let probe = Filter {
+        must: vec![Predicate::Range {
+            key: "b".into(),
+            min: 0.0,
+            max: (n / 2) as f64,
+        }],
+    };
+    let t = std::time::Instant::now();
+    let cnt = (0..n)
+        .filter(|&i| probe.matches_id(&meta_store, VectorId(i as u64)))
+        .count();
+    println!(
+        "planlama maliyeti (O(n) tam sayım, n={n}): {:?} (sayım={cnt})",
+        t.elapsed()
+    );
+    println!();
+    println!("| varyant | s | grup | recall | p50 | fallback | ziyaret | kabul/ziyaret | ef' recall | ef' p50 | tarama p50 |");
+    println!("|---------|---|------|--------|-----|----------|---------|----------------|------------|---------|------------|");
+
+    // Kümelenmiş varyantın merkezi: taban kümeden bir vektör.
+    let center = &base[0];
+    // Sorguları merkeze uzaklığa göre sırala, üçe böl (yakın/orta/uzak).
+    let mut q_order: Vec<usize> = (0..queries.len()).collect();
+    q_order.sort_by(|&a, &b| {
+        metric
+            .distance(&queries[a], center)
+            .total_cmp(&metric.distance(&queries[b], center))
+    });
+    let third = queries.len() / 3;
+
+    let s_levels = [0.001f64, 0.01, 0.05, 0.1, 0.3, 0.5, 1.0];
+    let make_allow_set = |variant: &str, s: f64| -> HashSet<u64> {
+        let m = ((s * n as f64) as usize).max(1);
+        match variant {
+            "uniform" => {
+                let step = (n / m).max(1);
+                (0..n).step_by(step).take(m).map(|i| i as u64).collect()
+            }
+            "clustered" => exact_top_k(base, center, m, metric)
+                .iter()
+                .map(|r| r.id.0)
+                .collect(),
+            _ => (0..m as u64).collect(),
+        }
+    };
+
+    for variant in ["uniform", "clustered", "contig"] {
+        for s in s_levels {
+            let allow_set = make_allow_set(variant, s);
+            let allow = |id: VectorId| allow_set.contains(&id.0);
+            let s_real = allow_set.len() as f64 / n as f64;
+            let ef_scaled = ((k as f64 / s_real).ceil() as usize).clamp(ef, ef_cap);
+
+            // Kümelenmişte sorgular uzaklık gruplarına ayrılır; diğerlerinde tek grup.
+            let groups: Vec<(&str, Vec<usize>)> = if variant == "clustered" {
+                vec![
+                    ("yakın", q_order[..third].to_vec()),
+                    ("orta", q_order[third..2 * third].to_vec()),
+                    ("uzak", q_order[2 * third..].to_vec()),
+                ]
+            } else {
+                vec![("-", (0..queries.len()).collect())]
+            };
+
+            for (gname, qidx) in groups {
+                let qs: Vec<Vec<f32>> = qidx.iter().map(|&i| queries[i].clone()).collect();
+                let mut hits = 0usize;
+                let mut total = 0usize;
+                let mut fallbacks = 0usize;
+                let mut visited_sum = 0usize;
+                let mut admitted_sum = 0usize;
+                let mut hits_scaled = 0usize;
+                for q in &qs {
+                    let truth: Vec<VectorId> = bf
+                        .search_filtered(q, k, &allow)
+                        .iter()
+                        .map(|r| r.id)
+                        .collect();
+                    let (res, st) = hnsw.search_filtered_stats(q, k, ef, &allow, None);
+                    hits += res.iter().filter(|r| truth.contains(&r.id)).count();
+                    total += truth.len();
+                    fallbacks += st.fallback_used as usize;
+                    visited_sum += st.visited;
+                    admitted_sum += st.admitted;
+                    let res2 = hnsw.search_filtered_with_ef(q, k, ef_scaled, &allow);
+                    hits_scaled += res2.iter().filter(|r| truth.contains(&r.id)).count();
+                }
+                let nq = qs.len().max(1);
+                let recall = hits as f64 / total.max(1) as f64;
+                let recall_scaled = hits_scaled as f64 / total.max(1) as f64;
+                let lat = measure_latency(&qs, |q| {
+                    std::hint::black_box(hnsw.search_filtered_with_ef(q, k, ef, &allow));
+                });
+                let lat_scaled = measure_latency(&qs, |q| {
+                    std::hint::black_box(hnsw.search_filtered_with_ef(q, k, ef_scaled, &allow));
+                });
+                // Planlayıcının alternatif kolu: yalnız eşleşenlerde tarama.
+                let lat_scan = measure_latency(&qs, |q| {
+                    std::hint::black_box(bf.search_filtered(q, k, &allow));
+                });
+                println!(
+                    "| {variant} | {s} | {gname} | {recall:.3} | {:?} | {}/{nq} | {} | {:.3} | {recall_scaled:.3} | {:?} | {:?} |",
+                    lat.p50,
+                    fallbacks,
+                    visited_sum / nq,
+                    admitted_sum as f64 / visited_sum.max(1) as f64,
+                    lat_scaled.p50,
+                    lat_scan.p50,
+                );
+            }
+        }
+    }
+
+    // ---- "Sonra" tablosu: planlayıcılı SegmentedIndex uçtan uca ----
+    // Her s seviyesi bir Bool etiketi olur ("s0".."s6"); filtre Eq ile
+    // posting-list yolunu kullanır. Varyant başına tek inşa.
+    use vector_gvector::index::segmented::SegmentedIndex;
+    println!();
+    println!("== planlayıcılı SegmentedIndex (posting-list + tarama kolu + ziyaret bütçesi) ==");
+    println!("| varyant | s | grup | recall | p50 |");
+    println!("|---------|---|------|--------|-----|");
+    for variant in ["uniform", "clustered", "contig"] {
+        let sets: Vec<HashSet<u64>> = s_levels
+            .iter()
+            .map(|&s| make_allow_set(variant, s))
+            .collect();
+        let idx = SegmentedIndex::new(dim, metric, HnswParams::default(), (n / 4).max(1000));
+        for (i, v) in base.iter().enumerate() {
+            let mut m: Metadata = Metadata::new();
+            for (si, set) in sets.iter().enumerate() {
+                if set.contains(&(i as u64)) {
+                    m.insert(format!("s{si}"), MetaValue::Bool(true));
+                }
+            }
+            idx.insert_with_meta(VectorId(i as u64), v, m)
+                .expect("insert");
+        }
+        for (si, s) in s_levels.iter().enumerate() {
+            let filter = Filter {
+                must: vec![Predicate::Eq {
+                    key: format!("s{si}"),
+                    value: MetaValue::Bool(true),
+                }],
+            };
+            let allow_set = &sets[si];
+            let allow = |id: VectorId| allow_set.contains(&id.0);
+            let groups: Vec<(&str, Vec<usize>)> = if variant == "clustered" {
+                vec![
+                    ("yakın", q_order[..third].to_vec()),
+                    ("orta", q_order[third..2 * third].to_vec()),
+                    ("uzak", q_order[2 * third..].to_vec()),
+                ]
+            } else {
+                vec![("-", (0..queries.len()).collect())]
+            };
+            for (gname, qidx) in groups {
+                let qs: Vec<Vec<f32>> = qidx.iter().map(|&i| queries[i].clone()).collect();
+                let mut hits = 0usize;
+                let mut total = 0usize;
+                for q in &qs {
+                    let truth: Vec<VectorId> = bf
+                        .search_filtered(q, k, &allow)
+                        .iter()
+                        .map(|r| r.id)
+                        .collect();
+                    let res = idx.search_filtered(q, k, &filter);
+                    hits += res.iter().filter(|r| truth.contains(&r.id)).count();
+                    total += truth.len();
+                }
+                let recall = hits as f64 / total.max(1) as f64;
+                let lat = measure_latency(&qs, |q| {
+                    std::hint::black_box(idx.search_filtered(q, k, &filter));
+                });
+                println!(
+                    "| {variant} | {s} | {gname} | {recall:.3} | {:?} |",
+                    lat.p50
+                );
+            }
+        }
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str).unwrap_or("random");
@@ -83,7 +308,7 @@ fn main() {
     let metric = Metric::L2; // SIFT literatürde L2 ile değerlendirilir
 
     let (base, queries, label) = match mode {
-        "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" => {
+        "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -115,6 +340,11 @@ fn main() {
 
     if mode == "sweep" {
         hnsw_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "filter" {
+        filter_sweep(&base, &queries, k, metric);
         return;
     }
 

@@ -41,6 +41,46 @@ impl MetaValue {
 
 pub type Metadata = HashMap<String, MetaValue>;
 
+/// Posting-list anahtarı: `MetaValue`'nun hash'lenebilir izdüşümü.
+/// Float'lar tam sayıysa Int'e normalize edilir (Eq semantiğiyle tutarlı:
+/// Int(3) == Float(3.0)); değilse bit deseni kullanılır.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MetaKey {
+    Bool(bool),
+    Int(i64),
+    FloatBits(u64),
+    Str(String),
+}
+
+impl MetaValue {
+    pub fn key(&self) -> MetaKey {
+        match self {
+            MetaValue::Bool(b) => MetaKey::Bool(*b),
+            MetaValue::Int(i) => MetaKey::Int(*i),
+            MetaValue::Float(f) if f.fract() == 0.0 && f.abs() < i64::MAX as f64 => {
+                MetaKey::Int(*f as i64)
+            }
+            MetaValue::Float(f) => MetaKey::FloatBits(f.to_bits()),
+            MetaValue::Str(s) => MetaKey::Str(s.clone()),
+        }
+    }
+}
+
+impl Filter {
+    /// Filtredeki Eq koşullarının posting-list anahtarları.
+    /// Kardinalite tahmini VE bağlacında bunların minimumudur (üst sınır);
+    /// Range koşulları tahmine katılmaz (histogramsız — DECISIONS #28).
+    pub fn eq_keys(&self) -> Vec<(&str, MetaKey)> {
+        self.must
+            .iter()
+            .filter_map(|p| match p {
+                Predicate::Eq { key, value } => Some((key.as_str(), value.key())),
+                Predicate::Range { .. } => None,
+            })
+            .collect()
+    }
+}
+
 /// Tek koşul. `Range` uçları kapalıdır (min ≤ x ≤ max); tek uç için diğerine
 /// ±∞ verilebilir.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
