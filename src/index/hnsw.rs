@@ -654,6 +654,16 @@ impl HnswIndex {
         self.slot_of.contains_key(&id)
     }
 
+    /// Yaşayan (id, vektör) çiftleri — segment merge yeniden inşası bunları
+    /// okur; tombstone'lular atlanır (merge doğal compaction'dır).
+    pub fn live_entries(&self) -> impl Iterator<Item = (VectorId, &[f32])> {
+        self.ids
+            .iter()
+            .enumerate()
+            .filter(|(slot, _)| !self.deleted[*slot])
+            .map(|(slot, &id)| (id, self.vector_at(slot)))
+    }
+
     /// Yaşayan bir kaydın (normalize edilmiş olabilecek) vektörü.
     /// Planlayıcının tarama kolu id listesinden doğrudan mesafe hesaplar.
     pub fn vector_of(&self, id: VectorId) -> Option<&[f32]> {

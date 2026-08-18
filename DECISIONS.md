@@ -1,5 +1,27 @@
 # Mimari Kararlar
 
+## Segment tavan bekçisi — 2026-08-18
+
+### 30. Merge: minimal tavan bekçisi, en-küçük-iki, tavan 8
+segcurve ölçümü (BENCHMARKS): eğri doğrusala yakın (~+45µs/segment) ve
+eşit-recall karşılaştırmasında tam merge'in kazancı ~%20 — merge'in
+gerekçesi latency DEĞİL, sınırsız büyümeyi kesmek (40 segment ≈ 1.8ms
+olurdu; eğri doyuma ulaşmıyor). Politika:
+- **En küçük iki** segment birleştirilir (en-eski değil): yeniden inşa
+  maliyeti n'e bağlı — en ucuz merge, ve boyutlar dengelenir. HNSW merge'i
+  gerçek birleştirme değil yeniden inşadır (grafları birleştirmenin ucuz
+  yolu yok); yazma amplifikasyonu LSM'den pahalı → politika muhafazakâr.
+- Mekanizma mühürlemenin "iki girdi, bir çıktı" varyantı: kilitsiz inşa,
+  tek write-kilidi altında atomik takas (retain+push aynı kilitte — okuyucu
+  ya eski ikiliyi ya birleşiği görür, asla ikisini birden/hiçbirini değil).
+- Merge doğal compaction: tombstone'lular birleşiğe taşınmaz.
+- Tek-yazar sözleşmesi korunur: merge yazıcıyı inşa süresince meşgul eder
+  (100K/tavan-8'de toplam +3.9s), okuyucular hiç durmaz. Tepe bellek:
+  kalıcı + iki kaynak segment (takas anına dek; 10K'lık segmentte +2×9MB).
+- Tavan 8: segcurve'de 8 segment ≈ 385µs — kabul edilebilir taban; tavana
+  ancak mühürleme sonrası bakılır, mühürleme başına merge asla.
+
+
 ## Filtre planlayıcısı — 2026-08-18
 
 ### 28. Ölçüm bulgusu: kırılganlık recall'da değil latency'de (#26 revizyonu)

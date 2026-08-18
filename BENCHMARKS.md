@@ -13,6 +13,16 @@ Merge politikası girdisi: aynı veri farklı seal eşikleriyle bölündü.
 | 8 | 385.3µs | 596µs | 1.0000 | 8.9s |
 | 10 | 466µs | 705.8µs | 1.0000 | 8.4s |
 
+Tavan bekçisi maliyeti (aynı veri, seal=10K):
+
+| | inşa | segment | arama p50 | bellek |
+|---|---|---|---|---|
+| tavansız | 8.4s | 10 | 446µs | 89 MB |
+| tavan=8 | 12.3s | 8 (2 merge) | 410µs | 88 MB |
+
+Merge tepe belleği ≈ kalıcı + 2×kaynak segment (takas anına dek; 10K
+segmentte +2×9 MB).
+
 Okumalar:
 - Eğri hafif alt-doğrusal ama doğrusala yakın: segment başına ~+45µs
   (10 segment = tek segmentin 8.1 katı, 10 katı değil). Küçük segmentin

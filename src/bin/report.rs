@@ -309,7 +309,7 @@ fn main() {
 
     let (base, queries, label) = match mode {
         "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter"
-        | "segcurve" => {
+        | "segcurve" | "mergecost" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -346,6 +346,39 @@ fn main() {
 
     if mode == "filter" {
         filter_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "mergecost" {
+        // Tavan bekçisinin maliyeti: aynı veri, tavanlı vs tavansız.
+        use vector_gvector::index::segmented::SegmentedIndex;
+        let seal = base.len() / 10; // tavansızda 10 segment üretir
+        for (label, ceiling) in [("tavansız", 100usize), ("tavan=8", 8)] {
+            let mut idx = SegmentedIndex::new(dim, metric, HnswParams::default(), seal);
+            idx.set_max_segments(ceiling);
+            let t = Instant::now();
+            for (i, v) in base.iter().enumerate() {
+                idx.insert_shared(VectorId(i as u64), v).expect("insert");
+            }
+            let build = t.elapsed();
+            let (n_seg, n_buf) = idx.shape();
+            let stats = measure_latency(&queries, |q| {
+                std::hint::black_box(idx.search_shared(q, k));
+            });
+            println!(
+                "{label}: inşa {build:.1?}, {n_seg} segment (+{n_buf} buffer), \
+                 arama p50 {:?}, bellek {:.0} MB",
+                stats.p50,
+                idx.memory_bytes() as f64 / 1048576.0
+            );
+        }
+        // Bellek tepe noktası (analitik): merge sırasında iki kaynak + birleşik
+        // aynı anda yaşar. En kötü durum iki eşit segment: tepe ≈ kalıcı + 2×seg.
+        let seg_bytes = (seal * (dim * 4 + 404)) as f64 / 1048576.0;
+        println!(
+            "merge tepe belleği ≈ kalıcı + 2×{seg_bytes:.0} MB (iki kaynak, \
+             takas anına dek yaşar; birleşik zaten kalıcının parçası)"
+        );
         return;
     }
 

@@ -67,6 +67,14 @@ pub struct SegmentedIndex {
     /// Planlayıcı eşikleri (sorgu planlama parametreleri; graf parametresi değil).
     /// Değerler seçicilik ölçümünden (BENCHMARKS, filtre süpürmesi) türetildi.
     planner: PlannerConfig,
+    /// Tavan bekçisi: mühürleme sonrası segment sayısı bunu aşarsa en KÜÇÜK
+    /// iki segment birleştirilir. Gerekçe latency kazancı değil (eşit-recall
+    /// karşılaştırmasında tam merge ~%20 — BENCHMARKS segcurve), sınırsız
+    /// büyümeyi kesmek: eğri doğrusal (~+45µs/segment), 40 segment = ~1.8ms.
+    /// En küçük iki: yeniden inşa maliyeti n'e bağlı — en ucuz birleştirme,
+    /// ve boyutlar dengelenir (en-eski politikası dev segmenti boşuna
+    /// yeniden kurabilirdi).
+    max_segments: usize,
 }
 
 /// Planlayıcı yapılandırması. Değerler 10K + 100K seçicilik süpürmelerinden
@@ -120,7 +128,13 @@ impl SegmentedIndex {
             metadata: RwLock::new(HashMap::new()),
             postings: RwLock::new(HashMap::new()),
             planner: PlannerConfig::default(),
+            max_segments: 8,
         }
+    }
+
+    /// Segment tavanını değiştir (test/deney için).
+    pub fn set_max_segments(&mut self, max: usize) {
+        self.max_segments = max.max(2);
     }
 
     /// Metadata'lı insert. Metadata'sız `insert_shared` boş geçer.
@@ -436,10 +450,63 @@ impl SegmentedIndex {
         // 3. Önce segmenti yayınla, SONRA buffer'ı boşalt. Aradaki pencerede
         // kopya görünür (id bazlı dedupe emer); ters sıra veri kaybettirirdi.
         self.segments.write().expect("kilit").push(segment);
-        let mut buffer = self.buffer.write().expect("kilit");
-        // Tek yazıcı sözleşmesi: seal ile bu satır arasında insert olamaz,
-        // buffer içeriği hâlâ `entries` ile birebir aynı — komple sıfırla.
-        *buffer = BruteForceIndex::new(self.dim, self.metric);
+        {
+            let mut buffer = self.buffer.write().expect("kilit");
+            // Tek yazıcı sözleşmesi: seal ile bu satır arasında insert olamaz,
+            // buffer içeriği hâlâ `entries` ile birebir aynı — komple sıfırla.
+            *buffer = BruteForceIndex::new(self.dim, self.metric);
+        }
+        // Tavan bekçisi: mühürleme mekanizmasının "iki girdi, bir çıktı"
+        // varyantı. Yazıcıyı inşa süresince meşgul eder (seal ile aynı
+        // sözleşme); okuyucular takas anına dek eski iki segmenti aramaya
+        // devam eder — o pencerede 3 kopya yaşar (bellek tepe noktası,
+        // BENCHMARKS'ta ölçülü).
+        while self.segments.read().expect("kilit").len() > self.max_segments {
+            self.merge_smallest_pair();
+        }
+    }
+
+    /// En küçük (canlı sayıya göre) iki segmenti tek segmentte yeniden inşa
+    /// eder. Merge doğal compaction: tombstone'lular yeni segmente taşınmaz,
+    /// merged segmentin tombstone kümesi boş başlar.
+    fn merge_smallest_pair(&self) {
+        // 1. Kurbanları seç (read kilidi kısa; Arc klonları inşa boyunca yaşar).
+        let (a, b) = {
+            let segments = self.segments.read().expect("kilit");
+            if segments.len() < 2 {
+                return;
+            }
+            let live = |s: &Arc<Segment>| s.index.len() - s.tombstones.read().expect("kilit").len();
+            let mut order: Vec<usize> = (0..segments.len()).collect();
+            order.sort_by_key(|&i| live(&segments[i]));
+            (segments[order[0]].clone(), segments[order[1]].clone())
+        };
+        // 2. Kilitsiz yeniden inşa. Tek yazıcı sözleşmesi: bu sırada delete
+        // gelemez, tombstone kümeleri donmuş sayılır.
+        let mut params = self.hnsw_params.clone();
+        let total = a.index.len() + b.index.len();
+        params.seed = params.seed.wrapping_add(total as u64).wrapping_add(1);
+        let mut merged = HnswIndex::new(self.dim, self.metric, params);
+        for seg in [&a, &b] {
+            let tombs = seg.tombstones.read().expect("kilit");
+            for (id, v) in seg.index.live_entries() {
+                if !tombs.contains(&id) {
+                    merged
+                        .insert(id, v)
+                        .expect("merge insert'i başarısız olamaz");
+                }
+            }
+        }
+        let merged = Arc::new(Segment {
+            index: merged,
+            tombstones: RwLock::new(HashSet::new()),
+        });
+        // 3. Atomik takas: iki kaynağı çıkar, birleşiği ekle. Arc kimliğiyle
+        // eşle — indeksler inşa sırasında kaymış olabilir (tek yazıcıda
+        // kaymaz ama kimlik eşleme varsayım taşımaz).
+        let mut segments = self.segments.write().expect("kilit");
+        segments.retain(|s| !Arc::ptr_eq(s, &a) && !Arc::ptr_eq(s, &b));
+        segments.push(merged);
     }
 
     /// Paylaşımlı (&self) silme — tek yazıcı thread'inden.
@@ -533,6 +600,20 @@ impl SegmentedIndex {
             .map(|s| s.index.len() - s.tombstones.read().expect("kilit").len())
             .sum();
         seg_live + self.buffer.read().expect("kilit").len()
+    }
+
+    /// Toplam indeks belleği (vektör + graf, tüm segmentler; byte).
+    pub fn memory_bytes(&self) -> usize {
+        self.segments
+            .read()
+            .expect("kilit")
+            .iter()
+            .map(|s| {
+                let (v, l) = s.index.memory_bytes();
+                v + l
+            })
+            .sum::<usize>()
+            + self.buffer.read().expect("kilit").memory_bytes()
     }
 
     /// Gözlem: (segment sayısı, buffer doluluğu).
@@ -791,6 +872,68 @@ mod tests {
         let res = idx.search_filtered(&vecs[7].clone(), 1, &f_v2);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].id, VectorId(7));
+    }
+
+    // ---- Segment tavanı / merge testleri ----
+
+    #[test]
+    fn merge_guard_enforces_ceiling() {
+        let vecs = random_vectors(1_200, 8, 42);
+        let mut idx = SegmentedIndex::new(8, Metric::L2, HnswParams::default(), 100);
+        idx.set_max_segments(4);
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert_shared(VectorId(i as u64), v).unwrap();
+        }
+        let (n_seg, _) = idx.shape();
+        assert!(n_seg <= 4, "tavan aşıldı: {n_seg}");
+        assert_eq!(idx.len(), 1_200, "merge kayıt kaybetti");
+        // doğruluk: exact referansla örtüşme
+        let queries = random_vectors(20, 8, 43);
+        let mut hits = 0;
+        for q in &queries {
+            let truth: Vec<_> = exact_top_k(&vecs, q, 10, Metric::L2)
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            hits += idx
+                .search_shared(q, 10)
+                .iter()
+                .filter(|r| truth.contains(&r.id))
+                .count();
+        }
+        assert!(
+            hits as f64 / 200.0 >= 0.95,
+            "merge sonrası recall: {hits}/200"
+        );
+    }
+
+    #[test]
+    fn merge_drops_tombstones_and_preserves_reinserts() {
+        let vecs = random_vectors(600, 4, 42);
+        let mut idx = SegmentedIndex::new(4, Metric::L2, HnswParams::default(), 100);
+        idx.set_max_segments(3);
+        for (i, v) in vecs.iter().take(300).enumerate() {
+            idx.insert_shared(VectorId(i as u64), v).unwrap();
+        }
+        // segmentlere düşmüş kayıtlardan sil + birini yeni vektörle geri ekle
+        idx.delete_shared(VectorId(5)).unwrap();
+        idx.delete_shared(VectorId(50)).unwrap();
+        idx.insert_shared(VectorId(5), &[9.0; 4]).unwrap();
+        // tavanı zorlayacak kadar ekle → merge'ler tetiklenir
+        for (i, v) in vecs.iter().enumerate().skip(300) {
+            idx.insert_shared(VectorId(i as u64), v).unwrap();
+        }
+        let (n_seg, _) = idx.shape();
+        assert!(n_seg <= 3);
+        assert_eq!(idx.len(), 599); // 600 - 1 kalıcı silme
+                                    // silinen id dönmüyor, yeniden eklenen yeni vektörüyle dönüyor
+        let all: Vec<_> = idx
+            .search_shared(&[9.0; 4], 599)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(!all.contains(&VectorId(50)));
+        assert_eq!(idx.search_shared(&[9.0; 4], 1)[0].id, VectorId(5));
     }
 
     /// Posting-list'ler her mutasyon dizisinden sonra metadata deposuyla
