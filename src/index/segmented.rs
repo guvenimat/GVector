@@ -195,40 +195,76 @@ impl SegmentedIndex {
             .iter()
             .cloned()
             .collect();
-        let mut out: Vec<SearchResult> = Vec::new();
-        'cand: for &id in candidates {
-            if !filter.matches_id(&meta, id) {
-                continue;
-            }
-            // Yaşayan kopyayı bul: önce buffer (en yeni), sonra segmentler
-            // yeniden eskiye (tombstone'lu eski kopyalar atlanır).
-            if let Some(v) = buffer.vector_of(id) {
-                out.push(SearchResult::new(id, self.metric.distance(query, v)));
-                continue;
-            }
-            for seg in segments.iter().rev() {
-                if seg.index.contains(id) && !seg.tombstones.read().expect("kilit").contains(&id) {
-                    if let Some(v) = seg.index.vector_of(id) {
-                        out.push(SearchResult::new(id, self.metric.distance(query, v)));
-                    }
-                    continue 'cand;
+        // Maliyet notları (ilk sürüm brute-force taramanın ~4 katıydı):
+        // - Tek Eq'li filtrede posting listesi ZATEN kesin eşleşme kümesi:
+        //   id başına metadata haritası sorgusu atlanır.
+        // - Kaynak-dışı döngü: id başına "tüm kaynakları dene" yerine kaynak
+        //   başına kalan id'ler elenir — aynı haritaya ardışık erişim,
+        //   bulunan id bir daha denenmez.
+        // - Top-k heap: O(est·log k), tüm listeyi sıralamak yerine.
+        let mut heap: std::collections::BinaryHeap<SearchResult> =
+            std::collections::BinaryHeap::with_capacity(k + 1);
+        let push = |id: VectorId, d: f32, heap: &mut std::collections::BinaryHeap<SearchResult>| {
+            let cand = SearchResult::new(id, d);
+            if heap.len() < k {
+                heap.push(cand);
+            } else if let Some(worst) = heap.peek() {
+                if cand < *worst {
+                    heap.pop();
+                    heap.push(cand);
                 }
             }
+        };
+        let mut remaining: Vec<VectorId> = if filter.must.len() > 1 {
+            candidates
+                .iter()
+                .copied()
+                .filter(|&id| filter.matches_id(&meta, id))
+                .collect()
+        } else {
+            candidates.iter().copied().collect()
+        };
+        // En yeni kaynaktan eskiye: yaşayan kopya her zaman en yeni konumda
+        // (sil→yeniden-ekle zinciri buffer'a, oradan daha yeni segmente gider).
+        remaining.retain(|&id| {
+            if let Some(v) = buffer.vector_of(id) {
+                push(id, self.metric.distance(query, v), &mut heap);
+                false
+            } else {
+                true
+            }
+        });
+        for seg in segments.iter().rev() {
+            if remaining.is_empty() {
+                break;
+            }
+            let tombs = seg.tombstones.read().expect("kilit");
+            remaining.retain(|&id| {
+                if let Some(v) = seg.index.vector_of(id) {
+                    if !tombs.contains(&id) {
+                        push(id, self.metric.distance(query, v), &mut heap);
+                    }
+                    false // bu segmentte bulundu (canlı ya da gölge) — arama biter
+                } else {
+                    true
+                }
+            });
         }
+        let mut out = heap.into_vec();
         out.sort();
-        out.truncate(k);
         out
     }
 
     /// Filtreli arama — üç kollu planlayıcı (gerekçe: BENCHMARKS filtre
-    /// süpürmesi; DECISIONS #28):
-    /// 1. Eq tahmini küçükse (≤ scan_factor·k): grafı açmadan posting
-    ///    listesinde doğrudan tarama — exact ve ucuz.
-    /// 2. Aksi halde gezinti-içi filtreli graf araması, ziyaret bütçesiyle:
-    ///    kabul/ziyaret oranı çökerse (kümelenmiş eşleşme + uzak sorgu
-    ///    patolojisi) bütçe dolup segment-içi taramaya düşülür.
-    /// 3. Eq koşulu yoksa (tahmin yok) 2. kol bütçeli çalışır — güvenlik
-    ///    ağı aynı.
+    /// süpürmesi; DECISIONS #28–29):
+    /// 1. Eq tahmini küçükse (≤ max(scan_factor·k, scan_fraction·n)):
+    ///    grafı açmadan posting listesinde doğrudan tarama — exact ve ucuz.
+    /// 2. Aksi halde FİLTRESİZ gezinti + over-fetch (ef'' = β·k/ŝ, tavanlı),
+    ///    filtre sonuçlara uygulanır; sonuç < 2k kalırsa exact taramaya düşer.
+    ///    Filtresiz gezinti, gezinti-içi filtrenin kümelenmiş-eşleşme
+    ///    patolojisine (grafın tamamını gezme) yapısal olarak bağışıktır.
+    /// 3. Eq koşulu yoksa (tahmin yok) gezinti-içi filtre + found<k güvenlik
+    ///    ağı — tek seçenek.
     pub fn search_filtered(&self, query: &[f32], k: usize, filter: &Filter) -> Vec<SearchResult> {
         if filter.must.is_empty() {
             return self.search_shared(query, k);
@@ -241,6 +277,12 @@ impl SegmentedIndex {
             Some((0, _)) => Vec::new(),
             Some((est, candidates)) => {
                 let n = self.len_shared().max(1);
+                // Kısayol: tek Eq ve her yaşayan kayıt eşleşiyor → filtre
+                // davranışsal olarak boş; filtresiz yol birebir eşdeğer.
+                // (UI'dan varsayılan/boş filtre gelen pratik durum.)
+                if filter.must.len() == 1 && *est >= n {
+                    return self.search_shared(query, k);
+                }
                 let scan_limit = (self.planner.scan_factor * k)
                     .max((self.planner.scan_fraction * n as f64) as usize);
                 if *est <= scan_limit {

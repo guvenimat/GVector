@@ -38,11 +38,28 @@ en yakın s·n komşusu; sorgular merkeze uzaklıkla yakın/orta/uzak), contig
 | s=1.0 satırları | 0.989 / ~90µs | 1.000 / ~550–610µs |
 
 Not: 100K'da en düşük hücre 0.988 (clustered×orta s=0.3) — eski 0.948
-tabanının üstünde. Üst-bant uzak hücrelerinde latency tarama tabanına
-dayanıyor (scan_candidates'in id→vektör bulma ek yükü ~4x brute-force;
-iyileştirme adayı). s=1.0'daki ~550µs, 4 segment × over-fetch bedeli —
-filtresiz `search_shared` yolu (65µs) filtre boşsa zaten kullanılıyor,
-bu satır "her kayıt eşleşiyor ama filtre yazılmış" ucunu ölçüyor.
+tabanının üstünde.
+
+### scan_candidates optimizasyonu + ŝ≈1 kısayolu (aynı gün, ikinci tur)
+
+İlk tarama kolu brute-force'un ~4 katıydı (id başına metadata yeniden
+kontrolü + kaynak başına hash yoklama + tam sıralama). Düzeltmeler: tek-Eq
+filtrede posting listesi kesin küme sayılır (yeniden kontrol yok), kaynak-dışı
+döngü (bulunan id tekrar denenmez), top-k heap. Ayrıca tek Eq + est=n ise
+filtre davranışsal boş → filtresiz `search_shared` kısayolu.
+
+| hücre (100K) | opt. öncesi | sonrası |
+|---|---|---|
+| tarama bandı (s≤0.05) | 12µs–1.03ms | 7.6µs–440µs (~2.4x) |
+| clustered×uzak s=0.3 | 10.8ms | **3.9ms** (gezinti-içi ham: 13.6ms/0.948) |
+| clustered×uzak s=0.5 | 20.4ms | **6.25ms** (ham: 10.1ms/0.985 — artık hem hızlı hem recall 1.000) |
+| s=1.0 satırları | 550–610µs | 430–530µs = segmentli filtresiz taban |
+
+s=1.0 açıklaması: ilk rapordaki "65µs'e karşı 6x" karşılaştırması yanıltıcıydı —
+65µs TEK HnswIndex'in filtresiz p50'siydi; segmentli indeksin filtresiz tabanı
+zaten ~470µs (5 segment × ef araması; eşzamanlılık ölçümündeki 1893 QPS ≈ 528µs
+ile tutarlı). Kısayol sonrası s=1.0 bu tabana oturuyor; gerileme yapısal değildi,
+karşılaştırma hatasıydı. Recall tabanı değişmedi: 0.988.
 
 
 ## SIMD — 2026-08-18 (wide f32x8 + target-cpu=native)
@@ -130,10 +147,10 @@ indeksten daha yüksek çıkar, arama 5 kez ef genişliğinde çalıştığı i�
 
 | Senaryo | Throughput |
 |---|---|
-| 1 okuyucu thread | 1.893 QPS |
-| 4 okuyucu | 8.303 QPS (4.4x — ölçekleniyor, okuyucular birbirini bloklamıyor ✓) |
-| 8 okuyucu | 16.460 QPS (8.7x) |
-| 4 okuyucu + aktif yazıcı (sürekli sil+ekle, mühürlemeler dahil) | 3.018 QPS |
+| 1 okuyucu thread | 1893 QPS |
+| 4 okuyucu | 8303 QPS (4.4x — ölçekleniyor, okuyucular birbirini bloklamıyor ✓) |
+| 8 okuyucu | 16460 QPS (8.7x) |
+| 4 okuyucu + aktif yazıcı (sürekli sil+ekle, mühürlemeler dahil) | 3018 QPS |
 
 Notlar:
 - Yazıcılı senaryodaki düşüş kilit beklemesinden çok CPU paylaşımından

@@ -237,7 +237,7 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
     // posting-list yolunu kullanır. Varyant başına tek inşa.
     use vector_gvector::index::segmented::SegmentedIndex;
     println!();
-    println!("== planlayıcılı SegmentedIndex (posting-list + tarama kolu + ziyaret bütçesi) ==");
+    println!("== planlayıcılı SegmentedIndex (posting-list + tarama / filtresiz over-fetch) ==");
     println!("| varyant | s | grup | recall | p50 |");
     println!("|---------|---|------|--------|-----|");
     for variant in ["uniform", "clustered", "contig"] {
