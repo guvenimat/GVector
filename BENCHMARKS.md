@@ -1,5 +1,39 @@
 # Benchmark Kayıtları
 
+## Aşama 6 — 2026-08-18 (scalar quantization f32→int8, ADC, M=16/ef_c=200)
+
+Saf quantization (rerank yok); graf f32 ile inşa edilip donduruldu.
+Kalibrasyon + kodlama: 10K → 7 ms, 100K → 92 ms.
+
+### SIFT 10K
+
+| indeks | ef | recall@10 | p50 | p99 | vektör MB | toplam MB (graf dahil) |
+|--------|----|-----------|-----|-----|-----------|------------------------|
+| f32 | 50 | 0.9990 | 65.3µs | 90.6µs | 5.0 | 8.9 |
+| int8 | 50 | 0.9890 | 79.5µs | 124.4µs | 1.2 | 3.7 |
+| f32 | 100 | 1.0000 | 107.1µs | 131.8µs | 5.0 | 8.9 |
+| int8 | 100 | 0.9900 | 124.8µs | 192.8µs | 1.2 | 3.7 |
+
+### SIFT 100K
+
+| indeks | ef | recall@10 | p50 | p99 | vektör MB | toplam MB (graf dahil) |
+|--------|----|-----------|-----|-----|-----------|------------------------|
+| f32 | 25 | 0.9660 | 85µs | 274µs | 49.8 | 88.3 |
+| int8 | 25 | 0.9610 | 91.2µs | 318.7µs | 12.2 | 37.6 |
+| f32 | 50 | 0.9890 | 129µs | 400.7µs | 49.8 | 88.3 |
+| int8 | 50 | 0.9800 | 142.9µs | 366.5µs | 12.2 | 37.6 |
+| f32 | 100 | 0.9980 | 222.3µs | 477µs | 49.8 | 88.3 |
+| int8 | 100 | 0.9870 | 225.9µs | 556.5µs | 12.2 | 37.6 |
+
+Kabul kontrolü:
+- Vektör verisi belleği: 49.8 → 12.2 MB = **4.1x düşüş** ✓ (hedef 4x)
+- Toplam indeks (graf komşulukları dahil): 88.3 → 37.6 MB = 2.35x —
+  graf başına ~404 B/vektör sabit kaldığı için toplam oran vektör oranından düşük.
+- recall@10 kaybı: 0.005–0.011 arası, hepsi **< 0.02** ✓
+- Latency ~%5-10 daha yüksek: ADC'de eleman başına ekstra mul+add
+  (dequantize) var; bant genişliği kazancı 128d'de bunu henüz telafi etmiyor.
+
+
 ## Aşama 5 — 2026-08-18 (segment modeli eşzamanlılık, SIFT 100K)
 
 Yapı: 5 × 20K HNSW segment + brute-force yazma buffer'ı. recall@10 = 1.0000

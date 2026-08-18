@@ -83,7 +83,7 @@ fn main() {
     let metric = Metric::L2; // SIFT literatürde L2 ile değerlendirilir
 
     let (base, queries, label) = match mode {
-        "sift" | "sweep" | "persist" | "delete" | "concurrent" => {
+        "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -172,6 +172,57 @@ fn main() {
             "compaction sonrası recall@{k} = {:.4}",
             recall_of(&hnsw, &bf)
         );
+        return;
+    }
+
+    if mode == "quant" {
+        use vector_gvector::index::quant::QuantizedHnsw;
+        let truth = ground_truth(&base, &queries, k, metric);
+        let mut hnsw = HnswIndex::new(dim, metric, HnswParams::default());
+        for (i, v) in base.iter().enumerate() {
+            hnsw.insert(VectorId(i as u64), v).expect("insert");
+        }
+        let (f32_vec_mem, link_mem) = hnsw.memory_bytes();
+        let t = Instant::now();
+        let quant = QuantizedHnsw::from_hnsw(&hnsw);
+        println!("quantize (kalibrasyon + kodlama): {:?}", t.elapsed());
+        let (code_mem, qlink_mem) = quant.memory_bytes();
+
+        println!();
+        println!("| indeks | ef | recall@{k} | p50 | p99 | vektör MB | toplam MB |");
+        println!("|--------|----|-----------|-----|-----|-----------|-----------|");
+        for ef in [25, 50, 100] {
+            for use_quant in [false, true] {
+                let search = |q: &[f32]| -> Vec<VectorId> {
+                    if use_quant {
+                        quant
+                            .search_with_ef(q, k, ef)
+                            .iter()
+                            .map(|r| r.id)
+                            .collect()
+                    } else {
+                        hnsw.search_with_ef(q, k, ef).iter().map(|r| r.id).collect()
+                    }
+                };
+                let results: Vec<Vec<VectorId>> = queries.iter().map(|q| search(q)).collect();
+                let recall = recall_at_k(&results, &truth, k);
+                let stats = measure_latency(&queries, |q| {
+                    std::hint::black_box(search(q));
+                });
+                let (name, vmem, lmem) = if use_quant {
+                    ("int8", code_mem, qlink_mem)
+                } else {
+                    ("f32", f32_vec_mem, link_mem)
+                };
+                println!(
+                    "| {name} | {ef} | {recall:.4} | {:?} | {:?} | {:.1} | {:.1} |",
+                    stats.p50,
+                    stats.p99,
+                    vmem as f64 / 1048576.0,
+                    (vmem + lmem) as f64 / 1048576.0
+                );
+            }
+        }
         return;
     }
 

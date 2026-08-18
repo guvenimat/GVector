@@ -1,5 +1,31 @@
 # Mimari Kararlar
 
+## Aşama 6 — 2026-08-18
+
+### 22. Quantization mimarisi: f32 ile inşa, dondurup quantize et, ADC ile ara
+Graf f32 hassasiyetle kurulur (komşu seçimi tam hassasiyetten yararlanır),
+`QuantizedHnsw::from_hnsw` grafı kopyalayıp vektörleri u8 koda çevirir;
+f32 kaynağı düşürülünce bellekte yalnız kodlar kalır. Arama asimetrik
+(ADC): query f32, kodlar anlık dequantize — çift taraflı quantize hataya
+iki kez maruz kalırdı. Donmuş indekste insert/delete `Unsupported`:
+segment modelinde (Aşama 5) yazma zaten buffer'a gider, quantize indeks
+"mühürlü segmentin sıkıştırılmış hali" rolündedir.
+
+### 23. Rerank YOK (saf quantization)
+Seçenekler: (a) saf SQ — düşük bellek, makul recall; (b) SQ + diskten f32
+okuyup top-k'yı yeniden sırala — yüksek recall, IO bağımlılığı.
+**(a) seçildi.** Ölçüm: SIFT 100K'da kayıp 0.005–0.011, hedef 0.02'nin
+yarısı bile değil — rerank'in kazanacağı recall pratikte yok denecek kadar
+az, buna karşılık disk IO yolu, dosya yaşam döngüsü bağımlılığı ve p99
+belirsizliği eklenecekti. Rerank, recall bütçesi gerçekten sıkışırsa
+(ör. PQ'ya geçiş) yeniden değerlendirilir.
+
+### 24. Per-dimension min/max kalibrasyon
+Global min/max yerine boyut başına: SIFT gibi boyutlar arası dinamik
+aralığı farklı veride hata payını boyut başına küçültür. Sabit boyut
+(max==min) scale=0 üretir; kod 0, decode min — NaN üretmez (testli).
+
+
 ## Aşama 5 — 2026-08-18
 
 ### 18. Eşzamanlılık: segment modeli (onaylanan strateji 2)

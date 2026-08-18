@@ -20,10 +20,11 @@ use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
 /// (mesafe, slot) çifti; mesafe üzerinden total_cmp sıralaması.
+/// `quant` modülü de aynı adaylık yapısını kullanır.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct Cand {
-    dist: f32,
-    slot: usize,
+pub(crate) struct Cand {
+    pub(crate) dist: f32,
+    pub(crate) slot: usize,
 }
 impl Eq for Cand {}
 impl PartialOrd for Cand {
@@ -483,6 +484,30 @@ impl HnswIndex {
             }
         }
         *self = fresh;
+    }
+
+    // Quantization (Aşama 6) grafın kendisini yeniden kullanır; bu erişimciler
+    // `quant` modülünün donmuş kopya çıkarabilmesi için crate-içi açık.
+    pub(crate) fn graph_links(&self) -> &[Vec<Vec<usize>>] {
+        &self.links
+    }
+    pub(crate) fn graph_ids(&self) -> &[VectorId] {
+        &self.ids
+    }
+    pub(crate) fn graph_entry(&self) -> Option<usize> {
+        self.entry
+    }
+    pub(crate) fn graph_deleted(&self) -> &[bool] {
+        &self.deleted
+    }
+    pub(crate) fn raw_vectors(&self) -> &[f32] {
+        self.storage.as_slice()
+    }
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+    pub fn metric(&self) -> Metric {
+        self.metric
     }
 
     /// id bu indekste yaşıyor mu (tombstone'lular hariç)?
