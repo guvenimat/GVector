@@ -3,6 +3,8 @@
 //! Aşama 1: `bruteforce` (doğruluk referansı, proje boyunca kalacak).
 //! Aşama 2: `hnsw`.
 
+pub mod bruteforce;
+
 use crate::types::{SearchResult, VectorId};
 use thiserror::Error;
 
