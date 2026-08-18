@@ -309,7 +309,7 @@ fn main() {
 
     let (base, queries, label) = match mode {
         "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter"
-        | "segcurve" | "mergecost" | "rangefilter" | "durability" => {
+        | "segcurve" | "mergecost" | "rangefilter" | "durability" | "wal" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -346,6 +346,125 @@ fn main() {
 
     if mode == "filter" {
         filter_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "wal" {
+        // Aşama 7c ölçümü: fsync politikası × yazma throughput'u + replay.
+        use vector_gvector::index::segmented::SegmentedIndex;
+        use vector_gvector::meta::{MetaValue, Metadata};
+        use vector_gvector::storage::wal::SyncPolicy;
+
+        let n = base.len().min(20_000);
+        // Sunucunun yazıcı task'i komutları batch'ler ve batch sonunda TEK
+        // commit yapar; ölçüm bunu birebir modellemeli, yoksa group commit
+        // pratikte per_op'a dönüşür ve tablo politikaların farkını göstermez.
+        const BATCH: usize = 64;
+        println!(
+            "WAL ölçümü: {n} insert, batch={BATCH} (sunucu yazıcı task'i gibi), mühürleme kapalı"
+        );
+        println!();
+        println!("| politika | süre | throughput | fsync/op | WAL boyutu | replay süresi | replay kayıt |");
+        println!("|----------|------|------------|----------|------------|---------------|--------------|");
+        for policy in [
+            SyncPolicy::None,
+            SyncPolicy::Group { window_ms: 20 },
+            SyncPolicy::PerOp,
+        ] {
+            let dir =
+                std::path::PathBuf::from(format!("data/wal-{}", policy.label().replace(':', "-")));
+            let _ = std::fs::remove_dir_all(&dir);
+            let idx = SegmentedIndex::open_durable(
+                dir.clone(),
+                dim,
+                metric,
+                HnswParams::default(),
+                usize::MAX, // mühürleme yok: HNSW inşası ölçümü kirletmesin
+                policy,
+            )
+            .expect("open");
+            let t = Instant::now();
+            for (i, v) in base.iter().take(n).enumerate() {
+                let meta: Metadata = [("v".to_string(), MetaValue::Int(i as i64))].into();
+                idx.insert_with_meta(VectorId(i as u64), v, meta)
+                    .expect("insert");
+                // Batch sonu commit: yanıtlar ancak bundan sonra gönderilir.
+                if (i + 1) % BATCH == 0 {
+                    idx.commit_wal().expect("commit");
+                }
+            }
+            idx.commit_wal().expect("son commit");
+            let elapsed = t.elapsed();
+            let fsync_per_op = match policy {
+                SyncPolicy::PerOp => 1.0,
+                SyncPolicy::Group { .. } => 1.0 / BATCH as f64,
+                SyncPolicy::None => 0.0,
+            };
+            let wal_bytes = idx.wal_len_bytes();
+            drop(idx);
+
+            let t = Instant::now();
+            let reopened = SegmentedIndex::open_durable(
+                dir,
+                dim,
+                metric,
+                HnswParams::default(),
+                usize::MAX,
+                policy,
+            )
+            .expect("reopen");
+            let replay = t.elapsed();
+            println!(
+                "| {} | {:.2?} | {:.0} op/s | {fsync_per_op:.3} | {:.1} MB | {:.2?} | {} |",
+                policy.label(),
+                elapsed,
+                n as f64 / elapsed.as_secs_f64(),
+                wal_bytes as f64 / 1048576.0,
+                replay,
+                reopened.replay_report().applied
+            );
+        }
+
+        // Büyük WAL replay'i: tam taban, fsync'siz yazım (replay süresi
+        // politikadan bağımsız — okuma yolu aynı).
+        if base.len() > n {
+            let dir = std::path::PathBuf::from("data/wal-bigreplay");
+            let _ = std::fs::remove_dir_all(&dir);
+            let idx = SegmentedIndex::open_durable(
+                dir.clone(),
+                dim,
+                metric,
+                HnswParams::default(),
+                usize::MAX,
+                SyncPolicy::None,
+            )
+            .expect("open");
+            for (i, v) in base.iter().enumerate() {
+                let meta: Metadata = [("v".to_string(), MetaValue::Int(i as i64))].into();
+                idx.insert_with_meta(VectorId(i as u64), v, meta)
+                    .expect("insert");
+            }
+            idx.flush_wal().expect("flush");
+            let wal_mb = idx.wal_len_bytes() as f64 / 1048576.0;
+            drop(idx);
+            let t = Instant::now();
+            let re = SegmentedIndex::open_durable(
+                dir,
+                dim,
+                metric,
+                HnswParams::default(),
+                usize::MAX,
+                SyncPolicy::None,
+            )
+            .expect("reopen");
+            println!();
+            println!(
+                "dolu WAL replay: {} kayıt / {wal_mb:.1} MB → {:?} ({:.0} kayıt/s)",
+                re.replay_report().applied,
+                t.elapsed(),
+                base.len() as f64 / t.elapsed().as_secs_f64()
+            );
+        }
         return;
     }
 

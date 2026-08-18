@@ -1,5 +1,33 @@
 # Benchmark Kayıtları
 
+## Aşama 7b/7c — WAL: fsync politikası ve kurtarma — 2026-08-18
+
+20.000 insert (SIFT, 128d + 1 metadata alanı), batch=64 (sunucu yazıcı
+task'inin davranışı), mühürleme kapalı — saf WAL yolu ölçülüyor.
+
+| politika | süre | throughput | fsync/op | WAL | replay |
+|---|---|---|---|---|---|
+| `none` | 71 ms | **281.609 op/s** | 0.000 | 10.9 MB | 36.8 ms |
+| `group:20` | 632 ms | **31.669 op/s** | 0.016 | 10.9 MB | 30.5 ms |
+| `per_op` | 40.1 s | **499 op/s** | 1.000 | 10.9 MB | 33.2 ms |
+
+Dolu WAL replay (100K kayıt / 54.3 MB): **155 ms — 646.000 kayıt/s**.
+
+Okumalar:
+- fsync ~2 ms (Windows, `sync_data`) → per_op'un 499 op/s tavanı doğrudan
+  bundan geliyor. Group commit aynı dayanıklılık vaadini **63x** throughput
+  ile veriyor: varsayılan `group:20` bu yüzden (DECISIONS #36).
+- `none` ile `group` arasındaki 8.9x fark, fsync'in gerçek bedeli.
+- Replay hızlı: 100K kayıt 155 ms — soğuk başlangıcın (242 ms, Aşama 7a)
+  yanında checkpoint aralığını uzun tutmak ucuz. WAL boyutu replay süresini
+  doğrusal etkiliyor.
+
+**Kaza matrisi (deterministik kesme, 5 test):** kayıt sınırı / başlık ortası /
+gövde ortası / son bayt eksik / checkpoint sonrası kesme + bozuk gövde →
+her durumda kurtarılan durum WAL'ın sağlam önekine EŞİT, panic yok, ikinci
+replay idempotent (dosya kesildiği için). proptest: rastgele op dizisi ×
+rastgele kesme noktası (24 vaka) ve tamamen rastgele baytlar → panic yok.
+
 ## Aşama 7a — Soğuk kalıcılık — 2026-08-18 (SIFT 100K, 3 metadata alanı, 8 segment)
 
 | Ölçüm | Değer |

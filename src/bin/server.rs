@@ -12,8 +12,14 @@
 //!   POST   /checkpoint     (mühürle + snapshot + manifest takası)
 //!   GET    /stats
 //!
-//! Kullanım: cargo run --release --bin server -- [port] [dim] [data-dir]
-//! data-dir verilirse indeks kalıcıdır (açılışta manifest'ten kurtarılır).
+//! Kullanım: cargo run --release --bin server -- [port] [dim] [data-dir] [sync]
+//! data-dir verilirse indeks kalıcıdır (açılışta manifest + WAL'dan kurtarılır).
+//! sync: none | per_op | group:<ms> (varsayılan group:20).
+//!
+//! HTTP 200 sözleşmesi (DECISIONS #36): yazma yanıtı, politikanın vaat ettiği
+//! dayanıklılık sağlandıktan SONRA döner. Yazıcı task'i komutları batch'ler,
+//! batch sonunda tek commit yapar, ancak ondan sonra yanıtları gönderir —
+//! group commit budur.
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -26,6 +32,7 @@ use vector_gvector::index::hnsw::HnswParams;
 use vector_gvector::index::segmented::SegmentedIndex;
 use vector_gvector::index::IndexError;
 use vector_gvector::meta::{Filter, Metadata};
+use vector_gvector::storage::wal::SyncPolicy;
 use vector_gvector::types::VectorId;
 
 /// Yazıcı task'ine gönderilen komutlar. Yanıt oneshot ile geri döner —
@@ -201,6 +208,9 @@ async fn stats(State(app): State<AppState>) -> Json<serde_json::Value> {
         "last_checkpoint_unix": app.index.last_checkpoint_unix(),
         "durable": app.index.storage_dir().is_some(),
         "storage_dir": app.index.storage_dir().map(|d| d.display().to_string()),
+        "wal_bytes": app.index.wal_len_bytes(),
+        "wal_policy": app.index.wal_policy_label(),
+        "wal_replay_applied": app.index.replay_report().applied,
     }))
 }
 
@@ -211,24 +221,41 @@ async fn main() {
     let dim: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(128);
 
     let data_dir = args.next().map(std::path::PathBuf::from);
+    let policy = args
+        .next()
+        .and_then(|s| SyncPolicy::parse(&s))
+        .unwrap_or(SyncPolicy::Group { window_ms: 20 });
     let index = Arc::new(match &data_dir {
         Some(dir) => {
             let t = std::time::Instant::now();
-            let idx = SegmentedIndex::open_or_create(
+            let idx = SegmentedIndex::open_durable(
                 dir.clone(),
                 dim,
                 Metric::L2,
                 HnswParams::default(),
                 10_000,
+                policy,
             )
             .expect("indeks açılamadı");
+            let rep = idx.replay_report();
             println!(
-                "kalıcı mod: {} (generation={}, {} kayıt, {:?})",
+                "kalıcı mod: {} (generation={}, {} kayıt, sync={}, {:?})",
                 dir.display(),
                 idx.generation(),
                 idx.len_shared(),
+                policy.label(),
                 t.elapsed()
             );
+            if rep.applied > 0 || rep.truncated_at.is_some() {
+                println!(
+                    "  WAL replay: {} kayıt uygulandı{}",
+                    rep.applied,
+                    match (&rep.reason, rep.truncated_at) {
+                        (Some(r), Some(at)) => format!("; kuyruk {at} offsetinde kesildi ({r})"),
+                        _ => String::new(),
+                    }
+                );
+            }
             idx
         }
         None => {
@@ -243,27 +270,65 @@ async fn main() {
         let index = index.clone();
         // Mühürleme (HNSW inşası) saniyeler sürebilir: blocking thread'de koş.
         tokio::task::spawn_blocking(move || {
-            while let Some(cmd) = rx.blocking_recv() {
-                match cmd {
-                    WriteCmd::Insert {
-                        id,
-                        vector,
-                        meta,
-                        reply,
-                    } => {
-                        let _ = reply.send(index.insert_with_meta(id, &vector, meta));
+            // Group commit: hazır bekleyen komutlar tek batch'te uygulanır,
+            // batch sonunda TEK commit yapılır ve yanıtlar ancak ondan sonra
+            // gönderilir. Böylece "200 = dayanıklı" sözleşmesi korunurken
+            // fsync maliyeti batch'e yayılır.
+            const MAX_BATCH: usize = 256;
+            let mut pending: Vec<oneshot::Sender<Result<(), IndexError>>> = Vec::new();
+            let mut results: Vec<Result<(), IndexError>> = Vec::new();
+            while let Some(first) = rx.blocking_recv() {
+                let mut batch = vec![first];
+                while batch.len() < MAX_BATCH {
+                    match rx.try_recv() {
+                        Ok(c) => batch.push(c),
+                        Err(_) => break,
                     }
-                    WriteCmd::Delete { id, reply } => {
-                        let _ = reply.send(index.delete_shared(id));
+                }
+                for cmd in batch {
+                    match cmd {
+                        WriteCmd::Insert {
+                            id,
+                            vector,
+                            meta,
+                            reply,
+                        } => {
+                            results.push(index.insert_with_meta(id, &vector, meta));
+                            pending.push(reply);
+                        }
+                        WriteCmd::Delete { id, reply } => {
+                            results.push(index.delete_shared(id));
+                            pending.push(reply);
+                        }
+                        WriteCmd::Checkpoint { reply } => {
+                            // Checkpoint kendi dayanıklılığını sağlar; bekleyen
+                            // yazmaları önce commit et ki sıra bozulmasın.
+                            let _ = index.commit_wal();
+                            for (tx, r) in pending.drain(..).zip(results.drain(..)) {
+                                let _ = tx.send(r);
+                            }
+                            let _ = reply.send(index.checkpoint().map_err(|e| e.to_string()));
+                        }
                     }
-                    WriteCmd::Checkpoint { reply } => {
-                        let _ = reply.send(index.checkpoint().map_err(|e| e.to_string()));
+                }
+                if !pending.is_empty() {
+                    let commit = index.commit_wal();
+                    for (tx, r) in pending.drain(..).zip(results.drain(..)) {
+                        // Commit başarısızsa yazma dayanıklı değildir: istemci
+                        // bunu 200 olarak görmemeli.
+                        let _ = tx.send(match (&commit, r) {
+                            (Err(e), _) => Err(IndexError::Storage(e.to_string())),
+                            (Ok(()), r) => r,
+                        });
                     }
                 }
             }
+            // Kanal kapandı (graceful shutdown): kalanı dayanıklı yap.
+            let _ = index.flush_wal();
         });
     }
 
+    let index_for_shutdown = index.clone();
     let app = Router::new()
         .route("/vectors", post(insert_vector))
         .route("/vectors/:id", delete(delete_vector))
@@ -275,5 +340,19 @@ async fn main() {
     let addr = format!("127.0.0.1:{port}");
     println!("vector-gvector API dinliyor: http://{addr} (dim={dim})");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
-    axum::serve(listener, app).await.expect("serve");
+    // Graceful shutdown: ctrl-c → yeni istek alma, bekleyenleri bitir,
+    // ardından WAL'ı zorla fsync'le. Kapanışta politika ne olursa olsun
+    // fsync yapılır — veri kaybetmenin bir faydası yok.
+    let shutdown_index = index_for_shutdown;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            let _ = tokio::signal::ctrl_c().await;
+            println!("\nkapanıyor: WAL flush ediliyor...");
+        })
+        .await
+        .expect("serve");
+    if let Err(e) = shutdown_index.flush_wal() {
+        eprintln!("WAL flush hatası: {e}");
+    }
+    println!("temiz kapanış.");
 }

@@ -22,6 +22,10 @@ pub enum IndexError {
     NotFound(VectorId),
     #[error("desteklenmiyor: {0}")]
     Unsupported(&'static str),
+    /// WAL/disk yazımı başarısız. Write-ahead sırası gereği bu hata
+    /// döndüğünde mutasyon belleğe UYGULANMAMIŞTIR.
+    #[error("kalıcılık hatası: {0}")]
+    Storage(String),
 }
 
 /// Tüm indeks implementasyonlarının ortak arayüzü.

@@ -13,6 +13,8 @@
 //!   alan indeksleri metadata'dan tam olarak yeniden kurulur. Tek kaynak →
 //!   tutarsızlık riski yapısal olarak yok.
 
+pub mod wal;
+
 use crate::distance::Metric;
 use crate::index::hnsw::HnswParams;
 use crate::meta::{MetaValue, Metadata};
@@ -127,8 +129,8 @@ fn decode_framed<T: serde::de::DeserializeOwned>(
 // diğeri iç format, bağımsız evrilebilirler.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) enum MetaValueRepr {
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub enum MetaValueRepr {
     Bool(bool),
     Int(i64),
     Float(f64),
@@ -157,10 +159,16 @@ impl From<MetaValueRepr> for MetaValue {
     }
 }
 
-pub(crate) type MetaRepr = Vec<(String, MetaValueRepr)>;
+pub type MetaRepr = Vec<(String, MetaValueRepr)>;
 
+/// Metadata'yı disk temsiline çevirir. **Anahtara göre sıralı** — `HashMap`
+/// iterasyon sırası deterministik olmadığı için aynı metadata farklı baytlar
+/// üretebilirdi; bu hem CRC/dosya karşılaştırmalarını hem de ölçüm
+/// tekrarlanabilirliğini bozardı (testte yakalandı).
 pub(crate) fn meta_to_repr(m: &Metadata) -> MetaRepr {
-    m.iter().map(|(k, v)| (k.clone(), v.into())).collect()
+    let mut out: MetaRepr = m.iter().map(|(k, v)| (k.clone(), v.into())).collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 pub(crate) fn repr_to_meta(r: MetaRepr) -> Metadata {

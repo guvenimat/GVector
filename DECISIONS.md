@@ -1,5 +1,53 @@
 # Mimari Kararlar
 
+## Aşama 7b/7c — WAL ve kurtarma — 2026-08-18
+
+### 36. HTTP 200 sözleşmesi politikaya göre tanımlıdır
+Yazma sırası **write-ahead**: (1) validasyon (dim/duplicate — mutasyon YOK),
+(2) WAL append + politika fsync'i, (3) belleğe uygula. Ters sırada
+"istemciye hata döndük ama kayıt bellekte kaldı ve sonraki checkpoint onu
+kalıcılaştırdı" durumu oluşurdu. `IndexError::Storage` döndüğünde mutasyon
+belleğe UYGULANMAMIŞTIR.
+
+200 (POST /vectors → 201, DELETE → 204) şu anlama gelir:
+
+| politika | 200 = | hayatta kalır | ölçülen |
+|---|---|---|---|
+| `none` | bellek + WAL append (OS cache) | süreç çökmesi; **güç kesintisi DEĞİL** | 281.609 op/s |
+| `group:T` (varsayılan) | kaydı kapsayan fsync tamamlandı | güç kesintisi | 31.669 op/s (batch=64) |
+| `per_op` | kaydın kendi fsync'i tamamlandı | güç kesintisi | 499 op/s |
+
+**Varsayılan `group:20`** — ölçüm gerekçesi: per_op'ta fsync ~2 ms ve
+throughput 499 op/s'ye çakılıyor; group aynı dayanıklılık vaadini 63x
+throughput ile veriyor. Bedeli, yanıtın batch penceresi kadar gecikmesi.
+Gerçek group commit için yazıcı task'i komutları batch'ler, batch sonunda
+TEK commit yapar ve yanıtları **ancak ondan sonra** gönderir; "fsync'i
+beklemeyen group" sözleşmeyi sessizce zayıflatırdı.
+
+### 37. Kurtarma: ilk tutarsızlıkta dur, dosyayı orada KES
+Replay kısmi kayıt / CRC uyuşmazlığı / mantıksız uzunlukta durur; hayalet op
+asla türetilmez. Kritik ayrıntı: sağlam önekin sonunda dosya `set_len` ile
+kesilir. Kesmezsek bir sonraki append bozuk kuyruğun üstüne yazar ve dosya
+kalıcı olarak tutarsız kalırdı (ikinci replay farklı sonuç verirdi — testli).
+
+Replay sırasında `self.wal` HENÜZ bağlı değildir; bu, "replay ettiğimi
+tekrar loglamak" hatasını yapısal olarak imkânsız kılar.
+
+### 38. Kaza testi yöntemi: deterministik kesme, süreç öldürme değil
+Op dizisi gerçek indekse uygulanır, WAL dosyası kayıt sınırında VE kayıt
+ortasında (başlık ortası, gövde ortası, son bayt eksik) budanır, indeks
+yeniden açılır. Taşınabilir (Windows dahil), tekrarlanabilir, kesme noktası
+tam kontrollü. Doğruluk ölçütü: kurtarılan durum == WAL'ın sağlam önekinin
+durumu (ne eksik ne fazla). proptest: rastgele op dizisi × rastgele kesme
+noktası, ayrıca tamamen rastgele baytlar → hiçbir noktada panic yok.
+
+### 39. WAL rotasyonu checkpoint'e bağlı
+Checkpoint önce buffer'ı mühürler (tüm veri segmentlere geçer), sonra YENİ
+WAL dosyasını açar, sonra manifest'i yazar. Manifest yeni WAL'ı işaret ettiği
+anda eskisinin tüm kayıtları zaten segmentlerde. Kesinti olursa eski manifest
+hâlâ eski WAL'ı işaret eder — tutarlı. WAL'da checkpoint işareti YOK: "bu
+noktadan öncesi segmentlerde" bilgisi dosya sınırının kendisi.
+
 ## Aşama 7a — Soğuk kalıcılık — 2026-08-18
 
 ### 32. Segment dosyaları değişmez, adları generation taşır

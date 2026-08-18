@@ -32,6 +32,7 @@ use crate::index::hnsw::{HnswIndex, HnswParams};
 use crate::index::numeric::NumericFieldIndex;
 use crate::index::{IndexError, VectorIndex};
 use crate::meta::{Filter, MetaKey, MetaValue, Metadata, Predicate};
+use crate::storage::wal::{self, ReplayReport, SyncPolicy, Wal, WalRecord};
 use crate::storage::{self, Manifest, SegmentRef, StorageError};
 use crate::types::{SearchResult, VectorId};
 use std::collections::{HashMap, HashSet};
@@ -100,6 +101,10 @@ pub struct SegmentedIndex {
     generation: AtomicU64,
     /// Son başarılı checkpoint'in unix zamanı (0 = hiç yapılmadı).
     last_checkpoint: AtomicU64,
+    /// Sıcak kalıcılık (Aşama 7b). None = yalnız checkpoint dayanıklılığı.
+    wal: RwLock<Option<Wal>>,
+    /// Açılışta yapılan WAL replay'inin raporu (gözlem / /stats).
+    replay_report: RwLock<ReplayReport>,
 }
 
 /// Planlayıcı yapılandırması. Değerler 10K + 100K seçicilik süpürmelerinden
@@ -188,6 +193,8 @@ impl SegmentedIndex {
             storage_dir: RwLock::new(None),
             generation: AtomicU64::new(0),
             last_checkpoint: AtomicU64::new(0),
+            wal: RwLock::new(None),
+            replay_report: RwLock::new(ReplayReport::default()),
         }
     }
 
@@ -203,9 +210,52 @@ impl SegmentedIndex {
         vector: &[f32],
         meta: Metadata,
     ) -> Result<(), IndexError> {
-        self.insert_shared(id, vector)?;
+        // Write-ahead sırası (DECISIONS #36): (1) validasyon — mutasyon yok,
+        // (2) WAL append + politikaya göre fsync, (3) belleğe uygula.
+        // Ters sırada "istemciye hata döndük ama kayıt bellekte kaldı ve
+        // sonraki checkpoint onu kalıcılaştırdı" durumu oluşurdu.
+        self.validate_insert(id, vector)?;
+        if let Some(w) = self.wal.write().expect("kilit").as_mut() {
+            w.append(&WalRecord::insert(id, vector, &meta))
+                .map_err(|e| IndexError::Storage(e.to_string()))?;
+        }
+        self.apply_insert(id, vector, meta)
+    }
+
+    /// Insert'in bellek tarafı (WAL'sız). Replay bu yolu kullanır — replay
+    /// sırasında WAL bağlı olmadığı için kayıtlar ikiye katlanmaz.
+    fn apply_insert(&self, id: VectorId, vector: &[f32], meta: Metadata) -> Result<(), IndexError> {
+        let should_seal = {
+            let mut buffer = self.buffer.write().expect("kilit");
+            buffer.insert(id, vector)?;
+            buffer.len() >= self.seal_threshold
+        }; // write kilidi düşer; mühürleme kilitsiz çalışacak
         if !meta.is_empty() {
             self.index_metadata(id, meta);
+        }
+        if should_seal {
+            self.seal(); // tavan bekçisi seal'ın içinde
+        }
+        Ok(())
+    }
+
+    /// Insert doğrulaması: boyut ve id çakışması. Hiçbir şeyi değiştirmez —
+    /// WAL'a yazmadan önce çağrılabilsin diye ayrı.
+    fn validate_insert(&self, id: VectorId, vector: &[f32]) -> Result<(), IndexError> {
+        if vector.len() != self.dim {
+            return Err(IndexError::DimensionMismatch {
+                expected: self.dim,
+                got: vector.len(),
+            });
+        }
+        if self.buffer.read().expect("kilit").contains(id) {
+            return Err(IndexError::DuplicateId(id));
+        }
+        let segments = self.segments.read().expect("kilit");
+        for seg in segments.iter() {
+            if seg.index.contains(id) && !seg.tombstones.read().expect("kilit").contains(&id) {
+                return Err(IndexError::DuplicateId(id));
+            }
         }
         Ok(())
     }
@@ -554,36 +604,7 @@ impl SegmentedIndex {
     /// Birden çok yazıcı data race üretmez (her şey kilitli) ama duplicate id
     /// kontrolü iki yazıcı arasında yarışabilir; sözleşme tek yazıcıdır.
     pub fn insert_shared(&self, id: VectorId, vector: &[f32]) -> Result<(), IndexError> {
-        if vector.len() != self.dim {
-            return Err(IndexError::DimensionMismatch {
-                expected: self.dim,
-                got: vector.len(),
-            });
-        }
-        // Duplicate kontrolü: buffer'da ya da herhangi bir segmentte (tombstone'suz) yaşıyor mu?
-        {
-            let buffer = self.buffer.read().expect("kilit zehirlenmedi");
-            if buffer.contains(id) {
-                return Err(IndexError::DuplicateId(id));
-            }
-        }
-        {
-            let segments = self.segments.read().expect("kilit");
-            for seg in segments.iter() {
-                if seg.index.contains(id) && !seg.tombstones.read().expect("kilit").contains(&id) {
-                    return Err(IndexError::DuplicateId(id));
-                }
-            }
-        }
-        let should_seal = {
-            let mut buffer = self.buffer.write().expect("kilit");
-            buffer.insert(id, vector)?;
-            buffer.len() >= self.seal_threshold
-        }; // write kilidi burada düşer; mühürleme kilitsiz çalışacak
-        if should_seal {
-            self.seal();
-        }
-        Ok(())
+        self.insert_with_meta(id, vector, Metadata::new())
     }
 
     /// Buffer'ı HNSW segmentine dönüştürür. Pahalı inşa kilitsiz yapılır;
@@ -679,6 +700,30 @@ impl SegmentedIndex {
     /// Paylaşımlı (&self) silme — tek yazıcı thread'inden.
     /// Metadata da düşürülür (yeniden eklemede eski metadata sızmasın).
     pub fn delete_shared(&self, id: VectorId) -> Result<(), IndexError> {
+        // Write-ahead: önce "bu id yaşıyor mu" (mutasyonsuz kontrol), sonra
+        // WAL, sonra gerçek silme.
+        if !self.contains_live(id) {
+            return Err(IndexError::NotFound(id));
+        }
+        if let Some(w) = self.wal.write().expect("kilit").as_mut() {
+            w.append(&WalRecord::delete(id))
+                .map_err(|e| IndexError::Storage(e.to_string()))?;
+        }
+        self.apply_delete(id)
+    }
+
+    /// id yaşayan bir kayda mı ait? (buffer ya da tombstone'suz segment)
+    fn contains_live(&self, id: VectorId) -> bool {
+        if self.buffer.read().expect("kilit").contains(id) {
+            return true;
+        }
+        self.segments.read().expect("kilit").iter().any(|seg| {
+            seg.index.contains(id) && !seg.tombstones.read().expect("kilit").contains(&id)
+        })
+    }
+
+    /// Silmenin bellek tarafı (WAL'sız); replay bu yolu kullanır.
+    fn apply_delete(&self, id: VectorId) -> Result<(), IndexError> {
         let res = self.delete_vector_only(id);
         if res.is_ok() {
             // Posting-list'ler yalnız yaşayan id'leri içerir: metadata'yı
@@ -875,6 +920,23 @@ impl SegmentedIndex {
             (Some(name), storage::crc32(&bytes))
         };
 
+        // WAL rotasyonu: buffer mühürlendiği için eski WAL'ın TÜM kayıtları
+        // artık segmentlerde. Yeni (boş) dosyayı manifest yazılmadan ÖNCE
+        // açarız; manifest yeni adı işaret eder, GC eskisini siler. Kesinti
+        // olursa eski manifest hâlâ eski WAL'ı işaret eder — tutarlı.
+        let wal_file = {
+            let mut guard = self.wal.write().expect("kilit");
+            match guard.as_ref() {
+                Some(old) => {
+                    let policy = old.policy();
+                    let name = Manifest::wal_file_name(generation);
+                    *guard = Some(Wal::open_append(dir.join(&name), policy)?);
+                    Some(name)
+                }
+                None => None,
+            }
+        };
+
         let now = storage::now_unix_secs();
         let manifest = Manifest {
             generation,
@@ -886,13 +948,66 @@ impl SegmentedIndex {
             segments: refs,
             metadata_file,
             metadata_crc,
-            wal_file: None, // Aşama 7b dolduracak
+            wal_file,
             created_unix_secs: now,
         };
         manifest.write(&dir)?;
         storage::gc_unreferenced(&dir, &manifest)?;
         self.last_checkpoint.store(now, Ordering::Relaxed);
         Ok(generation)
+    }
+
+    /// WAL'ı zorla fsync'ler (grup penceresini kapatır). Graceful shutdown ve
+    /// yazıcı task'inin batch sonu bunu çağırır.
+    pub fn flush_wal(&self) -> Result<(), IndexError> {
+        if let Some(w) = self.wal.write().expect("kilit").as_mut() {
+            w.sync().map_err(|e| IndexError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Grup penceresi dolduysa fsync'ler; batch sonunda ucuz çağrı.
+    pub fn sync_wal_if_due(&self) -> Result<bool, IndexError> {
+        if let Some(w) = self.wal.write().expect("kilit").as_mut() {
+            return w
+                .sync_if_due()
+                .map_err(|e| IndexError::Storage(e.to_string()));
+        }
+        Ok(false)
+    }
+
+    /// Batch sonu commit: politikanın vaat ettiği dayanıklılığı sağlar
+    /// (None → yalnız OS'e teslim, diğerleri → fsync). Yazıcı task'i HTTP
+    /// yanıtlarını göndermeden ÖNCE çağırır; group commit'in
+    /// "200 = fsync'lendi" sözleşmesi buna dayanır.
+    pub fn commit_wal(&self) -> Result<(), IndexError> {
+        if let Some(w) = self.wal.write().expect("kilit").as_mut() {
+            w.commit().map_err(|e| IndexError::Storage(e.to_string()))?;
+        }
+        Ok(())
+    }
+
+    /// Aktif WAL'ın bayt boyutu (0 = WAL yok).
+    pub fn wal_len_bytes(&self) -> u64 {
+        self.wal
+            .read()
+            .expect("kilit")
+            .as_ref()
+            .map(|w| w.len_bytes())
+            .unwrap_or(0)
+    }
+
+    pub fn wal_policy_label(&self) -> Option<String> {
+        self.wal
+            .read()
+            .expect("kilit")
+            .as_ref()
+            .map(|w| w.policy().label())
+    }
+
+    /// Açılışta yapılan WAL replay'inin raporu.
+    pub fn replay_report(&self) -> ReplayReport {
+        self.replay_report.read().expect("kilit").clone()
     }
 
     /// Dizinde manifest varsa oradan kurar, yoksa verilen parametrelerle boş
@@ -907,10 +1022,42 @@ impl SegmentedIndex {
         hnsw_params: HnswParams,
         seal_threshold: usize,
     ) -> Result<Self, StorageError> {
+        Self::open_inner(dir, dim, metric, hnsw_params, seal_threshold, None)
+    }
+
+    /// WAL'lı açılış: manifest + segmentler yüklenir, ardından WAL replay
+    /// edilir ve log append modunda bağlanır. Kurtarma her zaman WAL'la
+    /// tamamlanır — manifest tek başına yeterli sayılmaz (DECISIONS #33'teki
+    /// Windows dizin-fsync boşluğu).
+    pub fn open_durable(
+        dir: PathBuf,
+        dim: usize,
+        metric: Metric,
+        hnsw_params: HnswParams,
+        seal_threshold: usize,
+        policy: SyncPolicy,
+    ) -> Result<Self, StorageError> {
+        Self::open_inner(dir, dim, metric, hnsw_params, seal_threshold, Some(policy))
+    }
+
+    fn open_inner(
+        dir: PathBuf,
+        dim: usize,
+        metric: Metric,
+        hnsw_params: HnswParams,
+        seal_threshold: usize,
+        wal_policy: Option<SyncPolicy>,
+    ) -> Result<Self, StorageError> {
         std::fs::create_dir_all(&dir)?;
         let Some(manifest) = Manifest::read(&dir)? else {
             let idx = Self::new(dim, metric, hnsw_params, seal_threshold);
-            idx.attach_storage(dir);
+            idx.attach_storage(dir.clone());
+            if let Some(policy) = wal_policy {
+                // Manifest yok ama WAL olabilir: önceki koşu checkpoint'e
+                // ulaşamadan çöktüyse tüm veri oradadır.
+                let name = Manifest::wal_file_name(0);
+                idx.recover_wal(&dir, &name, policy)?;
+            }
             return Ok(idx);
         };
         let mut idx = Self::new(
@@ -949,8 +1096,45 @@ impl SegmentedIndex {
         idx.generation.store(manifest.generation, Ordering::Relaxed);
         idx.last_checkpoint
             .store(manifest.created_unix_secs, Ordering::Relaxed);
-        idx.attach_storage(dir);
+        idx.attach_storage(dir.clone());
+        if let Some(policy) = wal_policy {
+            let name = manifest
+                .wal_file
+                .clone()
+                .unwrap_or_else(|| Manifest::wal_file_name(manifest.generation));
+            idx.recover_wal(&dir, &name, policy)?;
+        }
         Ok(idx)
+    }
+
+    /// WAL replay + logu append modunda bağlama.
+    ///
+    /// Replay sırasında `self.wal` HENÜZ None olduğu için kayıtlar yeniden
+    /// yazılmaz; bu, "replay ettiğimi tekrar loglamak" hatasını yapısal
+    /// olarak imkânsız kılar.
+    fn recover_wal(
+        &self,
+        dir: &std::path::Path,
+        name: &str,
+        policy: SyncPolicy,
+    ) -> Result<(), StorageError> {
+        let path = dir.join(name);
+        let (records, report) = wal::replay(&path)?;
+        for rec in records {
+            match rec {
+                WalRecord::Insert { id, vector, meta } => {
+                    self.apply_insert(VectorId(id), &vector, wal::record_meta(meta))?;
+                }
+                WalRecord::Delete { id } => {
+                    // Replay'de "yok" durumu rotasyon sınırında meşru olabilir:
+                    // sessizce geç, hayalet op üretme.
+                    let _ = self.apply_delete(VectorId(id));
+                }
+            }
+        }
+        *self.replay_report.write().expect("kilit") = report;
+        *self.wal.write().expect("kilit") = Some(Wal::open_append(path, policy)?);
+        Ok(())
     }
 
     /// Toplam indeks belleği (vektör + graf, tüm segmentler; byte).
