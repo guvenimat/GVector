@@ -863,6 +863,12 @@ impl SegmentedIndex {
     /// Kilitsiz-esaslı arama: segment listesi klonlanır, HNSW aramaları
     /// hiçbir kilit tutulmadan koşar; buffer araması kısa read kilidiyle.
     pub fn search_shared(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
+        self.search_shared_with_ef(query, k, self.ef_search)
+    }
+
+    /// `search_shared`'ın ef parametreli hali (parametre süpürmesi ve
+    /// ölçüm için; grafı etkilemez, yalnız sorgu genişliğini değiştirir).
+    pub fn search_shared_with_ef(&self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult> {
         if k == 0 {
             return Vec::new();
         }
@@ -880,9 +886,7 @@ impl SegmentedIndex {
             // Tombstone'lar sonuçları eleyebileceği için fazladan aday iste;
             // tombstone sayısı k'yı aşarsa bile ef zaten üst sınırı belirler.
             let want = k + tombs.len().min(k);
-            let res = seg
-                .index
-                .search_with_ef(query, want, self.ef_search.max(want));
+            let res = seg.index.search_with_ef(query, want, ef.max(want));
             all.extend(res.into_iter().filter(|r| !tombs.contains(&r.id)));
         }
         {
@@ -1233,6 +1237,21 @@ impl SegmentedIndex {
             })
             .sum::<usize>()
             + self.buffer.read().expect("kilit").memory_bytes()
+    }
+
+    /// Ölçüm için: her mühürlü segmentin int8 (quantize) kopyasını üretir.
+    /// `Segment` tipini dışa sızdırmamak için dönüşüm burada yapılır.
+    ///
+    /// NOT: bu bir ÖLÇÜM yoludur, üretim yolu değil — quantize segmentler
+    /// `SegmentedIndex`'e entegre DEĞİL (tombstone'lar, buffer ve planlayıcı
+    /// f32 tarafında kalır). Entegrasyon kararı 8a ölçümüne bağlı.
+    pub fn quantize_segments(&self) -> Vec<crate::index::quant::QuantizedHnsw> {
+        self.segments
+            .read()
+            .expect("kilit")
+            .iter()
+            .map(|s| crate::index::quant::QuantizedHnsw::from_hnsw(&s.index))
+            .collect()
     }
 
     /// Gözlem: (segment sayısı, buffer doluluğu).

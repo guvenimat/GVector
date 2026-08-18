@@ -1,5 +1,50 @@
 # Mimari Kararlar
 
+## Aşama 8a — int8 ölçeklenmesi — 2026-08-19
+
+### 44. DÜZELTME: "1M'de okuma ölçeklenmiyor" bulgusu (#43) YANLIŞTI
+Aşama 8'in karışık yük bölümünde 8 okuyucu için 945 QPS ölçülmüş ve
+"ölçeklenme çöküyor, bellek bant genişliği duvarı" sonucuna varılmıştı.
+İzole ölçüm bunu çürüttü: **f32 1M'de 5.4–6.1x ölçekleniyor** (8 fiziksel
+çekirdek). Hatanın kaynağı ölçüm ortamı: o tablo, 5 dakikadır çalışan,
+1M inşa + 130K yazma + merge + üç soğuk başlangıç yapmış, RSS'i 3.1 GB'a
+çıkmış bir süreçte `fullscale`'in 8. bölümü olarak alınmıştı.
+
+- **Geçerliliğini koruyan kısım:** aynı tablodaki fsync politikası
+  karşılaştırması (oran 0.99–1.01) — üç politika da aynı kirli süreçte
+  ölçüldüğü için *göreli* sonuç geçerli. "fsync okuyuculara bindirmiyor"
+  kararı ayakta.
+- **Geçersiz kısım:** mutlak QPS değerleri ve "ölçeklenme çöküyor" yorumu.
+- **Ders (metodoloji):** performans ölçümleri izole, taze süreçte,
+  warmup + tekrar medyanıyla yapılmalı. `fullscale` gibi uzun bir koşunun
+  sonuna eklenen throughput ölçümü, ölçtüğünü sandığın şeyi ölçmez.
+  Bu ders `int8scale` moduna kod yorumu olarak da yazıldı.
+- **L3 açıklaması:** 100K'daki 8.7x ölçeklenme, çalışma kümesinin (92 MB)
+  makinenin **96 MB L3'üne** (Ryzen 7800X3D, 3D V-Cache) sığmasındandı.
+  1M'de sığmıyor ve ölçeklenme 8.7x → ~5.5x'e düşüyor: gerçek etki bu,
+  "çöküş" değil.
+
+### 45. 8a kararı: int8 entegrasyonu performans gerekçesiyle YAPILMAZ
+Ön-kayıtlı eşik (plan): 8 thread / 1 thread ≥ 2.0 → GO. **Ölçülen: 2.75–3.58x,
+yani eşik teknik olarak KARŞILANDI.** Ancak eşiğin dayandığı varsayım
+("f32 1M'de ölçeklenmiyor, int8 ölçeklenmeyi geri getirir") #44 ile çürüdü.
+Eşik değiştirilmiyor; sonuç olduğu gibi kaydediliyor ve karar varsayımın
+çürümesine göre veriliyor:
+
+- **int8 ölçeklenmesi f32'den DAHA AZ** (2.75–3.58x vs 5.40–6.12x).
+- **int8 mutlak olarak ~2x YAVAŞ**: 8-thread QPS oranı 0.46–0.63x.
+- Sebep ADC'nin dequantize aritmetiği (Aşama 6: 15.6 ns vs 7.4 ns). Tek
+  thread'de bellek avantajı bunu dengeliyor, çok thread'de CPU darboğaz
+  olunca ADC ağır basıyor.
+- **Karar:** "1M+ için int8 segmented entegrasyonu" performans kalemi olarak
+  backlog'a GİRMEZ. Bellek gerekçesi (2.00x çalışma kümesi) Aşama 6'dan beri
+  zaten biliniyordu ve ayrı bir karardır.
+- **Yeniden bakma koşulu:** (a) ADC'nin SIMD'i iyileştirilirse (şu an u8→f32
+  dönüşümü şerit başına skaler; tam vektörleştirilmiş bir yol ölçülmedi),
+  (b) veri RAM'e sığmaz hale gelirse bellek gerekçesi performans gerekçesinin
+  önüne geçer, (c) graf temsili de küçültülürse (komşuluklarda u32 slot)
+  çalışma kümesi L3'e yaklaşabilir — o noktada tablo yeniden anlam kazanır.
+
 ## Aşama 8 sonuçları — go/no-go kararları — 2026-08-19
 
 ### 42. Eşik-karşılaştırmalı kararlar (ön-kayıt #40'a göre)

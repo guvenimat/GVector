@@ -1,5 +1,52 @@
 # Benchmark Kayıtları
 
+## Aşama 8a — int8 çoklu-okuyucu ölçeklenmesi — 2026-08-19
+
+Makine: **AMD Ryzen 7 7800X3D, 8 fiziksel / 16 mantıksal çekirdek, L3 = 96 MB**
+(3D V-Cache). Veri: `data/fullscale` (1.13M kayıt, 8 segment). Ölçüm:
+warmup + 3 tekrarın medyanı; **iki ayrı süreçte tekrarlandı**.
+
+| indeks | ef | 1 thread | 2 | 4 | 8 | ölçeklenme (8/1) |
+|---|---|---|---|---|---|---|
+| f32 | 50 | 1286 / 1273 | 2443 / 1920 | 4649 / 3793 | **7865 / 6872** | **6.12x / 5.40x** |
+| f32 | 100 | 794 / 738 | 1229 / 1180 | 2371 / 2334 | **4380 / 4355** | **5.52x / 5.90x** |
+| int8 | 50 | 1226 / 1236 | 2243 / 2317 | 3242 / 4374 | **3643 / 3399** | **2.97x / 2.75x** |
+| int8 | 100 | 741 / 803 | 964 / 1195 | 1694 / 1753 | **2649 / 2751** | **3.58x / 3.42x** |
+
+(hücreler: koşu 1 / koşu 2 — tekrarlanabilirlik kontrolü)
+
+| | değer |
+|---|---|
+| çalışma kümesi | f32 847 MB → int8 424 MB (**2.00x**, planda öngörülen ~2x) |
+| quantize süresi | 0.39 s (8 segment) |
+| recall kaybı (f32→int8) | **0.0091** (ef=50) / **0.0101** (ef=100) — eşik 0.02 ✓ |
+| 8-thread QPS oranı int8/f32 | **0.46–0.49x** (ef=50), **0.60–0.63x** (ef=100) |
+
+**Sonuçlar:**
+1. **f32 1M'de ölçekleniyor: 5.4–6.1x** (8 fiziksel çekirdekte). Aşama 8'in
+   "1M'de okuma ölçeklenmiyor (8 thread = tek thread QPS'i)" bulgusu
+   **YANLIŞTI** — bkz. DECISIONS #44.
+2. **int8 daha AZ ölçekleniyor (2.75–3.58x) ve mutlak olarak ~2x YAVAŞ.**
+   Sebep ADC: her mesafede dequantize (min + scale·kod) aritmetiği; Aşama 6
+   micro-bench'i zaten 15.6 ns (ADC) vs 7.4 ns (f32 L2) demişti. Tek thread'de
+   bellek avantajı bu maliyeti dengeliyor (1226 vs 1286), 8 thread'de CPU
+   darboğaz olunca ADC ağır basıyor.
+3. **L3 hipotezi:** 100K'daki 8.7x ölçeklenmenin nedeni çalışma kümesinin
+   (92 MB) 96 MB L3'e sığmasıydı. 1M'de f32 847 MB, int8 424 MB — **ikisi de
+   L3'ün kat kat üstünde**, yani quantization çalışma kümesini cache'e
+   sokmuyor, yalnız DRAM trafiğini yarıya indiriyor. Bu, int8'in ölçeklenmeyi
+   "geri getirmesi" beklentisinin neden boş çıktığını açıklıyor.
+
+**Metodoloji notu:** İlk sürüm tekrarlanabilir değildi (aynı kod, aynı veri:
+5.08x ve 1.14x). Neden: aynı süreçte ikinci bir büyük indeks açmak (bellek
+baskısı + cache kirliliği). Düzeltme: warmup + 3 tekrarın medyanı, tek indeks,
+ayrı süreçlerde doğrulama.
+
+**Recall mutlak değeri uyarısı:** tablodaki 0.8242, `data/fullscale` dizininin
+fullscale koşusundan kalan 130K kopya kayıt içermesinden (aynı vektörler farklı
+id'lerle; resmi GT saf 1M için). Anlamlı olan f32→int8 **kaybı** (0.009–0.010),
+mutlak değer değil.
+
 ## Aşama 8 — 1M uçtan uca gerçeklik — 2026-08-19 (SIFT1M tam set, tam sistem)
 
 Konfigürasyon: 8 segment (seal=125K, tavan=8), 3 metadata alanı + 3 kümelenmiş

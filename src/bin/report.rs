@@ -757,7 +757,8 @@ fn main() {
 
     let (base, queries, label) = match mode {
         "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter"
-        | "segcurve" | "mergecost" | "rangefilter" | "durability" | "wal" | "fullscale" => {
+        | "segcurve" | "mergecost" | "rangefilter" | "durability" | "wal" | "fullscale"
+        | "int8scale" | "coldprofile" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -794,6 +795,197 @@ fn main() {
 
     if mode == "filter" {
         filter_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "int8scale" {
+        // Aşama 8a: int8 çoklu-okuyucu ölçeklenmesi. Hipotez (düzeltilmiş):
+        // int8 çalışma kümesini ~2x küçültür (graf quantize EDİLMEZ), 3-4x
+        // değil. Kabul eşiği ön-kayıtlı: 8 thread / 1 thread ≥ 2.0 → GO.
+        //
+        // Adil karşılaştırma: f32 tarafı 8 segmentli ölçüldü, int8 tarafı da
+        // AYNI segment sayısında ölçülür (tek-graf int8 karşılaştırması
+        // segcurve'deki 1→8 segment farkını int8'in hanesine yazardı).
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use vector_gvector::index::quant::QuantizedHnsw;
+        use vector_gvector::index::segmented::SegmentedIndex;
+        use vector_gvector::types::SearchResult;
+
+        let dir = std::path::PathBuf::from("data/fullscale");
+        if !dir.join("MANIFEST").exists() {
+            eprintln!("data/fullscale yok — önce `report -- fullscale 1000000 99` koş");
+            return;
+        }
+        println!(
+            "makine: {} mantıksal çekirdek",
+            std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(0)
+        );
+        let t = Instant::now();
+        let idx = SegmentedIndex::open_or_create(
+            dir.clone(),
+            dim,
+            metric,
+            HnswParams::default(),
+            125_000,
+        )
+        .expect("aç");
+        let (n_seg, n_buf) = idx.shape();
+        println!(
+            "f32 indeks: {n_seg} segment + {n_buf} buffer, {} kayıt ({:.1?})",
+            idx.len_shared(),
+            t.elapsed()
+        );
+        let f32_mem = idx.memory_bytes();
+
+        // Ground truth: tam set ise resmi, değilse exact.
+        let truth: Vec<Vec<VectorId>> = if base.len() == 1_000_000 {
+            read_ivecs(std::path::Path::new("data/sift/sift_groundtruth.ivecs"))
+                .expect("gt")
+                .iter()
+                .take(queries.len())
+                .map(|row| row.iter().take(k).map(|&i| VectorId(i as u64)).collect())
+                .collect()
+        } else {
+            ground_truth(&base, &queries, k, metric)
+        };
+
+        // Çoklu-okuyucu ölçüm çekirdeği.
+        //
+        // METODOLOJİ NOTU: bu ölçümün ilk sürümü TEKRARLANABİLİR DEĞİLDİ —
+        // aynı kod, aynı veri, iki koşu: f32 ölçeklenmesi 5.08x ve 1.14x.
+        // Neden: aynı süreçte ikinci bir büyük indeks açmak (bellek baskısı +
+        // cache kirliliği). Aşama 8'in "1M'de okuma ölçeklenmiyor" bulgusu da
+        // 5 dakikadır çalışan, RSS'i 3.1 GB'a çıkmış bir süreçte ölçülmüştü.
+        // Düzeltme: warmup + üç tekrarın MEDYANI.
+        let bench =
+            |threads: usize, search: &(dyn Fn(&[f32]) -> Vec<SearchResult> + Sync)| -> f64 {
+                let run = |secs: u64| -> f64 {
+                    let stop = AtomicBool::new(false);
+                    let count = AtomicUsize::new(0);
+                    std::thread::scope(|sc| {
+                        for t in 0..threads {
+                            let (stop, count, queries) = (&stop, &count, &queries);
+                            sc.spawn(move || {
+                                let mut i = 0usize;
+                                while !stop.load(Ordering::Relaxed) {
+                                    std::hint::black_box(search(&queries[(i + t) % queries.len()]));
+                                    i += 1;
+                                    count.fetch_add(1, Ordering::Relaxed);
+                                }
+                            });
+                        }
+                        std::thread::sleep(std::time::Duration::from_secs(secs));
+                        stop.store(true, Ordering::Relaxed);
+                    });
+                    count.load(Ordering::Relaxed) as f64 / secs as f64
+                };
+                run(1); // warmup: cache ısınsın, ölçüme girmesin
+                let mut s = [run(3), run(3), run(3)];
+                s.sort_by(f64::total_cmp);
+                s[1] // medyan — tek koşunun gürültüsüne karşı
+            };
+
+        let merge_hits = |mut all: Vec<SearchResult>, k: usize| -> Vec<SearchResult> {
+            all.sort();
+            let mut seen = std::collections::HashSet::with_capacity(all.len());
+            all.retain(|r| seen.insert(r.id));
+            all.truncate(k);
+            all
+        };
+
+        println!();
+        println!("| indeks | ef | 1 thread | 2 | 4 | 8 | ölçeklenme (8/1) | recall@10 |");
+        println!("|--------|----|----------|---|---|---|------------------|-----------|");
+
+        // --- f32 ölçümü (int8'e çevirmeden önce) ---
+        let mut f32_rows = Vec::new();
+        for ef in [50usize, 100] {
+            let search = |q: &[f32]| idx.search_shared_with_ef(q, k, ef);
+            let results: Vec<Vec<VectorId>> = queries
+                .iter()
+                .map(|q| search(q).iter().map(|r| r.id).collect())
+                .collect();
+            let recall = recall_at_k(&results, &truth, k);
+            let mut qps = Vec::new();
+            for th in [1usize, 2, 4, 8] {
+                qps.push(bench(th, &search));
+            }
+            println!(
+                "| f32 | {ef} | {:.0} | {:.0} | {:.0} | {:.0} | {:.2}x | {recall:.4} |",
+                qps[0],
+                qps[1],
+                qps[2],
+                qps[3],
+                qps[3] / qps[0].max(1.0)
+            );
+            f32_rows.push((ef, qps, recall));
+        }
+
+        // --- int8'e çevir, f32'yi BIRAK (cache'i kirletmesin) ---
+        let t = Instant::now();
+        let quantized: Vec<QuantizedHnsw> = idx.quantize_segments();
+        let qt = t.elapsed();
+        let int8_mem: usize = quantized
+            .iter()
+            .map(|q| {
+                let (c, l) = q.memory_bytes();
+                c + l
+            })
+            .sum();
+        drop(idx);
+        println!();
+        println!(
+            "quantize: {qt:.1?} — çalışma kümesi f32 {:.0} MB → int8 {:.0} MB ({:.2}x)",
+            f32_mem as f64 / 1048576.0,
+            int8_mem as f64 / 1048576.0,
+            f32_mem as f64 / int8_mem.max(1) as f64
+        );
+        println!();
+
+        let mut int8_rows = Vec::new();
+        for ef in [50usize, 100] {
+            let search = |q: &[f32]| {
+                let mut all = Vec::new();
+                for seg in &quantized {
+                    all.extend(seg.search_with_ef(q, k, ef));
+                }
+                merge_hits(all, k)
+            };
+            let results: Vec<Vec<VectorId>> = queries
+                .iter()
+                .map(|q| search(q).iter().map(|r| r.id).collect())
+                .collect();
+            let recall = recall_at_k(&results, &truth, k);
+            let mut qps = Vec::new();
+            for th in [1usize, 2, 4, 8] {
+                qps.push(bench(th, &search));
+            }
+            println!(
+                "| int8 | {ef} | {:.0} | {:.0} | {:.0} | {:.0} | {:.2}x | {recall:.4} |",
+                qps[0],
+                qps[1],
+                qps[2],
+                qps[3],
+                qps[3] / qps[0].max(1.0)
+            );
+            int8_rows.push((ef, qps, recall));
+        }
+
+        println!();
+        for ((ef, fq, fr), (_, iq, ir)) in f32_rows.iter().zip(&int8_rows) {
+            let scale = iq[3] / iq[0].max(1.0);
+            println!(
+                "ef={ef}: int8 ölçeklenme {scale:.2}x (eşik ≥2.0 → {}), \
+                 8-thread QPS {:.0} → {:.0} ({:.2}x), recall {fr:.4} → {ir:.4} (kayıp {:.4})",
+                if scale >= 2.0 { "GO" } else { "NO-GO" },
+                fq[3],
+                iq[3],
+                iq[3] / fq[3].max(1.0),
+                fr - ir
+            );
+        }
         return;
     }
 
