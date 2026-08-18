@@ -1,5 +1,40 @@
 # Benchmark Kayıtları
 
+## Range histogramı — 2026-08-18 (SIFT 100K, 64 kova eşit genişlik, k=10)
+
+Bakım maliyeti: metadata'sız inşa 9.9s → 3 alanlı (2 sayısal) 10.2s (**+%4**).
+scan_limit = 5000. Tahmin [alt, üst] aralığı; "üst/gerçek" hata göstergesi.
+
+| alan | s | gerçek | tahmin [alt,üst] | üst/gerçek | kol (oracle) | recall | p50 |
+|------|---|--------|------------------|-----------|--------------|--------|-----|
+| v(düzgün) | 0.01 | 1000 | [0,1608] | 1.61 | scan (scan) | 1.000 | 112µs |
+| v(düzgün) | 0.1 | 10000 | [8039,11255] | 1.13 | post (post) | 1.000 | 1.67ms |
+| v(düzgün) | 0.3 | 30000 | [27333,30549] | 1.02 | post (post) | 1.000 | 727µs |
+| v(düzgün) | 0.5 | 50000 | [48235,51451] | 1.03 | post (post) | 1.000 | 481µs |
+| lv(çarpık) | 0.01 | 1000 | [0,48788] | 48.8 | scan (scan) | 1.000 | 117µs |
+| lv(çarpık) | 0.1 | 10000 | [0,48788] | 4.88 | post (post) | 0.999 | 550µs |
+| lv(çarpık) | 0.3 | 30000 | [0,48788] | 1.63 | post (post) | 1.000 | 566µs |
+| lv(çarpık) | 0.5 | 50000 | [48788,79485] | 1.59 | post (post) | 1.000 | 376µs |
+| Eq∧Range korelasyonlu | 0.1 | 10000 | min-üst: 22510 | 2.25 | post (post) | 1.000 | 1.22ms |
+
+**Kabul kriterleri karşılığı:**
+- Düzgün dağılımda post-bandı tahmin hatası %2–13 (< %20 ✓).
+- Çarpıkta ölçüldü ve öngörülen patoloji doğrulandı: log-normal'de kütlenin
+  tamamına yakını ilk kovalarda (48788 kayıt tek kova komşuluğunda) —
+  üst/gerçek 1.6–49x. Quantile histogramına geçmenin gerekçesi bu satırlar;
+  AMA aşağıdaki nedenle şimdilik gerekmedi:
+- **Kol örtüşmesi 13/13 (%100)** (≥ %95 ✓): küçük-kol kararı histogramla
+  değil değer-sıralı map'te sınırlı sayımla (`enumerate_up_to(scan_limit)`)
+  verildiği için tahmin hatası kol seçimine hiç sızmıyor. Histogram yalnız
+  post-kolunun ŝ'ına (ef'' ölçeği) etki ediyor; oradaki hata yönü muhafazakâr
+  (üst sınır → küçük ŝ sanılmaz → recall değil en fazla latency öder) ve
+  <2k fallback'i güvenlik ağı.
+- Korelasyonlu Eq∧Range: min-üst 2.25x şişkin (bağımsızlık değil Fréchet
+  üst sınırı kullanılıyor; şişkinlik yine muhafazakâr yönde), kol doğru,
+  recall 1.000.
+- Bakım maliyeti +%4 inşada, insert başına O(log distinct); DECISIONS #31.
+
+
 ## Segment sayısı × latency/recall eğrisi — 2026-08-18 (SIFT 100K, filtresiz, ef=50)
 
 Merge politikası girdisi: aynı veri farklı seal eşikleriyle bölündü.

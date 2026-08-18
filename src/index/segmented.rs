@@ -29,8 +29,9 @@
 use crate::distance::Metric;
 use crate::index::bruteforce::BruteForceIndex;
 use crate::index::hnsw::{HnswIndex, HnswParams};
+use crate::index::numeric::NumericFieldIndex;
 use crate::index::{IndexError, VectorIndex};
-use crate::meta::{Filter, MetaKey, Metadata};
+use crate::meta::{Filter, MetaKey, MetaValue, Metadata, Predicate};
 use crate::types::{SearchResult, VectorId};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
@@ -64,6 +65,9 @@ pub struct SegmentedIndex {
     /// Planlayıcının O(1) kardinalite tahmini ve tarama kolunun id kaynağı.
     /// Insert/delete'te bakımı yapılır; Range koşulları kapsam dışı (DECISIONS #28).
     postings: RwLock<HashMap<(String, MetaKey), HashSet<VectorId>>>,
+    /// Sayısal alanlar için Range indeksi: histogram (ŝ aralığı) +
+    /// değer-sıralı map (sınırlı sayım). Bkz. numeric modülü / DECISIONS #31.
+    numeric: RwLock<HashMap<String, NumericFieldIndex>>,
     /// Planlayıcı eşikleri (sorgu planlama parametreleri; graf parametresi değil).
     /// Değerler seçicilik ölçümünden (BENCHMARKS, filtre süpürmesi) türetildi.
     planner: PlannerConfig,
@@ -114,6 +118,36 @@ impl Default for PlannerConfig {
     }
 }
 
+/// MetaValue'nun sayısal izdüşümü (Range indeksine girenler).
+fn numeric_value(v: &MetaValue) -> Option<f64> {
+    match v {
+        MetaValue::Int(i) => Some(*i as f64),
+        MetaValue::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
+/// Planlayıcının kol kararı. `Scan` id'leri yanında taşır (bedava çıktılar);
+/// `Post` fallback kaynağını taşır ki <2k durumunda exact sayım yapılabilsin.
+enum Arm {
+    /// Bir koşulun eşleşmesi kesin sıfır — sonuç boş.
+    Empty,
+    /// Kesin küçük eşleşme kümesi: doğrudan tarama.
+    Scan(HashSet<VectorId>),
+    /// Filtresiz gezinti + over-fetch; ŝ üst-sınır tahmininden.
+    Post {
+        s_hat: f64,
+        fallback: FallbackSource,
+    },
+    /// Tahmin yok (Eq'suz ve sayısal-indekssiz): gezinti-içi filtre.
+    Legacy,
+}
+
+enum FallbackSource {
+    Ids(HashSet<VectorId>),
+    Range { key: String, lo: f64, hi: f64 },
+}
+
 impl SegmentedIndex {
     pub fn new(dim: usize, metric: Metric, hnsw_params: HnswParams, seal_threshold: usize) -> Self {
         let ef_search = hnsw_params.ef_search;
@@ -127,6 +161,7 @@ impl SegmentedIndex {
             ef_search,
             metadata: RwLock::new(HashMap::new()),
             postings: RwLock::new(HashMap::new()),
+            numeric: RwLock::new(HashMap::new()),
             planner: PlannerConfig::default(),
             max_segments: 8,
         }
@@ -154,6 +189,14 @@ impl SegmentedIndex {
                     .insert(id);
             }
             drop(postings);
+            // Sayısal değerler Range indeksine de girer (Int/Float).
+            let mut numeric = self.numeric.write().expect("kilit");
+            for (key, value) in &meta {
+                if let Some(v) = numeric_value(value) {
+                    numeric.entry(key.clone()).or_default().insert(v, id);
+                }
+            }
+            drop(numeric);
             self.metadata.write().expect("kilit").insert(id, meta);
         }
         Ok(())
@@ -182,6 +225,94 @@ impl SegmentedIndex {
             }
         }
         best.map(|s| (s.len(), s.clone()))
+    }
+
+    /// Kol kararı (DECISIONS #29 + #31). Aralık tahmini muhafazakâr kullanılır:
+    /// - Küçük kol kararı asla tahminle verilmez: Eq'te sayım zaten kesin,
+    ///   Range'de sınırlı sayım (`enumerate_up_to`) kesinleştirir. Sınırlı
+    ///   sayım yalnız alt sınır ≤ limit iken denenir (alt sınır bile büyükse
+    ///   kesin büyüktür, sayım israf olur).
+    /// - Büyük kolun ŝ'ı ÜST sınırların minimumu (VE bağlacı Fréchet üst
+    ///   sınırı). Üst sınır küçük ŝ → büyük ef'' yönünde hata yapar; yanlışsa
+    ///   bedeli recall değil latency (ve <2k fallback'i zaten var).
+    fn plan(&self, filter: &Filter, k: usize) -> Arm {
+        let n = self.len_shared().max(1);
+        let scan_limit =
+            (self.planner.scan_factor * k).max((self.planner.scan_fraction * n as f64) as usize);
+        let eq = self.estimate(filter);
+        if let Some((0, _)) = eq {
+            return Arm::Empty;
+        }
+        let mut best_upper: Option<usize> = eq.as_ref().map(|(e, _)| *e);
+        let mut best_small: Option<HashSet<VectorId>> = eq
+            .as_ref()
+            .filter(|(e, _)| *e <= scan_limit)
+            .map(|(_, set)| set.clone());
+        let mut range_fallback: Option<(String, f64, f64, usize)> = None;
+        {
+            let numeric = self.numeric.read().expect("kilit");
+            for p in &filter.must {
+                if let Predicate::Range { key, min, max } = p {
+                    if let Some(fi) = numeric.get(key) {
+                        let (lower, upper) = fi.estimate(*min, *max);
+                        if upper == 0 {
+                            return Arm::Empty;
+                        }
+                        if best_upper.is_none_or(|b| upper < b) {
+                            best_upper = Some(upper);
+                        }
+                        if range_fallback
+                            .as_ref()
+                            .is_none_or(|(_, _, _, u)| upper < *u)
+                        {
+                            range_fallback = Some((key.clone(), *min, *max, upper));
+                        }
+                        if best_small.is_none() && lower <= scan_limit {
+                            if let Some(ids) = fi.enumerate_up_to(*min, *max, scan_limit) {
+                                best_small = Some(ids.into_iter().collect());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(ids) = best_small {
+            return Arm::Scan(ids);
+        }
+        match best_upper {
+            Some(upper) => Arm::Post {
+                s_hat: (upper as f64 / n as f64).clamp(1e-6, 1.0),
+                fallback: match eq {
+                    Some((_, set)) => FallbackSource::Ids(set),
+                    None => {
+                        let (key, lo, hi, _) =
+                            range_fallback.expect("upper varsa range kaynağı var");
+                        FallbackSource::Range { key, lo, hi }
+                    }
+                },
+            },
+            None => Arm::Legacy,
+        }
+    }
+
+    /// Ölçüm/test için: planlayıcının seçtiği kolun adı.
+    pub fn debug_plan_arm(&self, filter: &Filter, k: usize) -> &'static str {
+        match self.plan(filter, k) {
+            Arm::Empty => "empty",
+            Arm::Scan(_) => "scan",
+            Arm::Post { .. } => "post",
+            Arm::Legacy => "legacy",
+        }
+    }
+
+    /// Ölçüm için: bir sayısal alanın [lo, hi] kardinalite aralığı tahmini.
+    pub fn debug_range_estimate(&self, key: &str, lo: f64, hi: f64) -> (usize, usize) {
+        self.numeric
+            .read()
+            .expect("kilit")
+            .get(key)
+            .map(|fi| fi.estimate(lo, hi))
+            .unwrap_or((0, 0))
     }
 
     /// Tarama kolu: aday id'ler (en küçük posting listesi) üzerinde tam filtre
@@ -286,28 +417,22 @@ impl SegmentedIndex {
         if k == 0 {
             return Vec::new();
         }
-        let estimate = self.estimate(filter);
-        match &estimate {
-            Some((0, _)) => Vec::new(),
-            Some((est, candidates)) => {
-                let n = self.len_shared().max(1);
-                // Kısayol: tek Eq ve her yaşayan kayıt eşleşiyor → filtre
-                // davranışsal olarak boş; filtresiz yol birebir eşdeğer.
-                // (UI'dan varsayılan/boş filtre gelen pratik durum.)
-                if filter.must.len() == 1 && *est >= n {
+        // Kısayol: tek Eq ve her yaşayan kayıt eşleşiyor → filtre davranışsal
+        // boş; filtresiz yol birebir eşdeğer (UI'dan varsayılan filtre durumu).
+        if filter.must.len() == 1 {
+            if let Some((est, _)) = self.estimate(filter) {
+                if est >= self.len_shared().max(1) {
                     return self.search_shared(query, k);
                 }
-                let scan_limit = (self.planner.scan_factor * k)
-                    .max((self.planner.scan_fraction * n as f64) as usize);
-                if *est <= scan_limit {
-                    // Küçük eşleşme: grafı hiç açma, posting listesinde exact top-k.
-                    return self.scan_candidates(query, k, candidates, filter);
-                }
+            }
+        }
+        match self.plan(filter, k) {
+            Arm::Empty => Vec::new(),
+            Arm::Scan(candidates) => self.scan_candidates(query, k, &candidates, filter),
+            Arm::Post { s_hat, fallback } => {
                 // Post-filter kolu: FİLTRESİZ gezinti (patolojiye bağışık) +
-                // over-fetch + sonuçta filtre. ŝ Eq minimumundan gelen ÜST
-                // sınır; gerçek seçicilik küçükse sonuç k'nın altında kalır
-                // ve exact tarama fallback'i devreye girer.
-                let s_hat = (*est as f64 / n as f64).clamp(1e-6, 1.0);
+                // over-fetch + sonuçta filtre. ŝ üst sınır; gerçek seçicilik
+                // küçükse sonuç 2k'nın altında kalır ve exact fallback koşar.
                 let ef_over = ((self.planner.overfetch_beta * k as f64 / s_hat) as usize).clamp(
                     self.ef_search.max(2 * k),
                     (self.planner.overfetch_cap_factor * self.ef_search).max(4 * k),
@@ -337,20 +462,29 @@ impl SegmentedIndex {
                 all.sort();
                 let mut seen = HashSet::with_capacity(all.len());
                 all.retain(|r| seen.insert(r.id));
-                if all.len() < 2 * k && *est >= 2 * k {
+                if all.len() < 2 * k {
                     // Over-fetch penceresi eşleşme bölgesini ıskaladı (sorgu
-                    // eşleşmelerden uzak) ya da tahmin şişkindi: k'yı kıl payı
-                    // geçen sonuç kümesi de güvenilmez — exact taramaya düş.
-                    // (2k eşiği: 10K ölçümünde kümelenmiş/orta bandın 0.979'a
-                    // sessizce düşmesini yakalayan sinyal buydu.)
-                    return self.scan_candidates(query, k, candidates, filter);
+                    // eşleşmelerden uzak) ya da üst-sınır tahmini şişkindi
+                    // (VE korelasyonu): exact taramaya düş. Fallback adayları
+                    // kaynaktan gelir — Eq posting'i ya da Range tam sayımı.
+                    let candidates = match fallback {
+                        FallbackSource::Ids(ids) => ids,
+                        FallbackSource::Range { key, lo, hi } => self
+                            .numeric
+                            .read()
+                            .expect("kilit")
+                            .get(&key)
+                            .map(|fi| fi.enumerate_all(lo, hi).into_iter().collect())
+                            .unwrap_or_default(),
+                    };
+                    return self.scan_candidates(query, k, &candidates, filter);
                 }
                 all.truncate(k);
                 all
             }
-            // Eq yok (yalnız Range): tahmin yok — gezinti-içi filtre +
-            // found<k güvenlik ağı (eski davranış) tek seçenek.
-            None => {
+            // Tahmin yok (Eq'suz ve sayısal-indekssiz Range): gezinti-içi
+            // filtre + found<k güvenlik ağı tek seçenek.
+            Arm::Legacy => {
                 let meta = self.metadata.read().expect("kilit");
                 let allow = |id: VectorId| filter.matches_id(&meta, id);
                 let segments: Vec<Arc<Segment>> = self
@@ -521,6 +655,15 @@ impl SegmentedIndex {
                 for (key, value) in &meta {
                     if let Some(set) = postings.get_mut(&(key.clone(), value.key())) {
                         set.remove(&id);
+                    }
+                }
+                drop(postings);
+                let mut numeric = self.numeric.write().expect("kilit");
+                for (key, value) in &meta {
+                    if let Some(v) = numeric_value(value) {
+                        if let Some(fi) = numeric.get_mut(key) {
+                            fi.remove(v, id);
+                        }
                     }
                 }
             }
@@ -934,6 +1077,65 @@ mod tests {
             .collect();
         assert!(!all.contains(&VectorId(50)));
         assert_eq!(idx.search_shared(&[9.0; 4], 1)[0].id, VectorId(5));
+    }
+
+    /// Kabul kriteri (DECISIONS #31): Range'li sorgularda seçilen kol, gerçek
+    /// kardinaliteyle seçilecek kolla örtüşmeli. Sınırlı sayım tasarımı bunu
+    /// scan sınırında yapısal olarak garanti eder; test yine de belgeler.
+    #[test]
+    fn range_planner_arm_matches_oracle() {
+        let vecs = random_vectors(2_000, 4, 42);
+        let idx = SegmentedIndex::new(4, Metric::L2, HnswParams::default(), 500);
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert_with_meta(
+                VectorId(i as u64),
+                v,
+                [("v".to_string(), MetaValue::Int(i as i64))].into(),
+            )
+            .unwrap();
+        }
+        let k = 10;
+        let n = 2_000usize;
+        let scan_limit =
+            (idx.planner.scan_factor * k).max((idx.planner.scan_fraction * n as f64) as usize);
+        for m in [1usize, 50, 160, 161, 300, 800, 1500] {
+            let f = Filter {
+                must: vec![Predicate::Range {
+                    key: "v".into(),
+                    min: 0.0,
+                    max: (m - 1) as f64,
+                }],
+            };
+            let oracle = if m <= scan_limit { "scan" } else { "post" };
+            assert_eq!(idx.debug_plan_arm(&f, k), oracle, "m={m}");
+            // ve sonuçlar exact referansla doğru
+            let allow = |id: VectorId| (id.0 as usize) < m;
+            let q = &vecs[m / 2];
+            let truth: Vec<_> = {
+                let mut bf = BruteForceIndex::new(4, Metric::L2);
+                for (i, v) in vecs.iter().enumerate() {
+                    bf.insert(VectorId(i as u64), v).unwrap();
+                }
+                bf.search_filtered(q, k, &allow)
+                    .iter()
+                    .map(|r| r.id)
+                    .collect()
+            };
+            let got: Vec<_> = idx.search_filtered(q, k, &f).iter().map(|r| r.id).collect();
+            let hit = got.iter().filter(|id| truth.contains(id)).count();
+            assert!(hit * 10 >= truth.len() * 9, "m={m}: {hit}/{}", truth.len());
+        }
+        // Range'de sıfır eşleşme → boş
+        let f_empty = Filter {
+            must: vec![Predicate::Range {
+                key: "v".into(),
+                min: 1e9,
+                max: 2e9,
+            }],
+        };
+        assert!(idx
+            .search_filtered(&vecs[0].clone(), k, &f_empty)
+            .is_empty());
     }
 
     /// Posting-list'ler her mutasyon dizisinden sonra metadata deposuyla

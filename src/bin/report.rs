@@ -309,7 +309,7 @@ fn main() {
 
     let (base, queries, label) = match mode {
         "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter"
-        | "segcurve" | "mergecost" => {
+        | "segcurve" | "mergecost" | "rangefilter" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -346,6 +346,208 @@ fn main() {
 
     if mode == "filter" {
         filter_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "rangefilter" {
+        // Range histogramı ölçümü (DECISIONS #31 kabul kriterleri):
+        // düzgün + çarpık (log-normal) dağılım, tahmin aralığı vs gerçek,
+        // korelasyonlu Eq+Range hücresi, kol-örtüşme oranı, bakım maliyeti.
+        use rand::rngs::StdRng;
+        use rand::{Rng, SeedableRng};
+        use std::collections::HashSet;
+        use vector_gvector::index::segmented::SegmentedIndex;
+        use vector_gvector::meta::{Filter, MetaValue, Metadata, Predicate};
+
+        let n = base.len();
+        // log-normal alan: exp(N(0,1)), deterministik
+        let mut rng = StdRng::seed_from_u64(DEFAULT_SEED + 2);
+        let lognormal: Vec<f64> = (0..n)
+            .map(|_| {
+                // Box-Muller ile N(0,1)
+                let u1: f64 = rng.gen_range(1e-12..1.0);
+                let u2: f64 = rng.gen_range(0.0..1.0);
+                let z = (-2.0 * u1.ln()).sqrt() * (2.0 * std::f64::consts::PI * u2).cos();
+                z.exp()
+            })
+            .collect();
+
+        // Bakım maliyeti: metadata'sız vs iki sayısal alanlı inşa.
+        let t = Instant::now();
+        let plain = SegmentedIndex::new(dim, metric, HnswParams::default(), n / 4);
+        for (i, v) in base.iter().enumerate() {
+            plain.insert_shared(VectorId(i as u64), v).expect("insert");
+        }
+        let t_plain = t.elapsed();
+        drop(plain);
+        let t = Instant::now();
+        let idx = SegmentedIndex::new(dim, metric, HnswParams::default(), n / 4);
+        for (i, v) in base.iter().enumerate() {
+            let meta: Metadata = [
+                ("v".to_string(), MetaValue::Int(i as i64)),
+                ("lv".to_string(), MetaValue::Float(lognormal[i])),
+                (
+                    "par".to_string(),
+                    MetaValue::Int(if i < n / 2 { 0 } else { 1 }),
+                ),
+            ]
+            .into();
+            idx.insert_with_meta(VectorId(i as u64), v, meta)
+                .expect("insert");
+        }
+        let t_meta = t.elapsed();
+        println!(
+            "bakım maliyeti: metadata'sız inşa {t_plain:.1?}, 3 alanlı (2 sayısal) {t_meta:.1?} (+{:.0}%)",
+            (t_meta.as_secs_f64() / t_plain.as_secs_f64() - 1.0) * 100.0
+        );
+
+        let mut bf = BruteForceIndex::new(dim, metric);
+        for (i, v) in base.iter().enumerate() {
+            bf.insert(VectorId(i as u64), v).expect("insert");
+        }
+        let scan_limit = (16 * k).max(n / 20);
+        println!("scan_limit = {scan_limit}");
+        println!();
+        println!(
+            "| alan | s | gerçek | tahmin [alt,üst] | üst/gerçek | kol (oracle) | recall | p50 |"
+        );
+        println!(
+            "|------|---|--------|------------------|-----------|--------------|--------|-----|"
+        );
+
+        let mut agree = 0usize;
+        let mut rows = 0usize;
+        let mut sorted_lv = lognormal.clone();
+        sorted_lv.sort_by(f64::total_cmp);
+
+        for s in [0.001f64, 0.01, 0.05, 0.1, 0.3, 0.5] {
+            let m = ((s * n as f64) as usize).max(1);
+            // (etiket, filtre, gerçek eşleşen id kümesi, tahmin sorgusu)
+            type RangeCase<'a> = (&'a str, Filter, HashSet<u64>, (&'a str, f64, f64));
+            let cases: Vec<RangeCase> = vec![
+                (
+                    "v(düzgün)",
+                    Filter {
+                        must: vec![Predicate::Range {
+                            key: "v".into(),
+                            min: 0.0,
+                            max: (m - 1) as f64,
+                        }],
+                    },
+                    (0..m as u64).collect(),
+                    ("v", 0.0, (m - 1) as f64),
+                ),
+                (
+                    "lv(çarpık)",
+                    {
+                        let cutoff = sorted_lv[m - 1];
+                        Filter {
+                            must: vec![Predicate::Range {
+                                key: "lv".into(),
+                                min: f64::NEG_INFINITY,
+                                max: cutoff,
+                            }],
+                        }
+                    },
+                    {
+                        let cutoff = sorted_lv[m - 1];
+                        (0..n as u64)
+                            .filter(|&i| lognormal[i as usize] <= cutoff)
+                            .collect()
+                    },
+                    ("lv", f64::NEG_INFINITY, sorted_lv[m - 1]),
+                ),
+            ];
+            for (label, filter, truth_set, (ekey, elo, ehi)) in cases {
+                let truth_n = truth_set.len();
+                let (est_l, est_u) = idx.debug_range_estimate(ekey, elo, ehi);
+                let arm = idx.debug_plan_arm(&filter, k);
+                let oracle = if truth_n <= scan_limit {
+                    "scan"
+                } else {
+                    "post"
+                };
+                agree += (arm == oracle) as usize;
+                rows += 1;
+                let allow = |id: VectorId| truth_set.contains(&id.0);
+                let mut hits = 0usize;
+                let mut total = 0usize;
+                for q in &queries {
+                    let tr: Vec<VectorId> = bf
+                        .search_filtered(q, k, &allow)
+                        .iter()
+                        .map(|r| r.id)
+                        .collect();
+                    let res = idx.search_filtered(q, k, &filter);
+                    hits += res.iter().filter(|r| tr.contains(&r.id)).count();
+                    total += tr.len();
+                }
+                let stats = measure_latency(&queries, |q| {
+                    std::hint::black_box(idx.search_filtered(q, k, &filter));
+                });
+                println!(
+                    "| {label} | {s} | {truth_n} | [{est_l},{est_u}] | {:.2} | {arm} ({oracle}) | {:.3} | {:?} |",
+                    est_u as f64 / truth_n.max(1) as f64,
+                    hits as f64 / total.max(1) as f64,
+                    stats.p50
+                );
+            }
+        }
+
+        // Korelasyonlu hücre: Eq(par=0) [i < n/2] ∧ Range v∈[0.4n, 0.6n) —
+        // gerçek kesişim 0.1n; bağımsızlık/min-üst tahmini ~0.2n → oran ~2.
+        let f_corr = Filter {
+            must: vec![
+                Predicate::Eq {
+                    key: "par".into(),
+                    value: MetaValue::Int(0),
+                },
+                Predicate::Range {
+                    key: "v".into(),
+                    min: (n as f64) * 0.4,
+                    max: (n as f64) * 0.6 - 1.0,
+                },
+            ],
+        };
+        let truth_corr: HashSet<u64> = ((n as u64 * 2 / 5)..(n as u64 / 2)).collect();
+        let (el, eu) = idx.debug_range_estimate("v", n as f64 * 0.4, n as f64 * 0.6 - 1.0);
+        let arm = idx.debug_plan_arm(&f_corr, k);
+        let oracle = if truth_corr.len() <= scan_limit {
+            "scan"
+        } else {
+            "post"
+        };
+        agree += (arm == oracle) as usize;
+        rows += 1;
+        let allow = |id: VectorId| truth_corr.contains(&id.0);
+        let mut hits = 0;
+        let mut total = 0;
+        for q in &queries {
+            let tr: Vec<VectorId> = bf
+                .search_filtered(q, k, &allow)
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            let res = idx.search_filtered(q, k, &f_corr);
+            hits += res.iter().filter(|r| tr.contains(&r.id)).count();
+            total += tr.len();
+        }
+        let stats = measure_latency(&queries, |q| {
+            std::hint::black_box(idx.search_filtered(q, k, &f_corr));
+        });
+        println!(
+            "| Eq∧Range (korelasyonlu) | 0.1 | {} | range:[{el},{eu}] min-üst:{} | {:.2} | {arm} ({oracle}) | {:.3} | {:?} |",
+            truth_corr.len(),
+            eu.min(n / 2),
+            eu.min(n / 2) as f64 / truth_corr.len().max(1) as f64,
+            hits as f64 / total.max(1) as f64,
+            stats.p50
+        );
+        println!();
+        println!(
+            "kol örtüşmesi: {agree}/{rows} ({:.0}%)",
+            agree as f64 / rows as f64 * 100.0
+        );
         return;
     }
 

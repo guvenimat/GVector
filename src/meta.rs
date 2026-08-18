@@ -66,6 +66,18 @@ impl MetaValue {
     }
 }
 
+/// f64 → sıralamayı koruyan u64 (BTreeMap anahtarı için).
+/// Negatiflerde bitler ters çevrilir, pozitiflerde işaret biti set edilir;
+/// sonuç, f64 sıralamasıyla birebir aynı sıralanan bir tamsayıdır.
+pub fn ordered_bits(x: f64) -> u64 {
+    let b = x.to_bits();
+    if b >> 63 == 1 {
+        !b
+    } else {
+        b | (1 << 63)
+    }
+}
+
 impl Filter {
     /// Filtredeki Eq koşullarının posting-list anahtarları.
     /// Kardinalite tahmini VE bağlacında bunların minimumudur (üst sınır);

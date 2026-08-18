@@ -1,5 +1,34 @@
 # Mimari Kararlar
 
+## Range histogramı — 2026-08-18
+
+### 31. Range tahmini: eşit-genişlik histogram [alt,üst] + sınırlı sayım
+- **Eşit genişlik 64 kova**, quantile değil: basit, O(1) güncelleme.
+  Çarpık dağılım riski ölçüldü (log-normal: üst/gerçek 49x'e kadar) ama
+  quantile'a geçilmedi çünkü tahmin hatası kol seçimine sızmıyor (aşağıda).
+  Quantile, ancak post-kolu ef'' ölçeklemesi çarpık veride ölçülebilir
+  latency kaybettirirse gündeme gelir — o ölçümde recall 0.999+ ve p50'ler
+  düzgün dağılımdan farksızdı.
+- **Tahmin tek sayı değil [alt, üst] aralığı** (kullanıcı tasarımı): tam
+  içerilen kovalar alt, sınır kovaları dahil üst. Kova-içi düzgünlük
+  varsayımı hiç yapılmıyor; belirsizlik açık taşınıyor ve planlayıcı hep
+  muhafazakâr tarafı kullanıyor (küçük kol için üst, ŝ için üst → hata
+  yönü latency'e, asla recall'a çarpmaz).
+- **Kritik ekleme — sınırlı sayım**: histogramın yanında değer-sıralı
+  BTreeMap (bits-sıralı f64). Küçük-kol kararı tahminle DEĞİL,
+  `enumerate_up_to(scan_limit)` ile kesin veriliyor; eşleşen id'ler tarama
+  koluna bedava çıkıyor. Kabul kriterindeki kol örtüşmesi bu sayede
+  yapısal %100 (ölçüm: 13/13, çarpık ve korelasyonlu hücreler dahil).
+- **VE bağlacı**: bağımsızlık varsayımı YOK; üst sınırların minimumu
+  (Fréchet). Korelasyonlu Eq∧Range hücresinde 2.25x şişkin ama muhafazakâr.
+- **Genişleme payı %12.5**: monoton değer akışında histogram yeniden
+  kurulumunu amorti eder (testli).
+- Bakım: insert/remove O(log distinct); 100K inşada +%4 (BENCHMARKS).
+- Bellek bedeli: sorted map id başına ~24B/sayısal alan — histogram-yalnız
+  tasarıma göre pahalı ama küçük-kol kesinliği + fallback enumerasyonunu
+  satın alıyor.
+
+
 ## Segment tavan bekçisi — 2026-08-18
 
 ### 30. Merge: minimal tavan bekçisi, en-küçük-iki, tavan 8
