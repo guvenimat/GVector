@@ -83,7 +83,7 @@ fn main() {
     let metric = Metric::L2; // SIFT literatürde L2 ile değerlendirilir
 
     let (base, queries, label) = match mode {
-        "sift" | "sweep" => {
+        "sift" | "sweep" | "persist" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -115,6 +115,42 @@ fn main() {
 
     if mode == "sweep" {
         hnsw_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "persist" {
+        // Kalıcılık doğrulaması: kaydet → yükle → sonuçlar birebir aynı mı?
+        let t = Instant::now();
+        let mut hnsw = HnswIndex::new(dim, metric, HnswParams::default());
+        for (i, v) in base.iter().enumerate() {
+            hnsw.insert(VectorId(i as u64), v).expect("insert");
+        }
+        println!("inşa: {:?}", t.elapsed());
+        let path = std::path::Path::new("data/index.gvdb");
+        let t = Instant::now();
+        hnsw.save(path).expect("save");
+        let size = std::fs::metadata(path).expect("stat").len();
+        println!(
+            "save: {:?}, dosya {:.1} MB ({:.0} B/vektör)",
+            t.elapsed(),
+            size as f64 / (1024.0 * 1024.0),
+            size as f64 / base.len() as f64
+        );
+        let t = Instant::now();
+        let loaded = HnswIndex::load(path, false).expect("load");
+        println!("load: {:?}", t.elapsed());
+        let mut identical = true;
+        for q in &queries {
+            if hnsw.search(q, k) != loaded.search(q, k) {
+                identical = false;
+                break;
+            }
+        }
+        println!(
+            "yeniden yükleme sonrası {} sorguda sonuçlar birebir aynı: {identical}",
+            queries.len()
+        );
+        assert!(identical);
         return;
     }
 

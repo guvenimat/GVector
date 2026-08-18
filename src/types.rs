@@ -4,7 +4,9 @@
 ///
 /// Newtype: çıplak `u64` yerine ayrı tip, id ile graf içi offset'lerin
 /// (ileride `usize` slot indeksleri) karışmasını derleme zamanında engeller.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct VectorId(pub u64);
 
 /// Sahipli vektör verisi. Boyut kontrolü indeksin sorumluluğunda;

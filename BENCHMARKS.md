@@ -1,5 +1,16 @@
 # Benchmark Kayıtları
 
+## Aşama 3 — 2026-08-18 (kalıcılık, SIFT 100K, M=16/ef_c=200)
+
+| Ölçüm | Değer |
+|---|---|
+| save | 121 ms |
+| load (tam okuma; mmap izni beklemede) | 73 ms |
+| dosya boyutu | 71.8 MB (753 B/vektör: 512 B veri + graf + id'ler) |
+| yeniden yükleme sonrası sonuçlar | 100/100 sorguda birebir aynı ✓ |
+| kesik/bozuk dosya | panic yok, Err (test + proptest mini-fuzz) ✓ |
+
+
 ## Aşama 2 — 2026-08-18 (HNSW, SIFT1M alt kümeleri, k=10, L2)
 
 Referans brute-force (rayon, tüm çekirdekler): 10K p50=617µs; 100K p50=547µs.

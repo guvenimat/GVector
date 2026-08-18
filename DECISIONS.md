@@ -1,5 +1,32 @@
 # Mimari Kararlar
 
+## Aşama 3 — 2026-08-18
+
+### 11. Dosya formatı: magic + versiyon + bincode meta + ham f32 bölümü + CRC32
+Vektör verisi meta'nın DIŞINDA, 4 byte'a hizalı ham bölümde tutulur —
+memmap ile kopyasız erişilebilsin diye. CRC32 dosyanın tamamını kapsar;
+checksum meta parse'ından ÖNCE doğrulanır (bozuk baytı deserializer'a
+hiç göstermemek fuzz yüzeyini küçültür). Yazma geçici dosya + atomik
+rename ile: yarım yazım asıl dosyayı asla bozamaz.
+
+### 12. memmap2 lazy load BEKLEMEDE: unsafe izni gerekiyor
+`memmap2::Mmap::map` bir `unsafe fn` (harita yaşarken dosya değişirse UB) ve
+crate `#![deny(unsafe_code)]` ile derleniyor. Kural gereği kaldırmadan önce
+kullanıcıya soruldu; onay gelene dek `load(path, lazy)` iki yolda da güvenli
+tam-okuma yapar. `VectorStorage::Mmap` altyapısı hazır (bytemuck cast,
+copy-on-write insert), izinle tek satırlık aktivasyon kaldı.
+
+### 13. RNG durumu diske yazılmaz
+Yükleme sonrası seviye RNG'si `seed ^ n`'den yeniden türetilir. Yüklenmiş
+indekse yapılan insert'ler deterministiktir ama kesintisiz inşayla birebir
+aynı graf olmayabilir — arama doğruluğu bundan etkilenmez, kabul edildi.
+
+### 14. load_from_bytes ayrı yüzey
+Fuzz hedefi, testler ve dosya yolu aynı parse kodunu paylaşır; `rebuild`
+her slot/entry referansını sınır kontrolünden geçirir — bozuk ama crc'si
+tutan (kasıtlı üretilmiş) dosyada bile panic yerine Err.
+
+
 ## Aşama 2 — 2026-08-18
 
 ### 7. HNSW komşu seçimi: Algorithm 4 heuristic + keepPrunedConnections

@@ -39,7 +39,7 @@ impl Ord for Cand {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HnswParams {
     /// Üst katmanlarda hedef komşu sayısı (makaledeki M).
     pub m: usize,
@@ -65,6 +65,48 @@ impl Default for HnswParams {
     }
 }
 
+/// Vektör verisinin nerede durduğu: bellekte sahipli blok ya da diskten
+/// memmap ile lazy yüklenmiş bölge. Mmap yoluna yazılamaz; ilk insert'te
+/// veri sahipli Vec'e kopyalanır (copy-on-write).
+enum VectorStorage {
+    Owned(Vec<f32>),
+    /// Şimdilik inşa edilmiyor: memmap2 açılışı unsafe gerektirir ve crate
+    /// deny(unsafe_code) ile derlenir; izin çıkarsa lazy load bunu kullanacak.
+    #[allow(dead_code)]
+    Mmap {
+        map: memmap2::Mmap,
+        /// f32 verisinin dosya içindeki byte offset'i (4'e hizalı garanti).
+        offset: usize,
+        /// f32 eleman sayısı.
+        len: usize,
+    },
+}
+
+impl VectorStorage {
+    #[inline]
+    fn as_slice(&self) -> &[f32] {
+        match self {
+            VectorStorage::Owned(v) => v,
+            // cast_slice hizayı runtime'da doğrular; offset'i 4'e hizalı
+            // yazdığımız ve mmap tabanı sayfa hizalı olduğu için güvenli.
+            VectorStorage::Mmap { map, offset, len } => {
+                bytemuck::cast_slice(&map[*offset..*offset + *len * 4])
+            }
+        }
+    }
+
+    /// Yazma erişimi: mmap destekliyse önce sahipli kopyaya dönüştür.
+    fn to_owned_mut(&mut self) -> &mut Vec<f32> {
+        if let VectorStorage::Mmap { .. } = self {
+            *self = VectorStorage::Owned(self.as_slice().to_vec());
+        }
+        match self {
+            VectorStorage::Owned(v) => v,
+            VectorStorage::Mmap { .. } => unreachable!("üstte dönüştürüldü"),
+        }
+    }
+}
+
 pub struct HnswIndex {
     params: HnswParams,
     metric: Metric,
@@ -72,7 +114,7 @@ pub struct HnswIndex {
     /// mL = 1/ln(M): seviye dağılım çarpanı (makale 4.1'deki optimum).
     ml: f64,
     /// Vektörler tek bitişik blokta, slot-major.
-    data: Vec<f32>,
+    storage: VectorStorage,
     ids: Vec<VectorId>,
     slot_of: HashMap<VectorId, usize>,
     /// links[slot][level] = komşu slot listesi. `links[slot].len()-1` node'un en üst seviyesi.
@@ -91,7 +133,7 @@ impl HnswIndex {
             metric,
             dim,
             ml,
-            data: Vec::new(),
+            storage: VectorStorage::Owned(Vec::new()),
             ids: Vec::new(),
             slot_of: HashMap::new(),
             links: Vec::new(),
@@ -111,7 +153,7 @@ impl HnswIndex {
 
     #[inline]
     fn vector_at(&self, slot: usize) -> &[f32] {
-        &self.data[slot * self.dim..(slot + 1) * self.dim]
+        &self.storage.as_slice()[slot * self.dim..(slot + 1) * self.dim]
     }
 
     #[inline]
@@ -239,15 +281,13 @@ impl HnswIndex {
         if self.links[node][level].len() <= limit {
             return;
         }
-        let node_vec_start = node * self.dim;
         // Aday listesi: mevcut komşular, node'a uzaklıklarıyla, artan sırada.
         let mut cands: Vec<Cand> = self.links[node][level]
             .iter()
             .map(|&nb| Cand {
-                dist: self.metric.distance(
-                    &self.data[node_vec_start..node_vec_start + self.dim],
-                    self.vector_at(nb),
-                ),
+                dist: self
+                    .metric
+                    .distance(self.vector_at(node), self.vector_at(nb)),
                 slot: nb,
             })
             .collect();
@@ -289,7 +329,7 @@ impl HnswIndex {
 
     /// Graf kenar belleği dahil toplam indeks belleği (byte).
     pub fn memory_bytes(&self) -> (usize, usize) {
-        let vec_bytes = self.data.capacity() * 4 + self.ids.capacity() * 8;
+        let vec_bytes = self.storage.as_slice().len() * 4 + self.ids.capacity() * 8;
         let link_bytes: usize = self
             .links
             .iter()
@@ -318,10 +358,11 @@ impl VectorIndex for HnswIndex {
             return Err(IndexError::DuplicateId(id));
         }
         let slot = self.ids.len();
-        self.data.extend_from_slice(vector);
+        let data = self.storage.to_owned_mut();
+        data.extend_from_slice(vector);
         if self.metric.requires_normalization() {
             let start = slot * self.dim;
-            normalize(&mut self.data[start..start + self.dim]);
+            normalize(&mut data[start..start + self.dim]);
         }
         self.ids.push(id);
         self.slot_of.insert(id, slot);
@@ -378,6 +419,223 @@ impl VectorIndex for HnswIndex {
 
     fn len(&self) -> usize {
         self.ids.len()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Kalıcılık (Aşama 3)
+//
+// Dosya düzeni (tüm sayılar little-endian):
+//   [0..4)   magic  b"GVDB"
+//   [4..8)   format versiyonu (u32) = 1
+//   [8..16)  meta uzunluğu (u64)
+//   [16..16+meta_len)  bincode(Meta)
+//   ...pad (meta sonunu 4 byte'a hizalar; f32 bölümü cast edilebilsin diye)
+//   [data_off..data_off+n*dim*4)  ham f32 vektör verisi
+//   [son 4 byte)  crc32 (kendinden önceki her şeyin)
+//
+// Vektör bölümü meta'nın DIŞINDA tutulur: memmap2 ile dosyayı açıp bu bölgeyi
+// kopyasız kullanmak (lazy load) mümkün olsun diye. Meta (graf, id'ler) her
+// durumda belleğe deserialize edilir — graf gezinmesi zaten rastgele erişimli
+// ve küçük; asıl yer kaplayan vektör verisidir.
+// ---------------------------------------------------------------------------
+
+const MAGIC: [u8; 4] = *b"GVDB";
+const FORMAT_VERSION: u32 = 1;
+
+#[derive(Debug, thiserror::Error)]
+pub enum PersistError {
+    #[error("io hatası: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("bozuk dosya: {0}")]
+    Corrupt(String),
+    #[error("desteklenmeyen format versiyonu: {0} (bu sürüm {FORMAT_VERSION} okur)")]
+    UnsupportedVersion(u32),
+    #[error("serileştirme hatası: {0}")]
+    Encode(#[from] bincode::Error),
+}
+
+/// Diske yazılan graf metadata'sı. Vektör verisi bilinçli olarak burada değil.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Meta {
+    params: HnswParams,
+    metric: Metric,
+    dim: u64,
+    n: u64,
+    ids: Vec<VectorId>,
+    links: Vec<Vec<Vec<u64>>>,
+    entry: Option<u64>,
+}
+
+fn corrupt(msg: impl Into<String>) -> PersistError {
+    PersistError::Corrupt(msg.into())
+}
+
+impl HnswIndex {
+    pub fn save(&self, path: &std::path::Path) -> Result<(), PersistError> {
+        let meta = Meta {
+            params: self.params.clone(),
+            metric: self.metric,
+            dim: self.dim as u64,
+            n: self.ids.len() as u64,
+            ids: self.ids.clone(),
+            links: self
+                .links
+                .iter()
+                .map(|ls| {
+                    ls.iter()
+                        .map(|l| l.iter().map(|&s| s as u64).collect())
+                        .collect()
+                })
+                .collect(),
+            entry: self.entry.map(|e| e as u64),
+        };
+        let meta_bytes = bincode::serialize(&meta)?;
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend(MAGIC);
+        buf.extend(FORMAT_VERSION.to_le_bytes());
+        buf.extend((meta_bytes.len() as u64).to_le_bytes());
+        buf.extend(&meta_bytes);
+        while !buf.len().is_multiple_of(4) {
+            buf.push(0); // f32 bölümü hizalaması
+        }
+        buf.extend_from_slice(bytemuck::cast_slice::<f32, u8>(self.storage.as_slice()));
+
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(&buf);
+        buf.extend(hasher.finalize().to_le_bytes());
+
+        // Önce geçici dosyaya yaz, sonra atomik rename: yarım yazılmış dosya
+        // asıl yolun üstüne hiç gelmesin.
+        let tmp = path.with_extension("tmp");
+        std::fs::write(&tmp, &buf)?;
+        std::fs::rename(&tmp, path)?;
+        Ok(())
+    }
+
+    /// Baytlardan yükleme — fuzz hedefi ve testler bu yolu paylaşır.
+    /// Vektör verisi kopyalanır (Owned). Dönen indeks aramaya hazırdır.
+    pub fn load_from_bytes(bytes: &[u8]) -> Result<HnswIndex, PersistError> {
+        let (meta, data_range) = Self::parse(bytes)?;
+        let data: Vec<f32> = bytes[data_range]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().expect("4 byte")))
+            .collect();
+        Self::rebuild(meta, VectorStorage::Owned(data))
+    }
+
+    /// Dosyadan yükleme.
+    ///
+    /// `lazy=true` niyeti vektör bölümünü memmap2 ile kopyasız kullanmaktır
+    /// (VectorStorage::Mmap). Ancak `memmap2::Mmap::map` bir `unsafe fn`dir
+    /// (harita yaşarken dosyanın değişmemesi çağıranın sorumluluğudur) ve
+    /// crate `#![deny(unsafe_code)]` ile derlenir. Bu izin verilene dek
+    /// lazy parametre kabul edilir ama iki yol da güvenli tam-okumayla
+    /// çalışır — davranış aynı, sadece bellek kopyası tasarrufu ertelenmiş
+    /// durumda (bkz. DECISIONS.md, Aşama 3).
+    pub fn load(path: &std::path::Path, _lazy: bool) -> Result<HnswIndex, PersistError> {
+        let bytes = std::fs::read(path)?;
+        Self::load_from_bytes(&bytes)
+    }
+
+    /// Header + crc + sınır doğrulaması. Başarıda (Meta, f32 bölümünün aralığı).
+    fn parse(bytes: &[u8]) -> Result<(Meta, std::ops::Range<usize>), PersistError> {
+        if bytes.len() < 20 {
+            return Err(corrupt("dosya header için bile kısa"));
+        }
+        if bytes[0..4] != MAGIC {
+            return Err(corrupt("magic uyuşmuyor (bu bir GVDB dosyası değil)"));
+        }
+        let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 byte"));
+        if version != FORMAT_VERSION {
+            return Err(PersistError::UnsupportedVersion(version));
+        }
+        // Checksum önce: gövde sağlam değilse gerisini yorumlamaya çalışma.
+        let body = &bytes[..bytes.len() - 4];
+        let stored_crc = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().expect("4 byte"));
+        let mut hasher = crc32fast::Hasher::new();
+        hasher.update(body);
+        if hasher.finalize() != stored_crc {
+            return Err(corrupt("crc32 uyuşmuyor (dosya bozulmuş/kesilmiş)"));
+        }
+        let meta_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 byte")) as usize;
+        let meta_end = 16usize
+            .checked_add(meta_len)
+            .ok_or_else(|| corrupt("meta_len taşıyor"))?;
+        if meta_end > body.len() {
+            return Err(corrupt("meta_len dosya boyutunu aşıyor"));
+        }
+        let meta: Meta = bincode::deserialize(&bytes[16..meta_end])?;
+        let data_off = meta_end.div_ceil(4) * 4;
+        let expected = (meta.n as usize)
+            .checked_mul(meta.dim as usize)
+            .and_then(|x| x.checked_mul(4))
+            .ok_or_else(|| corrupt("n*dim taşıyor"))?;
+        if body.len() < data_off || body.len() - data_off != expected {
+            return Err(corrupt(format!(
+                "vektör bölümü {} byte olmalıydı, {} var",
+                expected,
+                body.len().saturating_sub(data_off)
+            )));
+        }
+        Ok((meta, data_off..data_off + expected))
+    }
+
+    /// Meta + storage'dan çalışır indeks kurar; iç tutarlılığı doğrular
+    /// (fuzz'da çökmemek için her slot referansı sınır kontrolünden geçer).
+    fn rebuild(meta: Meta, storage: VectorStorage) -> Result<HnswIndex, PersistError> {
+        let n = meta.n as usize;
+        let dim = meta.dim as usize;
+        if dim == 0 || dim > 1 << 20 {
+            return Err(corrupt("mantıksız dim"));
+        }
+        if meta.ids.len() != n || meta.links.len() != n {
+            return Err(corrupt("ids/links uzunluğu n ile uyuşmuyor"));
+        }
+        let mut links = Vec::with_capacity(n);
+        for ls in &meta.links {
+            if ls.is_empty() {
+                return Err(corrupt("node'un hiç seviyesi yok"));
+            }
+            let mut node_levels = Vec::with_capacity(ls.len());
+            for level in ls {
+                let l: Vec<usize> = level.iter().map(|&s| s as usize).collect();
+                if l.iter().any(|&s| s >= n) {
+                    return Err(corrupt("komşu slot sınır dışı"));
+                }
+                node_levels.push(l);
+            }
+            links.push(node_levels);
+        }
+        let entry = match meta.entry {
+            Some(e) if (e as usize) < n => Some(e as usize),
+            Some(_) => return Err(corrupt("entry point sınır dışı")),
+            None if n == 0 => None,
+            None => return Err(corrupt("n>0 ama entry yok")),
+        };
+        let mut slot_of = HashMap::with_capacity(n);
+        for (slot, &id) in meta.ids.iter().enumerate() {
+            if slot_of.insert(id, slot).is_some() {
+                return Err(corrupt("yinelenen VectorId"));
+            }
+        }
+        let ml = 1.0 / (meta.params.m.max(2) as f64).ln();
+        Ok(HnswIndex {
+            // RNG durumu diske yazılmaz; yükleme sonrası seviye ataması
+            // seed ⊕ n'den yeniden türetilir (deterministik ama inşa
+            // ortasındaki durumla birebir aynı değil — bkz. DECISIONS.md).
+            rng: StdRng::seed_from_u64(meta.params.seed ^ meta.n),
+            params: meta.params,
+            metric: meta.metric,
+            dim,
+            ml,
+            storage,
+            ids: meta.ids,
+            slot_of,
+            links,
+            entry,
+        })
     }
 }
 
@@ -506,6 +764,131 @@ mod tests {
         }
         let recall = hits as f64 / total as f64;
         assert!(recall >= 0.95, "recall {recall} < 0.95");
+    }
+
+    // ---- Kalıcılık testleri (Aşama 3) ----
+
+    fn save_to_bytes(idx: &HnswIndex) -> Vec<u8> {
+        let dir = std::env::temp_dir().join(format!("gvdb-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("t-{:p}.gvdb", idx as *const _));
+        idx.save(&path).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        std::fs::remove_file(&path).ok();
+        bytes
+    }
+
+    #[test]
+    fn persist_roundtrip_identical_results() {
+        let vecs = random_vectors(1_000, 16, 42);
+        let idx = build(&vecs, Metric::L2);
+        let loaded = HnswIndex::load_from_bytes(&save_to_bytes(&idx)).unwrap();
+        for q in random_vectors(20, 16, 43) {
+            assert_eq!(idx.search(&q, 10), loaded.search(&q, 10));
+        }
+        assert_eq!(idx.len(), loaded.len());
+    }
+
+    #[test]
+    fn persist_roundtrip_cosine_normalized_data_preserved() {
+        let vecs = random_vectors(200, 8, 42);
+        let idx = build(&vecs, Metric::Cosine);
+        let loaded = HnswIndex::load_from_bytes(&save_to_bytes(&idx)).unwrap();
+        for q in random_vectors(5, 8, 43) {
+            assert_eq!(idx.search(&q, 5), loaded.search(&q, 5));
+        }
+    }
+
+    #[test]
+    fn persist_empty_index_roundtrip() {
+        let idx = HnswIndex::new(4, Metric::L2, HnswParams::default());
+        let loaded = HnswIndex::load_from_bytes(&save_to_bytes(&idx)).unwrap();
+        assert!(loaded.is_empty());
+        assert!(loaded.search(&[0.0; 4], 3).is_empty());
+    }
+
+    #[test]
+    fn persist_loaded_index_accepts_inserts() {
+        let vecs = random_vectors(100, 8, 42);
+        let idx = build(&vecs, Metric::L2);
+        let mut loaded = HnswIndex::load_from_bytes(&save_to_bytes(&idx)).unwrap();
+        loaded.insert(VectorId(999), &[0.5; 8]).unwrap();
+        assert_eq!(loaded.len(), 101);
+        let res = loaded.search(&[0.5; 8], 1);
+        assert_eq!(res[0].id, VectorId(999));
+    }
+
+    #[test]
+    fn persist_truncated_file_is_error_not_panic() {
+        let idx = build(&random_vectors(100, 8, 42), Metric::L2);
+        let bytes = save_to_bytes(&idx);
+        for cut in [0, 3, 10, bytes.len() / 2, bytes.len() - 1] {
+            assert!(
+                HnswIndex::load_from_bytes(&bytes[..cut]).is_err(),
+                "kesik dosya (cut={cut}) hata döndürmeliydi"
+            );
+        }
+    }
+
+    #[test]
+    fn persist_bitflip_detected_by_crc() {
+        let idx = build(&random_vectors(100, 8, 42), Metric::L2);
+        let bytes = save_to_bytes(&idx);
+        // header'dan sonra çeşitli noktalarda tek bit boz
+        for pos in [8, 20, bytes.len() / 2, bytes.len() - 10] {
+            let mut bad = bytes.clone();
+            bad[pos] ^= 0x01;
+            assert!(
+                HnswIndex::load_from_bytes(&bad).is_err(),
+                "bit flip @{pos} yakalanmalıydı"
+            );
+        }
+    }
+
+    #[test]
+    fn persist_wrong_magic_and_version() {
+        let idx = build(&random_vectors(10, 4, 42), Metric::L2);
+        let bytes = save_to_bytes(&idx);
+        let mut bad = bytes.clone();
+        bad[0] = b'X';
+        assert!(matches!(
+            HnswIndex::load_from_bytes(&bad),
+            Err(PersistError::Corrupt(_))
+        ));
+        // versiyonu değiştir + crc'yi düzelt ki versiyon kontrolüne ulaşsın
+        let mut bad = bytes.clone();
+        bad[4] = 99;
+        let body_len = bad.len() - 4;
+        let mut h = crc32fast::Hasher::new();
+        h.update(&bad[..body_len]);
+        let crc = h.finalize().to_le_bytes();
+        bad[body_len..].copy_from_slice(&crc);
+        assert!(matches!(
+            HnswIndex::load_from_bytes(&bad),
+            Err(PersistError::UnsupportedVersion(99))
+        ));
+    }
+
+    proptest! {
+        /// Mini-fuzz (cargo-fuzz'ın CI'siz muadili): rastgele baytlar asla
+        /// panic üretmemeli. Gerçek fuzz hedefi fuzz/fuzz_targets/load_index.rs.
+        #[test]
+        fn prop_load_random_bytes_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
+            let _ = HnswIndex::load_from_bytes(&bytes);
+        }
+
+        /// Geçerli bir dosyanın rastgele bir baytını bozmak ya hata vermeli
+        /// ya da (pad baytı gibi checksum'a girmeyen yer yoktur — crc her şeyi
+        /// kapsar) asla panic olmamalı.
+        #[test]
+        fn prop_corrupted_valid_file_no_panic(pos in 0usize..500, xor in 1u8..255) {
+            let idx = build(&random_vectors(20, 4, 42), Metric::L2);
+            let mut bytes = save_to_bytes(&idx);
+            let p = pos % bytes.len();
+            bytes[p] ^= xor;
+            // crc her baytı kapsadığından bozulma Err olmalı
+            prop_assert!(HnswIndex::load_from_bytes(&bytes).is_err());
+        }
     }
 
     proptest! {

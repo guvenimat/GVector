@@ -10,7 +10,7 @@
 //!   DECISIONS.md'de kayıtlıdır.
 
 /// Desteklenen metrikler. İndeksler bunu konfigürasyon olarak alır.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Metric {
     /// Kare L2. Gerçek mesafe gerekiyorsa çağıran sqrt alır.
     L2,
