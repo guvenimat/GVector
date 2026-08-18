@@ -1,5 +1,20 @@
 # Benchmark Kayıtları
 
+## SIFT1M tam set — 2026-08-18 (stres testi, resmi ivecs ground truth)
+
+M=16, ef_c=200. İnşa: **802 s (13.4 dk)**, segment başına süre sabit
+(~80 s/100K) — saatler sürme endişesi doğrulanmadı.
+
+| indeks | bellek | ef=50 | ef=100 | ef=200 |
+|---|---|---|---|---|
+| f32 | 496 MB vektör + 383 MB graf | 0.9680 / 296µs | 0.9900 / 480µs | 0.9960 / 782µs |
+| int8 | 122 MB kod + 252 MB graf | 0.9630 / 325µs | 0.9830 / 479µs | 0.9890 / 778µs |
+
+(hücreler: recall@10 / p50). Quantize dönüşümü 1.1 s. Kayıp 1M'de de ≤ 0.011.
+Not: int8 graf belleğinin küçük görünmesi kopya sırasında Vec capacity'lerinin
+tam boyuta oturmasından (f32 tarafı büyüme payı taşıyor).
+
+
 ## Aşama 6 — 2026-08-18 (scalar quantization f32→int8, ADC, M=16/ef_c=200)
 
 Saf quantization (rerank yok); graf f32 ile inşa edilip donduruldu.
