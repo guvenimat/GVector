@@ -10,4 +10,5 @@ pub mod distance;
 pub mod eval;
 pub mod index;
 pub mod meta;
+pub mod storage;
 pub mod types;

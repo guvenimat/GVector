@@ -309,7 +309,7 @@ fn main() {
 
     let (base, queries, label) = match mode {
         "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter"
-        | "segcurve" | "mergecost" | "rangefilter" => {
+        | "segcurve" | "mergecost" | "rangefilter" | "durability" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -346,6 +346,78 @@ fn main() {
 
     if mode == "filter" {
         filter_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "durability" {
+        // Aşama 7a ölçümü: checkpoint + soğuk başlangıç maliyeti.
+        use vector_gvector::index::segmented::SegmentedIndex;
+        use vector_gvector::meta::{MetaValue, Metadata};
+        let dir = std::path::PathBuf::from("data/durability");
+        let _ = std::fs::remove_dir_all(&dir);
+        let idx = SegmentedIndex::open_or_create(
+            dir.clone(),
+            dim,
+            metric,
+            HnswParams::default(),
+            base.len() / 8,
+        )
+        .expect("open");
+        let t = Instant::now();
+        for (i, v) in base.iter().enumerate() {
+            let meta: Metadata = [
+                ("grup".to_string(), MetaValue::Int((i % 8) as i64)),
+                ("v".to_string(), MetaValue::Int(i as i64)),
+                ("f".to_string(), MetaValue::Float(i as f64 * 0.5)),
+            ]
+            .into();
+            idx.insert_with_meta(VectorId(i as u64), v, meta)
+                .expect("insert");
+        }
+        println!("inşa (3 metadata alanı ile): {:?}", t.elapsed());
+
+        let t = Instant::now();
+        let g1 = idx.checkpoint().expect("checkpoint");
+        let ck1 = t.elapsed();
+        let disk: u64 = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok()?.metadata().ok().map(|m| m.len()))
+            .sum();
+        println!(
+            "ilk checkpoint (gen={g1}): {ck1:?}, disk {:.1} MB ({:.0} B/vektör)",
+            disk as f64 / 1048576.0,
+            disk as f64 / base.len() as f64
+        );
+
+        // İkinci checkpoint: hiç yeni segment yok → yalnız metadata+manifest
+        let t = Instant::now();
+        let g2 = idx.checkpoint().expect("checkpoint2");
+        println!(
+            "ikinci checkpoint (gen={g2}, yeni segment yok): {:?}",
+            t.elapsed()
+        );
+        let (n_seg, _) = idx.shape();
+        drop(idx);
+
+        let t = Instant::now();
+        let reopened =
+            SegmentedIndex::open_or_create(dir.clone(), dim, metric, HnswParams::default(), 1)
+                .expect("reopen");
+        let cold = t.elapsed();
+        println!(
+            "soğuk başlangıç: {cold:?} ({n_seg} segment, {} kayıt, türetilmiş indeksler yeniden kuruldu)",
+            reopened.len_shared()
+        );
+        // Doğruluk: yeniden açılan indeks aynı sonuçları veriyor mu?
+        let truth = ground_truth(&base, &queries, k, metric);
+        let results: Vec<Vec<VectorId>> = queries
+            .iter()
+            .map(|q| reopened.search_shared(q, k).iter().map(|r| r.id).collect())
+            .collect();
+        println!(
+            "yeniden açılış sonrası recall@{k} = {:.4}",
+            recall_at_k(&results, &truth, k)
+        );
         return;
     }
 

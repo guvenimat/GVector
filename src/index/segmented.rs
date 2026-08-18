@@ -32,9 +32,21 @@ use crate::index::hnsw::{HnswIndex, HnswParams};
 use crate::index::numeric::NumericFieldIndex;
 use crate::index::{IndexError, VectorIndex};
 use crate::meta::{Filter, MetaKey, MetaValue, Metadata, Predicate};
+use crate::storage::{self, Manifest, SegmentRef, StorageError};
 use crate::types::{SearchResult, VectorId};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
+
+/// Segmentin diskteki karşılığı. Dosya adı yazıldığı generation'ı taşır ve
+/// DEĞİŞMEZ: bir segment bir kez yazılır, sonraki checkpoint'ler onu yalnız
+/// manifest'ten referanslar (bkz. storage modülü başlığı).
+#[derive(Debug, Clone)]
+struct StoredFile {
+    name: String,
+    crc32: u32,
+}
 
 /// Mühürlü, immutable HNSW + kendi tombstone kümesi.
 ///
@@ -45,6 +57,9 @@ use std::sync::{Arc, RwLock};
 struct Segment {
     index: HnswIndex,
     tombstones: RwLock<HashSet<VectorId>>,
+    /// Diske yazılmışsa dosya adı + CRC; yeni mühürlenen ve merge çıktısı
+    /// segmentlerde None (bir sonraki checkpoint yazar).
+    stored: RwLock<Option<StoredFile>>,
 }
 
 pub struct SegmentedIndex {
@@ -79,6 +94,12 @@ pub struct SegmentedIndex {
     /// ve boyutlar dengelenir (en-eski politikası dev segmenti boşuna
     /// yeniden kurabilirdi).
     max_segments: usize,
+    /// Kalıcılık dizini (bağlıysa). Bellek-içi kullanımda None.
+    storage_dir: RwLock<Option<PathBuf>>,
+    /// Monoton checkpoint sayacı; dosya adlarının benzersizliği buna dayanır.
+    generation: AtomicU64,
+    /// Son başarılı checkpoint'in unix zamanı (0 = hiç yapılmadı).
+    last_checkpoint: AtomicU64,
 }
 
 /// Planlayıcı yapılandırması. Değerler 10K + 100K seçicilik süpürmelerinden
@@ -164,6 +185,9 @@ impl SegmentedIndex {
             numeric: RwLock::new(HashMap::new()),
             planner: PlannerConfig::default(),
             max_segments: 8,
+            storage_dir: RwLock::new(None),
+            generation: AtomicU64::new(0),
+            last_checkpoint: AtomicU64::new(0),
         }
     }
 
@@ -181,25 +205,32 @@ impl SegmentedIndex {
     ) -> Result<(), IndexError> {
         self.insert_shared(id, vector)?;
         if !meta.is_empty() {
-            let mut postings = self.postings.write().expect("kilit");
-            for (key, value) in &meta {
-                postings
-                    .entry((key.clone(), value.key()))
-                    .or_default()
-                    .insert(id);
-            }
-            drop(postings);
-            // Sayısal değerler Range indeksine de girer (Int/Float).
-            let mut numeric = self.numeric.write().expect("kilit");
-            for (key, value) in &meta {
-                if let Some(v) = numeric_value(value) {
-                    numeric.entry(key.clone()).or_default().insert(v, id);
-                }
-            }
-            drop(numeric);
-            self.metadata.write().expect("kilit").insert(id, meta);
+            self.index_metadata(id, meta);
         }
         Ok(())
+    }
+
+    /// Metadata'yı depoya + türetilmiş indekslere (posting-list'ler, sayısal
+    /// alanlar) işler. Insert yolu ile snapshot'tan yeniden kurma yolu bunu
+    /// paylaşır: türetilmiş yapılar diske yazılmadığı için tek kaynak burası.
+    fn index_metadata(&self, id: VectorId, meta: Metadata) {
+        let mut postings = self.postings.write().expect("kilit");
+        for (key, value) in &meta {
+            postings
+                .entry((key.clone(), value.key()))
+                .or_default()
+                .insert(id);
+        }
+        drop(postings);
+        // Sayısal değerler Range indeksine de girer (Int/Float).
+        let mut numeric = self.numeric.write().expect("kilit");
+        for (key, value) in &meta {
+            if let Some(v) = numeric_value(value) {
+                numeric.entry(key.clone()).or_default().insert(v, id);
+            }
+        }
+        drop(numeric);
+        self.metadata.write().expect("kilit").insert(id, meta);
     }
 
     /// Kardinalite tahmini: Eq koşullarının posting sayılarının minimumu
@@ -580,6 +611,7 @@ impl SegmentedIndex {
         let segment = Arc::new(Segment {
             index: hnsw,
             tombstones: RwLock::new(HashSet::new()),
+            stored: RwLock::new(None), // ilk checkpoint yazacak
         });
         // 3. Önce segmenti yayınla, SONRA buffer'ı boşalt. Aradaki pencerede
         // kopya görünür (id bazlı dedupe emer); ters sıra veri kaybettirirdi.
@@ -634,6 +666,7 @@ impl SegmentedIndex {
         let merged = Arc::new(Segment {
             index: merged,
             tombstones: RwLock::new(HashSet::new()),
+            stored: RwLock::new(None), // birleşik yeni dosyaya yazılacak
         });
         // 3. Atomik takas: iki kaynağı çıkar, birleşiği ekle. Arc kimliğiyle
         // eşle — indeksler inşa sırasında kaymış olabilir (tek yazıcıda
@@ -743,6 +776,181 @@ impl SegmentedIndex {
             .map(|s| s.index.len() - s.tombstones.read().expect("kilit").len())
             .sum();
         seg_live + self.buffer.read().expect("kilit").len()
+    }
+
+    // ---- Kalıcılık: soğuk yol (Aşama 7a) ----
+
+    /// Kalıcılık dizinini bağlar (bellek-içi indeksi kalıcı hale getirir).
+    pub fn attach_storage(&self, dir: PathBuf) {
+        *self.storage_dir.write().expect("kilit") = Some(dir);
+    }
+
+    pub fn storage_dir(&self) -> Option<PathBuf> {
+        self.storage_dir.read().expect("kilit").clone()
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Relaxed)
+    }
+
+    /// Son başarılı checkpoint'in unix zamanı; 0 = henüz yok.
+    pub fn last_checkpoint_unix(&self) -> u64 {
+        self.last_checkpoint.load(Ordering::Relaxed)
+    }
+
+    /// Checkpoint: buffer'ı mühürle → yeni segmentleri yaz → metadata
+    /// snapshot'ı yaz → manifest'i atomik takas et → referanssızları temizle.
+    ///
+    /// Yazma sırası kritik: manifest EN SON yazılır, GC ondan SONRA çalışır.
+    /// Böylece her an diskteki manifest, referansladığı tüm dosyalar var
+    /// olacak şekilde tutarlıdır; kesinti hangi adımda olursa olsun eski
+    /// manifest geçerli kalır (yeni dosyalar yetim kalır, sonraki GC toplar).
+    ///
+    /// Tek yazar sözleşmesi gereği yazıcı task'inden çağrılır.
+    pub fn checkpoint(&self) -> Result<u64, StorageError> {
+        let dir = self.storage_dir().ok_or_else(|| {
+            StorageError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "kalıcılık dizini bağlı değil (attach_storage/open_or_create)",
+            ))
+        })?;
+        std::fs::create_dir_all(&dir)?;
+        // Buffer'ı mühürle: checkpoint sonrası tüm veri segmentlerde olsun ki
+        // WAL rotasyonu (7b) hiçbir kaydı sahipsiz bırakmasın.
+        self.seal();
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+
+        let segments: Vec<Arc<Segment>> = self
+            .segments
+            .read()
+            .expect("kilit")
+            .iter()
+            .cloned()
+            .collect();
+        let mut refs = Vec::with_capacity(segments.len());
+        for (i, seg) in segments.iter().enumerate() {
+            let existing = seg.stored.read().expect("kilit").clone();
+            let stored = match existing {
+                // Değişmez: bir kez yazılan segment bir daha yazılmaz.
+                Some(s) => s,
+                None => {
+                    let bytes = seg.index.to_bytes()?;
+                    let name = Manifest::segment_file_name(generation, i);
+                    storage::write_file_durable(&dir.join(&name), &bytes)?;
+                    let s = StoredFile {
+                        name,
+                        crc32: storage::crc32(&bytes),
+                    };
+                    *seg.stored.write().expect("kilit") = Some(s.clone());
+                    s
+                }
+            };
+            refs.push(SegmentRef {
+                file: stored.name,
+                crc32: stored.crc32,
+                records: seg.index.len() as u64,
+                tombstones: seg
+                    .tombstones
+                    .read()
+                    .expect("kilit")
+                    .iter()
+                    .map(|id| id.0)
+                    .collect(),
+            });
+        }
+
+        let entries: Vec<(VectorId, Metadata)> = self
+            .metadata
+            .read()
+            .expect("kilit")
+            .iter()
+            .map(|(id, m)| (*id, m.clone()))
+            .collect();
+        let (metadata_file, metadata_crc) = if entries.is_empty() {
+            (None, 0)
+        } else {
+            let bytes = storage::encode_metadata(&entries)?;
+            let name = Manifest::metadata_file_name(generation);
+            storage::write_file_durable(&dir.join(&name), &bytes)?;
+            (Some(name), storage::crc32(&bytes))
+        };
+
+        let now = storage::now_unix_secs();
+        let manifest = Manifest {
+            generation,
+            dim: self.dim as u64,
+            metric: self.metric,
+            hnsw_params: self.hnsw_params.clone(),
+            seal_threshold: self.seal_threshold as u64,
+            max_segments: self.max_segments as u64,
+            segments: refs,
+            metadata_file,
+            metadata_crc,
+            wal_file: None, // Aşama 7b dolduracak
+            created_unix_secs: now,
+        };
+        manifest.write(&dir)?;
+        storage::gc_unreferenced(&dir, &manifest)?;
+        self.last_checkpoint.store(now, Ordering::Relaxed);
+        Ok(generation)
+    }
+
+    /// Dizinde manifest varsa oradan kurar, yoksa verilen parametrelerle boş
+    /// indeks açar. Her iki durumda da dizin bağlanır.
+    ///
+    /// Manifest varsa dim/metric/params/eşikler ONDAN gelir: diskteki gerçek,
+    /// çağıranın varsayımını ezer (yanlış dim ile açıp veriyi bozmak yerine).
+    pub fn open_or_create(
+        dir: PathBuf,
+        dim: usize,
+        metric: Metric,
+        hnsw_params: HnswParams,
+        seal_threshold: usize,
+    ) -> Result<Self, StorageError> {
+        std::fs::create_dir_all(&dir)?;
+        let Some(manifest) = Manifest::read(&dir)? else {
+            let idx = Self::new(dim, metric, hnsw_params, seal_threshold);
+            idx.attach_storage(dir);
+            return Ok(idx);
+        };
+        let mut idx = Self::new(
+            manifest.dim as usize,
+            manifest.metric,
+            manifest.hnsw_params.clone(),
+            manifest.seal_threshold as usize,
+        );
+        idx.set_max_segments(manifest.max_segments as usize);
+
+        let mut segments = Vec::with_capacity(manifest.segments.len());
+        for sref in &manifest.segments {
+            let bytes = storage::read_verified(&dir, &sref.file, sref.crc32)?;
+            let index = HnswIndex::load_from_bytes(&bytes)?;
+            let tombstones: HashSet<VectorId> =
+                sref.tombstones.iter().map(|&i| VectorId(i)).collect();
+            segments.push(Arc::new(Segment {
+                index,
+                tombstones: RwLock::new(tombstones),
+                stored: RwLock::new(Some(StoredFile {
+                    name: sref.file.clone(),
+                    crc32: sref.crc32,
+                })),
+            }));
+        }
+        *idx.segments.write().expect("kilit") = segments;
+
+        if let Some(file) = &manifest.metadata_file {
+            let bytes = storage::read_verified(&dir, file, manifest.metadata_crc)?;
+            // Türetilmiş yapılar (posting-list'ler, sayısal indeksler) burada
+            // yeniden kurulur — diske yazılmadılar, tek kaynak metadata.
+            for (id, meta) in storage::decode_metadata(&bytes, &dir.join(file))? {
+                idx.index_metadata(id, meta);
+            }
+        }
+        idx.generation.store(manifest.generation, Ordering::Relaxed);
+        idx.last_checkpoint
+            .store(manifest.created_unix_secs, Ordering::Relaxed);
+        idx.attach_storage(dir);
+        Ok(idx)
     }
 
     /// Toplam indeks belleği (vektör + graf, tüm segmentler; byte).
@@ -1015,6 +1223,266 @@ mod tests {
         let res = idx.search_filtered(&vecs[7].clone(), 1, &f_v2);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].id, VectorId(7));
+    }
+
+    // ---- Kalıcılık: soğuk yol testleri (Aşama 7a) ----
+
+    fn meta_of(i: usize) -> Metadata {
+        [
+            ("grup".to_string(), MetaValue::Int((i % 4) as i64)),
+            ("v".to_string(), MetaValue::Int(i as i64)),
+        ]
+        .into()
+    }
+
+    #[test]
+    fn checkpoint_reopen_gives_identical_results() {
+        let dir = crate::storage::temp_dir("ckpt-roundtrip");
+        let vecs = random_vectors(800, 8, 42);
+        let queries = random_vectors(15, 8, 43);
+        let gen = {
+            let idx = SegmentedIndex::open_or_create(
+                dir.clone(),
+                8,
+                Metric::L2,
+                HnswParams::default(),
+                200,
+            )
+            .unwrap();
+            for (i, v) in vecs.iter().enumerate() {
+                idx.insert_with_meta(VectorId(i as u64), v, meta_of(i))
+                    .unwrap();
+            }
+            let before: Vec<Vec<SearchResult>> =
+                queries.iter().map(|q| idx.search_shared(q, 10)).collect();
+            let gen = idx.checkpoint().unwrap();
+            // checkpoint mühürlemesi sonuçları değiştirmemeli
+            for (q, b) in queries.iter().zip(&before) {
+                assert_eq!(&idx.search_shared(q, 10), b, "checkpoint sonuçları bozdu");
+            }
+            gen
+        };
+        // yeniden aç
+        let idx = SegmentedIndex::open_or_create(
+            dir.clone(),
+            999, // yanlış dim: manifest'teki kazanmalı
+            Metric::Dot,
+            HnswParams::default(),
+            1,
+        )
+        .unwrap();
+        assert_eq!(idx.generation(), gen);
+        assert_eq!(idx.len(), 800);
+        assert_eq!(idx.shape().1, 0, "checkpoint sonrası buffer boş olmalı");
+        // Aynı sorgular birebir aynı sonuçları vermeli
+        let fresh = SegmentedIndex::new(8, Metric::L2, HnswParams::default(), 200);
+        for (i, v) in vecs.iter().enumerate() {
+            fresh
+                .insert_with_meta(VectorId(i as u64), v, meta_of(i))
+                .unwrap();
+        }
+        fresh.seal();
+        for q in &queries {
+            assert_eq!(idx.search_shared(q, 10), fresh.search_shared(q, 10));
+        }
+        // türetilmiş indeksler yeniden kurulmuş olmalı: Eq + Range filtreleri
+        let f_eq = Filter {
+            must: vec![Predicate::Eq {
+                key: "grup".into(),
+                value: MetaValue::Int(2),
+            }],
+        };
+        let res = idx.search_filtered(&queries[0], 10, &f_eq);
+        assert_eq!(res.len(), 10);
+        assert!(
+            res.iter().all(|r| r.id.0 % 4 == 2),
+            "Eq posting yeniden kurulmadı"
+        );
+        let f_range = Filter {
+            must: vec![Predicate::Range {
+                key: "v".into(),
+                min: 0.0,
+                max: 49.0,
+            }],
+        };
+        let res = idx.search_filtered(&queries[0], 10, &f_range);
+        assert_eq!(
+            idx.debug_plan_arm(&f_range, 10),
+            "scan",
+            "numeric indeks yok"
+        );
+        assert!(res.iter().all(|r| r.id.0 < 50));
+    }
+
+    #[test]
+    fn segments_written_once_across_checkpoints() {
+        let dir = crate::storage::temp_dir("ckpt-once");
+        let vecs = random_vectors(500, 4, 42);
+        let idx =
+            SegmentedIndex::open_or_create(dir.clone(), 4, Metric::L2, HnswParams::default(), 200)
+                .unwrap();
+        for (i, v) in vecs.iter().take(400).enumerate() {
+            idx.insert_shared(VectorId(i as u64), v).unwrap();
+        }
+        let g1 = idx.checkpoint().unwrap();
+        let first: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let n = e.unwrap().file_name().to_string_lossy().to_string();
+                n.starts_with("segment-").then_some(n)
+            })
+            .collect();
+        // ikinci tur: yeni veri → yeni segment, eskiler AYNI dosyada kalmalı
+        for (i, v) in vecs.iter().enumerate().skip(400) {
+            idx.insert_shared(VectorId(i as u64), v).unwrap();
+        }
+        let g2 = idx.checkpoint().unwrap();
+        assert!(g2 > g1);
+        let second: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let n = e.unwrap().file_name().to_string_lossy().to_string();
+                n.starts_with("segment-").then_some(n)
+            })
+            .collect();
+        for f in &first {
+            assert!(
+                second.contains(f),
+                "eski segment yeniden yazıldı/silindi: {f} (değişmezlik ihlali)"
+            );
+        }
+        assert!(second.len() > first.len(), "yeni segment yazılmadı");
+    }
+
+    #[test]
+    fn reopen_restores_tombstones() {
+        let dir = crate::storage::temp_dir("ckpt-tombstone");
+        let vecs = random_vectors(400, 4, 42);
+        {
+            let idx = SegmentedIndex::open_or_create(
+                dir.clone(),
+                4,
+                Metric::L2,
+                HnswParams::default(),
+                150,
+            )
+            .unwrap();
+            for (i, v) in vecs.iter().enumerate() {
+                idx.insert_with_meta(VectorId(i as u64), v, meta_of(i))
+                    .unwrap();
+            }
+            idx.checkpoint().unwrap(); // hepsi segmentlerde
+            idx.delete_shared(VectorId(7)).unwrap();
+            idx.delete_shared(VectorId(200)).unwrap();
+            idx.checkpoint().unwrap(); // tombstone'lar manifest'e
+        }
+        let idx =
+            SegmentedIndex::open_or_create(dir, 4, Metric::L2, HnswParams::default(), 150).unwrap();
+        assert_eq!(idx.len(), 398);
+        let all: Vec<_> = idx
+            .search_shared(&vecs[7].clone(), 400)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(!all.contains(&VectorId(7)), "tombstone kurtarılmadı");
+        assert!(!all.contains(&VectorId(200)));
+        // silinen metadata da geri gelmemeli
+        let f = Filter {
+            must: vec![Predicate::Eq {
+                key: "v".into(),
+                value: MetaValue::Int(7),
+            }],
+        };
+        assert!(idx.search_filtered(&vecs[7].clone(), 5, &f).is_empty());
+    }
+
+    #[test]
+    fn corrupt_segment_file_is_error_not_panic() {
+        let dir = crate::storage::temp_dir("ckpt-corrupt");
+        let vecs = random_vectors(300, 4, 42);
+        {
+            let idx = SegmentedIndex::open_or_create(
+                dir.clone(),
+                4,
+                Metric::L2,
+                HnswParams::default(),
+                100,
+            )
+            .unwrap();
+            for (i, v) in vecs.iter().enumerate() {
+                idx.insert_shared(VectorId(i as u64), v).unwrap();
+            }
+            idx.checkpoint().unwrap();
+        }
+        let seg_file = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("segment-"))
+            })
+            .expect("segment dosyası");
+        let mut bytes = std::fs::read(&seg_file).unwrap();
+        let mid = bytes.len() / 2;
+        bytes[mid] ^= 0xff;
+        std::fs::write(&seg_file, &bytes).unwrap();
+        let err =
+            SegmentedIndex::open_or_create(dir.clone(), 4, Metric::L2, HnswParams::default(), 100);
+        assert!(err.is_err(), "bozuk segment yakalanmalıydı");
+        // kesik dosya da panic üretmemeli
+        std::fs::write(&seg_file, &bytes[..bytes.len() / 3]).unwrap();
+        assert!(
+            SegmentedIndex::open_or_create(dir, 4, Metric::L2, HnswParams::default(), 100).is_err()
+        );
+    }
+
+    #[test]
+    fn merge_output_persists_and_gc_cleans_sources() {
+        let dir = crate::storage::temp_dir("ckpt-merge");
+        let vecs = random_vectors(1_200, 4, 42);
+        let (before_len, gen) = {
+            let mut idx = SegmentedIndex::open_or_create(
+                dir.clone(),
+                4,
+                Metric::L2,
+                HnswParams::default(),
+                100,
+            )
+            .unwrap();
+            idx.set_max_segments(4);
+            for (i, v) in vecs.iter().enumerate() {
+                idx.insert_shared(VectorId(i as u64), v).unwrap();
+            }
+            idx.checkpoint().unwrap();
+            // merge'ler tavanı korumuş olmalı
+            assert!(idx.shape().0 <= 4);
+            let g = idx.checkpoint().unwrap();
+            (idx.len(), g)
+        };
+        // GC: manifest'te olmayan segment dosyası kalmamalı
+        let manifest = Manifest::read(&dir).unwrap().unwrap();
+        assert_eq!(manifest.generation, gen);
+        let on_disk: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| {
+                let n = e.unwrap().file_name().to_string_lossy().to_string();
+                n.starts_with("segment-").then_some(n)
+            })
+            .collect();
+        assert_eq!(
+            on_disk.len(),
+            manifest.segments.len(),
+            "yetim segment dosyası kaldı: {on_disk:?}"
+        );
+        let idx =
+            SegmentedIndex::open_or_create(dir, 4, Metric::L2, HnswParams::default(), 100).unwrap();
+        assert_eq!(idx.len(), before_len);
+    }
+
+    #[test]
+    fn checkpoint_without_storage_dir_is_error() {
+        let idx = SegmentedIndex::new(4, Metric::L2, HnswParams::default(), 100);
+        assert!(idx.checkpoint().is_err());
     }
 
     // ---- Segment tavanı / merge testleri ----

@@ -9,9 +9,11 @@
 //!   POST   /vectors        {"id": 1, "vector": [...], "metadata": {"k": "v"}}
 //!   POST   /search         {"vector": [...], "k": 10, "filter": {"must": [...]}}
 //!   DELETE /vectors/{id}
+//!   POST   /checkpoint     (mühürle + snapshot + manifest takası)
 //!   GET    /stats
 //!
-//! Kullanım: cargo run --release --bin server -- [port] [dim]
+//! Kullanım: cargo run --release --bin server -- [port] [dim] [data-dir]
+//! data-dir verilirse indeks kalıcıdır (açılışta manifest'ten kurtarılır).
 
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
@@ -38,6 +40,12 @@ enum WriteCmd {
     Delete {
         id: VectorId,
         reply: oneshot::Sender<Result<(), IndexError>>,
+    },
+    /// Checkpoint de bir yazma işidir (buffer'ı mühürler): tek yazar
+    /// sözleşmesi gereği aynı kuyruktan geçer, eşzamanlı insert'lerle
+    /// yarışmaz.
+    Checkpoint {
+        reply: oneshot::Sender<Result<u64, String>>,
     },
 }
 
@@ -157,12 +165,42 @@ async fn search(State(app): State<AppState>, Json(req): Json<SearchReq>) -> Json
     Json(hits)
 }
 
+async fn checkpoint(
+    State(app): State<AppState>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let (tx, rx) = oneshot::channel();
+    app.writer
+        .send(WriteCmd::Checkpoint { reply: tx })
+        .await
+        .map_err(|_| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({ "error": "yazıcı kapalı" })),
+            )
+        })?;
+    match rx.await {
+        Ok(Ok(generation)) => Ok(Json(serde_json::json!({ "generation": generation }))),
+        Ok(Err(e)) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": e })),
+        )),
+        Err(_) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": "yazıcı yanıt vermedi" })),
+        )),
+    }
+}
+
 async fn stats(State(app): State<AppState>) -> Json<serde_json::Value> {
     let (segments, buffer) = app.index.shape();
     Json(serde_json::json!({
         "len": app.index.len_shared(),
         "segments": segments,
         "buffer": buffer,
+        "generation": app.index.generation(),
+        "last_checkpoint_unix": app.index.last_checkpoint_unix(),
+        "durable": app.index.storage_dir().is_some(),
+        "storage_dir": app.index.storage_dir().map(|d| d.display().to_string()),
     }))
 }
 
@@ -172,12 +210,32 @@ async fn main() {
     let port: u16 = args.next().and_then(|a| a.parse().ok()).unwrap_or(7700);
     let dim: usize = args.next().and_then(|a| a.parse().ok()).unwrap_or(128);
 
-    let index = Arc::new(SegmentedIndex::new(
-        dim,
-        Metric::L2,
-        HnswParams::default(),
-        10_000,
-    ));
+    let data_dir = args.next().map(std::path::PathBuf::from);
+    let index = Arc::new(match &data_dir {
+        Some(dir) => {
+            let t = std::time::Instant::now();
+            let idx = SegmentedIndex::open_or_create(
+                dir.clone(),
+                dim,
+                Metric::L2,
+                HnswParams::default(),
+                10_000,
+            )
+            .expect("indeks açılamadı");
+            println!(
+                "kalıcı mod: {} (generation={}, {} kayıt, {:?})",
+                dir.display(),
+                idx.generation(),
+                idx.len_shared(),
+                t.elapsed()
+            );
+            idx
+        }
+        None => {
+            println!("bellek-içi mod (data-dir verilmedi): veriler kalıcı DEĞİL");
+            SegmentedIndex::new(dim, Metric::L2, HnswParams::default(), 10_000)
+        }
+    });
 
     // Tek yazıcı task'i: tüm mutasyonlar buradan sırayla geçer.
     let (tx, mut rx) = mpsc::channel::<WriteCmd>(1024);
@@ -198,6 +256,9 @@ async fn main() {
                     WriteCmd::Delete { id, reply } => {
                         let _ = reply.send(index.delete_shared(id));
                     }
+                    WriteCmd::Checkpoint { reply } => {
+                        let _ = reply.send(index.checkpoint().map_err(|e| e.to_string()));
+                    }
                 }
             }
         });
@@ -207,6 +268,7 @@ async fn main() {
         .route("/vectors", post(insert_vector))
         .route("/vectors/:id", delete(delete_vector))
         .route("/search", post(search))
+        .route("/checkpoint", post(checkpoint))
         .route("/stats", get(stats))
         .with_state(AppState { index, writer: tx });
 

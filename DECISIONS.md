@@ -1,5 +1,48 @@
 # Mimari Kararlar
 
+## Aşama 7a — Soğuk kalıcılık — 2026-08-18
+
+### 32. Segment dosyaları değişmez, adları generation taşır
+`segment-<gen>-<idx>.gvdb` bir kez yazılır, bir daha ASLA üzerine yazılmaz;
+sonraki checkpoint'ler onu yalnız manifest'ten referanslar. Üç kazanç:
+(1) her checkpoint sadece YENİ segmentleri yazar — 100K'da ilk checkpoint
+221ms, ikinci (yeni segment yok) 98ms; 1M'de checkpoint maliyetini belirleyen
+şey bu. (2) Windows dosya kilitleriyle uyumlu: açık handle'lı dosyaya asla
+yazmıyoruz. (3) Aşama 9b'nin mmap'i için önkoşul — haritalanan dosyanın
+değişmezliği zaten garanti.
+
+### 33. Manifest tek gerçek kaynak, atomik takas, EN SON yazılır
+Yazma sırası: yeni segmentler → metadata snapshot → **manifest** → GC.
+Her an diskteki manifest, referansladığı tüm dosyalar var olacak şekilde
+tutarlı; kesinti hangi adımda olursa olsun ESKİ manifest geçerli kalır ve
+yeni dosyalar yetim kalır (sonraki GC toplar). GC manifest'ten sonra
+çalışır — ters sıra hâlâ referanslanan bir dosyayı silebilirdi.
+
+**Windows dizin fsync yok:** dosya içeriği `sync_all` ile fsync'li, rename
+atomik (MoveFileEx REPLACE_EXISTING), ama dizin girdisinin dayanıklılığı
+işletim sistemine bırakılmış (Rust std dizin handle'ı açmaz). Sonuç:
+"checkpoint diskte ama dizin girdisi kaybolmuş" senaryosu teorik olarak
+mümkün — kurtarma bu yüzden her zaman WAL replay'iyle tamamlanacak (7b).
+
+### 34. Tombstone'lar manifest'te, türetilmiş yapılar diskte YOK
+- Tombstone'lar segment dosyasına yazılamaz (değişmezlik kuralı) ve WAL'a
+  bırakılamaz (checkpoint WAL'ı rotasyona sokar). Manifest zaten atomik ve
+  küçük; merge/compaction tombstone'ları düzenli temizliyor.
+- Eq posting-list'leri ve sayısal alan indeksleri **diske yazılmaz**:
+  metadata'dan tam olarak türetilebiliyorlar. Tek kaynak → tutarsızlık
+  riski yapısal olarak yok. Bedeli açılışta yeniden kurma (100K + 3 alan:
+  toplam soğuk başlangıç 242ms; 1M'de Aşama 8 ölçecek).
+- Metadata snapshot'ı tam yazım (artımlı değil): sıcak yolu WAL taşıyacak.
+
+### 35. Disk temsili API temsilinden ayrı: `MetaValueRepr`
+`MetaValue` HTTP JSON şekli için `#[serde(untagged)]` — `{"renk":"mavi"}`
+gibi doğal gövdeler bunu gerektiriyor. Ama untagged deserialization
+`deserialize_any` ister ve bincode self-describing olmadığı için bunu
+DESTEKLEMEZ (sessizce değil, derleme/çalışma zamanı hatası). Disk ve WAL
+temsili bu yüzden ayrı ve etiketli bir enum. Ayrışma zaten sağlıklı: biri
+dış sözleşme, diğeri iç format; bağımsız evrilebilirler. Regresyon testi
+her MetaValue türünü roundtrip ediyor.
+
 ## Range histogramı — 2026-08-18
 
 ### 31. Range tahmini: eşit-genişlik histogram [alt,üst] + sınırlı sayım

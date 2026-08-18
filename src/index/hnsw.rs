@@ -734,6 +734,15 @@ fn corrupt(msg: impl Into<String>) -> PersistError {
 
 impl HnswIndex {
     pub fn save(&self, path: &std::path::Path) -> Result<(), PersistError> {
+        let buf = self.to_bytes()?;
+        crate::storage::write_file_durable(path, &buf)?;
+        Ok(())
+    }
+
+    /// Serileştirilmiş gövde (magic + versiyon + meta + f32 bölümü + CRC).
+    /// Segment snapshot'ı bunu kullanır: CRC'yi bellekte hesaplayıp manifest'e
+    /// yazabilmek için baytlara ihtiyaç var (dosyayı geri okumak yerine).
+    pub fn to_bytes(&self) -> Result<Vec<u8>, PersistError> {
         let meta = Meta {
             params: self.params.clone(),
             metric: self.metric,
@@ -767,13 +776,7 @@ impl HnswIndex {
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(&buf);
         buf.extend(hasher.finalize().to_le_bytes());
-
-        // Önce geçici dosyaya yaz, sonra atomik rename: yarım yazılmış dosya
-        // asıl yolun üstüne hiç gelmesin.
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, &buf)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        Ok(buf)
     }
 
     /// Baytlardan yükleme — fuzz hedefi ve testler bu yolu paylaşır.

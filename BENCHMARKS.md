@@ -1,5 +1,31 @@
 # Benchmark Kayıtları
 
+## Aşama 7a — Soğuk kalıcılık — 2026-08-18 (SIFT 100K, 3 metadata alanı, 8 segment)
+
+| Ölçüm | Değer |
+|---|---|
+| inşa (3 metadata alanı ile) | 8.1 s |
+| ilk checkpoint (8 segment yazımı) | 221 ms |
+| ikinci checkpoint (yeni segment yok) | 98 ms |
+| disk toplam | 79.7 MB (836 B/vektör) |
+| soğuk başlangıç (8 segment + türetilmiş indeksler) | 242 ms |
+| yeniden açılış sonrası recall@10 | 1.0000 |
+
+Okumalar:
+- İkinci checkpoint'in 98 ms'i **tamamen metadata tam yazımı** (100K × 3 alan)
+  + manifest; segment yazımı sıfır çünkü dosyalar değişmez (DECISIONS #32).
+  1M'de bu kalem ~10x büyür — Aşama 8'in ölçeceği kalemlerden biri.
+- Soğuk başlangıç 242 ms'in içinde 8 segment GVDB yüklemesi + posting-list ve
+  sayısal indekslerin metadata'dan yeniden kurulması var (diske yazılmıyorlar).
+- 836 B/vektör: 512 B ham vektör + ~404 B graf'ın bir kısmı + metadata
+  snapshot'ı; graf/vektör oranı Aşama 2 tablosuyla tutarlı.
+
+HTTP uçtan uca doğrulama (dim=4, kalıcı mod): 3 insert + 1 delete →
+`POST /checkpoint` (gen=1) → süreç öldürüldü → yeniden başlatıldı →
+`GET /stats` 2 kayıt/gen=1, arama silineni döndürmüyor, Eq ve Range
+filtreleri çalışıyor (türetilmiş indeksler kurtarıldı), silinen id yeniden
+eklenebiliyor.
+
 ## Range histogramı — 2026-08-18 (SIFT 100K, 64 kova eşit genişlik, k=10)
 
 Bakım maliyeti: metadata'sız inşa 9.9s → 3 alanlı (2 sayısal) 10.2s (**+%4**).
