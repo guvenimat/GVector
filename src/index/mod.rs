@@ -5,6 +5,7 @@
 
 pub mod bruteforce;
 pub mod hnsw;
+pub mod segmented;
 
 use crate::types::{SearchResult, VectorId};
 use thiserror::Error;

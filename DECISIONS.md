@@ -1,5 +1,34 @@
 # Mimari Kararlar
 
+## Aşama 5 — 2026-08-18
+
+### 18. Eşzamanlılık: segment modeli (onaylanan strateji 2)
+COW/RCU yerine immutable segment + append-only buffer seçildi (kullanıcı
+onayıyla). Gerekçe: yazma başına O(n) kopya yok; compaction "mühürleme"ye
+dönüşüp arka plana alınabiliyor; gerçek vektör DB mimarisi. Sharded locking
+reddedildi çünkü kilit birimi (shard) ile erişim birimi (gezinti yolu)
+örtüşmüyor: her adım rastgele shard'a sıçrar, insert çift yönlü bağlantı +
+çok node'lu budama ile aynı anda çok kilit ister → deadlock ya da dev kilit.
+
+### 19. Kilit disiplini: pahalı iş asla kilit altında değil
+Okuyucu segment listesini `Vec<Arc<Segment>>` olarak klonlar (read kilidi
+mikrosaniyeler) ve HNSW aramasını kilitsiz yapar. Mühürleme (HNSW inşası,
+saniyeler) hiçbir kilit tutulmadan koşar; yayınlama sırası "önce segment
+ekle, sonra buffer'ı boşalt" — aradaki pencerede görülebilecek kopyaları
+arama id-bazlı tekilleştirme emer (veri kaybı yerine kopya tercih edildi).
+
+### 20. Tombstone'lar segment-YEREL
+Global silinmiş-küme, silinip yeniden eklenen id'de eski kopyayı hortlatırdı
+(reinsert kümeden çıkarınca segmentteki eski vektör yeniden görünür olurdu).
+Segment-yerel kümede eski kopya kendi segmentinde kalıcı gölgede kalır.
+
+### 21. Tek-yazar sözleşmesi
+Mutasyonlar `&self` üzerinden kilitli çalışır (`insert_shared`) ama duplicate
+kontrolü check-then-act olduğu için çoklu yazıcıda yarışabilir; sözleşme
+"çok okuyucu + tek yazıcı"dır (aşamanın kabul kriteriyle uyumlu). Çoklu
+yazıcı ileride id-uzayı bölüştürme ya da yazı kuyruğuyla eklenebilir.
+
+
 ## Aşama 4 — 2026-08-18
 
 ### 15. Silme: tombstone + gezinmede köprü, sonuçta dışlama

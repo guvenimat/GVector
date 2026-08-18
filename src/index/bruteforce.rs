@@ -77,6 +77,20 @@ impl BruteForceIndex {
         heap
     }
 
+    /// id indekste kayıtlı mı?
+    pub fn contains(&self, id: VectorId) -> bool {
+        self.slot_of.contains_key(&id)
+    }
+
+    /// (id, vektör) çiftleri — segment mühürleme buffer'ı boşaltırken kullanır.
+    /// Cosine'da dönen vektörler normalize edilmiş halidir (idempotent).
+    pub fn entries(&self) -> impl Iterator<Item = (VectorId, &[f32])> {
+        self.ids
+            .iter()
+            .enumerate()
+            .map(|(slot, &id)| (id, self.vector_at(slot)))
+    }
+
     /// İndeksin yaklaşık bellek kullanımı (byte) — BENCHMARKS raporu için.
     pub fn memory_bytes(&self) -> usize {
         self.data.capacity() * std::mem::size_of::<f32>()

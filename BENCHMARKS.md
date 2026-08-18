@@ -1,5 +1,28 @@
 # Benchmark Kayıtları
 
+## Aşama 5 — 2026-08-18 (segment modeli eşzamanlılık, SIFT 100K)
+
+Yapı: 5 × 20K HNSW segment + brute-force yazma buffer'ı. recall@10 = 1.0000
+(ef=50'de segment-birleşimli arama; küçük segmentlerde recall tek büyük
+indeksten daha yüksek çıkar, arama 5 kez ef genişliğinde çalıştığı için).
+
+| Senaryo | Throughput |
+|---|---|
+| 1 okuyucu thread | 1.893 QPS |
+| 4 okuyucu | 8.303 QPS (4.4x — ölçekleniyor, okuyucular birbirini bloklamıyor ✓) |
+| 8 okuyucu | 16.460 QPS (8.7x) |
+| 4 okuyucu + aktif yazıcı (sürekli sil+ekle, mühürlemeler dahil) | 3.018 QPS |
+
+Notlar:
+- Yazıcılı senaryodaki düşüş kilit beklemesinden çok CPU paylaşımından
+  geliyor: yazıcı thread'i sıcak döngüde mühürleme inşaları yapıyor (her
+  10K insert'te bir ~2 s'lik HNSW inşası) ve çekirdek çalıyor. Aramalar
+  hiçbir noktada mühürleme süresince DURMUYOR — tek RwLock yaklaşımında
+  bu 2 s'lik inşa tüm aramaları donduracaktı; ölçülebilir fark bu.
+- Stres testi (4 okuyucu + 1 yazıcı, 3K insert + aralıklı silme, 5+ mühürleme):
+  panic yok, sonuç invariant'ları (dup yok, NaN yok, sıralı) her sorguda doğrulandı.
+
+
 ## Aşama 4 — 2026-08-18 (silme + compaction, SIFT 10K, M=16, ef=50)
 
 | Ölçüm | Değer |

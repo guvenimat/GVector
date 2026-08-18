@@ -83,7 +83,7 @@ fn main() {
     let metric = Metric::L2; // SIFT literatürde L2 ile değerlendirilir
 
     let (base, queries, label) = match mode {
-        "sift" | "sweep" | "persist" | "delete" => {
+        "sift" | "sweep" | "persist" | "delete" | "concurrent" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -171,6 +171,93 @@ fn main() {
         println!(
             "compaction sonrası recall@{k} = {:.4}",
             recall_of(&hnsw, &bf)
+        );
+        return;
+    }
+
+    if mode == "concurrent" {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use vector_gvector::index::segmented::SegmentedIndex;
+
+        let idx = Arc::new(SegmentedIndex::new(
+            dim,
+            metric,
+            HnswParams::default(),
+            20_000, // 100K → 5 segment
+        ));
+        let t = Instant::now();
+        for (i, v) in base.iter().enumerate() {
+            idx.insert_shared(VectorId(i as u64), v).expect("insert");
+        }
+        let (n_seg, n_buf) = idx.shape();
+        println!("inşa: {:?} ({n_seg} segment + {n_buf} buffer)", t.elapsed());
+
+        // recall kontrolü (segment birleştirme doğruluğu)
+        let truth = ground_truth(&base, &queries, k, metric);
+        let results: Vec<Vec<VectorId>> = queries
+            .iter()
+            .map(|q| idx.search_shared(q, k).iter().map(|r| r.id).collect())
+            .collect();
+        println!("recall@{k} = {:.4}", recall_at_k(&results, &truth, k));
+
+        // throughput: her thread 3 sn boyunca arar, toplam sorgu sayılır
+        let measure_qps = |threads: usize, with_writer: bool| -> f64 {
+            let stop = AtomicBool::new(false);
+            let total = AtomicUsize::new(0);
+            std::thread::scope(|s| {
+                for t in 0..threads {
+                    let idx = &idx;
+                    let stop = &stop;
+                    let total = &total;
+                    let queries = &queries;
+                    s.spawn(move || {
+                        let mut n = 0usize;
+                        while !stop.load(Ordering::Relaxed) {
+                            let q = &queries[(n + t) % queries.len()];
+                            std::hint::black_box(idx.search_shared(q, k));
+                            n += 1;
+                        }
+                        total.fetch_add(n, Ordering::Relaxed);
+                    });
+                }
+                if with_writer {
+                    let idx = &idx;
+                    let stop = &stop;
+                    let base = &base;
+                    s.spawn(move || {
+                        // yazıcı: sil + geri ekle döngüsü (net boyut sabit kalır)
+                        let mut i = 0u64;
+                        while !stop.load(Ordering::Relaxed) {
+                            let id = VectorId(i % 10_000);
+                            if idx.delete_shared(id).is_ok() {
+                                idx.insert_shared(id, &base[(i % 10_000) as usize])
+                                    .expect("yeniden ekleme");
+                            }
+                            i += 1;
+                        }
+                    });
+                }
+                std::thread::sleep(std::time::Duration::from_secs(3));
+                stop.store(true, Ordering::Relaxed);
+            });
+            total.load(Ordering::Relaxed) as f64 / 3.0
+        };
+
+        for threads in [1, 4, 8] {
+            println!(
+                "okuma throughput ({threads} thread, yazıcı yok): {:.0} QPS",
+                measure_qps(threads, false)
+            );
+        }
+        println!(
+            "okuma throughput (4 thread + aktif yazıcı): {:.0} QPS",
+            measure_qps(4, true)
+        );
+        let (n_seg, n_buf) = idx.shape();
+        println!(
+            "son durum: {n_seg} segment + {n_buf} buffer, len={}",
+            idx.len_shared()
         );
         return;
     }

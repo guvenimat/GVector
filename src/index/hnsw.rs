@@ -485,6 +485,11 @@ impl HnswIndex {
         *self = fresh;
     }
 
+    /// id bu indekste yaşıyor mu (tombstone'lular hariç)?
+    pub fn contains(&self, id: VectorId) -> bool {
+        self.slot_of.contains_key(&id)
+    }
+
     /// Tombstone oranı (test ve gözlem için).
     pub fn tombstone_ratio(&self) -> f64 {
         if self.ids.is_empty() {
