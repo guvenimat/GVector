@@ -154,6 +154,16 @@ impl NumericFieldIndex {
             .collect()
     }
 
+    /// Hesaplanan bellek maliyeti (byte). BTreeMap düğüm ek yükü girdi
+    /// başına kaba bir sabitle modellenir; kesin değil ama tutarlı — 9c
+    /// eşiği oransal olduğu için bu yeterli (DECISIONS #40).
+    pub fn memory_bytes(&self) -> usize {
+        const BTREE_ENTRY_OVERHEAD: usize = 48; // düğüm payı + anahtar
+        let vec_headers = self.sorted.len() * std::mem::size_of::<Vec<VectorId>>();
+        let ids = self.total * std::mem::size_of::<VectorId>();
+        self.sorted.len() * BTREE_ENTRY_OVERHEAD + vec_headers + ids + self.hist.len() * 8
+    }
+
     pub fn len(&self) -> usize {
         self.total
     }

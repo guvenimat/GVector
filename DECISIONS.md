@@ -1,5 +1,67 @@
 # Mimari Kararlar
 
+## Aşama 8 sonuçları — go/no-go kararları — 2026-08-19
+
+### 42. Eşik-karşılaştırmalı kararlar (ön-kayıt #40'a göre)
+
+**9a — merge'in bağımsız task'e alınması: KOŞULSUZ YAPILIR (ön-kayıt gereği).**
+Gerekçe ölçüldü: en uzun tek yazma **80.5 s** (taban p99 7.8 µs), oran 10.3
+milyon x. Bir istemci bu pencerede yazma isteğinin yanıtını 80 saniye bekler.
+- **KRİTİK BULGU — 9a tek başına kabul kriterini SAĞLAYAMAZ.** Pencere iki
+  parçadan oluşuyor: **mühürleme 20.8 s + merge 59.7 s**. 9a yalnız merge'i
+  arka plana alıyor; geriye kalan mühürleme penceresi 20.8 s = taban p99'un
+  **2.7 milyon katı**, yani 50x kabul eşiği yine karşılanmaz. Ön-kaydın
+  "aşıyorsa kabul edilmemiştir ve nedeni araştırılır" maddesi devreye girer:
+  **neden mühürlemedir**. 9a'nın kapsamı genişletilmeli (mühürleme de arka
+  plan task'ine) ya da mühürleme artımlı hale getirilmeli — bu, ön-kaydı
+  değiştirmek değil, ölçümün ortaya çıkardığı yeni iştir.
+
+**9b — mmap ile lazy load: NO-GO. `unsafe` AÇILMIYOR.**
+Soğuk başlangıç bileşenlerine ayrıldı (BENCHMARKS): mmap'in kaldırabileceği
+iş yalnız (a) dosya okuma **196 ms** + (b)'nin vektör kopyalama payı ≈ toplam
+**~0.6 s üst sınır**. Eşik: kazanç ≥ %40 (**1.45 s**) VE ≥ 2 s. **İkisi de
+sağlanamıyor** — üst sınır bile eşiğin yarısının altında.
+- `deny(unsafe_code)` crate genelinde kalıyor.
+- **Yeniden bakma koşulu** (#40'tan): vektör verisi RAM'e sığmaz hale gelirse
+  (>%70 fiziksel bellek) mmap optimizasyon değil gereklilik olur.
+- **Ölçümün ortaya çıkardığı asıl fırsat başka yerde:** soğuk başlangıcın
+  **%63'ü türetilmiş indeksleri (posting + sayısal) yeniden kurmak** (2.28 s).
+  #34'te bunları "tek kaynak metadata olsun" diye diske yazmamayı seçmiştik;
+  ölçüm o kararın bedelini şimdi rakamla gösteriyor. Snapshot'lamak
+  mmap'ten ~4x daha büyük bir kazanç olurdu ve `unsafe` gerektirmez.
+
+**9c — mühürlü segment metadata sıkıştırması: GO.**
+Metadata payı **%51.5** (934 MB), eşik %25 — iki katından fazla. Metadata
+vektör+graf'tan (882 MB) **daha büyük**: "ikinci sınıf yolcu" olmaktan
+çıkmış, kapasiteyi belirleyen kalem haline gelmiş durumda.
+- Dağılım: id→metadata haritası 421 MB, Eq posting-list'leri 353 MB,
+  sayısal indeksler 160 MB.
+- Hesaplanan 1816 MB'a karşılık **zirve RSS 3167 MB** (fark 1351 MB:
+  allocator fragmentasyonu, `Vec` capacity payı, merge sırasındaki iki
+  kaynak + birleşik segment).
+- Not: 9c'nin planladığı "sıralı dizi + ikili arama" dönüşümü sayısal
+  indeksleri (160 MB) hedefliyor; ölçüm asıl şişkinliğin **id→metadata
+  haritası ve posting-list'lerde** olduğunu gösteriyor. String anahtarların
+  her kayıtta tekrarlanması (HashMap<String, MetaValue> per record) muhtemel
+  ana israf — 9c'nin kapsamı buna göre gözden geçirilmeli.
+
+### 43. Eşiğe bağlı olmayan ama kayda değer bulgular
+- **Okuma ölçeklenmesi 1M'de çöküyor:** tek thread 1048 QPS, 8 thread toplam
+  945 QPS (100K'da 8.7x ölçekleniyordu). Bellek bant genişliği duvarı.
+  Aşama 5'in "okuyucular birbirini bloklamaz" sözleşmesi *kilit* düzeyinde
+  hâlâ doğru; sınır artık yazılımda değil donanımda. int8 quantization'ın
+  (4x az bellek trafiği) 1M+ ölçekte asıl değeri burada.
+- **fsync politikası okuyuculara bindirmiyor** (oran 0.99–1.01): Aşama 5
+  sözleşmesinin ilk gerçek sınavı geçildi.
+- **Filtre latency'si ölçekle bozuluyor:** clustered×uzak s=0.3 hücresinde
+  p50 3.9 ms (100K) → 92.7 ms (1M); recall korunuyor (0.997) ama tarama
+  kolunun maliyeti eşleşme sayısıyla doğrusal.
+- **Segment modeli inşayı hızlandırıyor:** 1M tek graf 802 s, 8 segment
+  170 s (4.7x) — küçük graflarda inşa süper-doğrusallıktan kaçıyor.
+- **Replay doğrusal değil:** replay kayıt sayısı mühürleme eşiğini aşarsa
+  kurtarma içinde HNSW inşası tetiklenir. Checkpoint sıklığı = kurtarma
+  süresi tavanı.
+
 ## Aşama 9 ÖN-KAYIT — 2026-08-18 (Aşama 8 ölçümü KOŞULMADAN önce yazıldı)
 
 ### 40. Go/no-go eşikleri ve kabul kriterleri

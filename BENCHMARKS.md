@@ -1,5 +1,77 @@
 # Benchmark Kayıtları
 
+## Aşama 8 — 1M uçtan uca gerçeklik — 2026-08-19 (SIFT1M tam set, tam sistem)
+
+Konfigürasyon: 8 segment (seal=125K, tavan=8), 3 metadata alanı + 3 kümelenmiş
+filtre etiketi, WAL=group:20, f32. Eşikler ön-kayıtlı (DECISIONS #40).
+
+| Ölçüm | Değer |
+|---|---|
+| inşa (1M + metadata, WAL açık) | **170.4 s** (tek-graf 1M: 802 s → 4.7x hızlı) |
+| checkpoint | 2.44 s, disk **802 MB** (841 B/vektör) |
+| soğuk başlangıç (medyan, 3 tur) | **3.63 s** (1.13M kayıt) |
+| soğuk başlangıç + 10K WAL | 3.63 s (replay etkisi ölçülemez) |
+| **recall@10 (resmi GT, ef=100)** | **0.9970** — eşik ≥0.99 **TUTTU** |
+| arama p50 / p99 (tek thread) | 954.6 µs / 1.17 ms |
+| bellek (hesaplanan) | vektör+graf **882 MB**, metadata **934 MB** |
+| bellek (zirve RSS) | **3167 MB** |
+
+### Soğuk başlangıç bileşenleri (9b kararı için)
+
+| bileşen | süre | pay |
+|---|---|---|
+| (a) segment dosyaları okuma + CRC (812 MB) | 196 ms | %5 |
+| (b) segment parse (graf + vektör kopyası) | 722 ms | %20 |
+| (c) metadata okuma + decode (83 MB) | 428 ms | %12 |
+| (d) **türetilmiş indeksleri kurma** (posting + sayısal) | **2.28 s** | **%63** |
+| toplam | 3.62 s | |
+
+### Filtre kritik hücreleri (clustered × uzak sorgu, gerçek planlayıcı yolu)
+
+| s | eşleşme | kol (oracle) | recall | p50 |
+|---|---------|--------------|--------|-----|
+| 0.001 | 1.000 | scan (scan) | 1.000 | 131 µs |
+| 0.05 | 50.000 | scan (scan) | 1.000 | 9.36 ms |
+| 0.3 | 300.000 | post (post) | 0.997 | **92.65 ms** |
+
+Kol örtüşmesi **3/3 (%100)** — 100K'daki sonuç 1M'de korundu. Recall korundu
+ama s=0.3 hücresinde latency 100K'daki 3.9 ms'den 92.7 ms'ye çıktı (23x, veri
+10x): tarama kolunun maliyeti eşleşme sayısıyla doğrusal büyüyor.
+
+### Merge penceresi (9a gerekçesi)
+
+| | değer |
+|---|---|
+| taban yazma p50 / p99 (pencere dışı) | 600 ns / **7.8 µs** |
+| **en uzun tek yazma** | **80.5 s** |
+| — bileşenleri | mühürleme **20.8 s** + merge **59.7 s** |
+| oran (max / taban p99) | 10.3 milyon x |
+
+### Karışık yük: 8 okuyucu + 1 yazıcı (200 op/s throttle)
+
+| politika | okuma QPS | tabana oran | yazma op/s | okuma p50 |
+|---|---|---|---|---|
+| yazıcısız taban | 945 | 1.00 | — | 8.48 ms |
+| `none` | 950 | **1.01** | 200 | 8.42 ms |
+| `group:20` | 937 | **0.99** | 200 | 8.56 ms |
+| `per_op` | 937 | **0.99** | 200 | 8.55 ms |
+
+**Aşama 5 sözleşmesi sınavı geçildi:** fsync politikası okuyuculara ölçülebilir
+bir yük bindirmiyor (oran 0.99–1.01). Ama ikinci bir bulgu var: 1M'de okuma
+**hiç ölçeklenmiyor** — tek thread 1048 QPS (954 µs), 8 thread toplam 945 QPS.
+100K'da 8.7x ölçekleniyordu. Neden: 882 MB'lık veri üzerinde rastgele erişim,
+8 thread bellek bant genişliği duvarına çarpıyor. Bu, int8 quantization'ın
+(4x az bellek trafiği) 1M+ ölçekte neden değerli olacağının kanıtı.
+
+### Kaza testi (1M snapshot + dolu WAL)
+
+145K kayıtlık WAL, %67'de kesildi → 103.734 kayıt sağlam önek; açılış **3.69 s**,
+kurtarılan durum sağlam önekle **birebir eşit**. Not: replay kayıt sayısı
+mühürleme eşiğini (125K) aşarsa replay içinde HNSW inşası tetiklenir ve
+kurtarma süresi doğrusallıktan çıkar — geçersiz ilk koşuda (rastgele veri,
+252K kayıt) bu 206 s olarak gözlendi. Mekanizma veri-bağımsız; checkpoint
+sıklığı kurtarma süresini doğrudan belirliyor.
+
 ## Aşama 7b/7c — WAL: fsync politikası ve kurtarma — 2026-08-18
 
 20.000 insert (SIFT, 128d + 1 metadata alanı), batch=64 (sunucu yazıcı

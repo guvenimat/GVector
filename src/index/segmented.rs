@@ -37,7 +37,7 @@ use crate::storage::{self, Manifest, SegmentRef, StorageError};
 use crate::types::{SearchResult, VectorId};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Segmentin diskteki karşılığı. Dosya adı yazıldığı generation'ı taşır ve
@@ -68,8 +68,10 @@ pub struct SegmentedIndex {
     metric: Metric,
     /// Mühürlenen segmentlerin HNSW parametreleri.
     hnsw_params: HnswParams,
-    /// Buffer bu boyuta ulaşınca mühürlenir.
-    seal_threshold: usize,
+    /// Buffer bu boyuta ulaşınca mühürlenir. Atomik: ölçümde mühürlemeyi
+    /// geçici olarak devre dışı bırakmak gerekiyor (aksi halde "fsync
+    /// politikası" ölçümü sessizce "HNSW inşası" ölçümüne dönüşür).
+    seal_threshold: AtomicUsize,
     segments: RwLock<Vec<Arc<Segment>>>,
     buffer: RwLock<BruteForceIndex>,
     /// Sorgu genişliği (mühürlü segmentlerde).
@@ -103,6 +105,12 @@ pub struct SegmentedIndex {
     last_checkpoint: AtomicU64,
     /// Sıcak kalıcılık (Aşama 7b). None = yalnız checkpoint dayanıklılığı.
     wal: RwLock<Option<Wal>>,
+    /// Son mühürleme ve son merge süreleri (µs) + merge sayısı. 9a ölçümü
+    /// için: merge ayrı task'e alınsa bile MÜHÜRLEME yazıcıda kalır, yani
+    /// iki pencere ayrı ayrı bilinmeli (birini diğerine yazmamak için).
+    last_seal_us: AtomicU64,
+    last_merge_us: AtomicU64,
+    merge_count: AtomicU64,
     /// Açılışta yapılan WAL replay'inin raporu (gözlem / /stats).
     replay_report: RwLock<ReplayReport>,
 }
@@ -181,7 +189,7 @@ impl SegmentedIndex {
             dim,
             metric,
             hnsw_params,
-            seal_threshold,
+            seal_threshold: AtomicUsize::new(seal_threshold),
             segments: RwLock::new(Vec::new()),
             buffer: RwLock::new(BruteForceIndex::new(dim, metric)),
             ef_search,
@@ -194,6 +202,9 @@ impl SegmentedIndex {
             generation: AtomicU64::new(0),
             last_checkpoint: AtomicU64::new(0),
             wal: RwLock::new(None),
+            last_seal_us: AtomicU64::new(0),
+            last_merge_us: AtomicU64::new(0),
+            merge_count: AtomicU64::new(0),
             replay_report: RwLock::new(ReplayReport::default()),
         }
     }
@@ -201,6 +212,17 @@ impl SegmentedIndex {
     /// Segment tavanını değiştir (test/deney için).
     pub fn set_max_segments(&mut self, max: usize) {
         self.max_segments = max.max(2);
+    }
+
+    /// Mühürleme eşiğini değiştirir. Ölçümde mühürlemeyi devre dışı bırakmak
+    /// için (usize::MAX): aksi halde "fsync politikası" ölçümü araya giren
+    /// HNSW inşası yüzünden sessizce başka bir şeyi ölçer.
+    pub fn set_seal_threshold(&self, n: usize) {
+        self.seal_threshold.store(n.max(1), Ordering::Relaxed);
+    }
+
+    pub fn seal_threshold(&self) -> usize {
+        self.seal_threshold.load(Ordering::Relaxed)
     }
 
     /// Metadata'lı insert. Metadata'sız `insert_shared` boş geçer.
@@ -228,7 +250,7 @@ impl SegmentedIndex {
         let should_seal = {
             let mut buffer = self.buffer.write().expect("kilit");
             buffer.insert(id, vector)?;
-            buffer.len() >= self.seal_threshold
+            buffer.len() >= self.seal_threshold.load(Ordering::Relaxed)
         }; // write kilidi düşer; mühürleme kilitsiz çalışacak
         if !meta.is_empty() {
             self.index_metadata(id, meta);
@@ -611,6 +633,7 @@ impl SegmentedIndex {
     /// okuyucular bu süre boyunca eski segmentler + dolu buffer'ı görmeye
     /// devam eder (hiçbir vektör görünmez olmaz).
     fn seal(&self) {
+        let t_seal = std::time::Instant::now();
         // 1. Buffer'ın anlık kopyasını al (read kilidi kısa tutulur).
         let entries: Vec<(VectorId, Vec<f32>)> = {
             let buffer = self.buffer.read().expect("kilit");
@@ -648,9 +671,70 @@ impl SegmentedIndex {
         // sözleşme); okuyucular takas anına dek eski iki segmenti aramaya
         // devam eder — o pencerede 3 kopya yaşar (bellek tepe noktası,
         // BENCHMARKS'ta ölçülü).
+        self.last_seal_us
+            .store(t_seal.elapsed().as_micros() as u64, Ordering::Relaxed);
         while self.segments.read().expect("kilit").len() > self.max_segments {
+            let t_merge = std::time::Instant::now();
             self.merge_smallest_pair();
+            self.last_merge_us
+                .store(t_merge.elapsed().as_micros() as u64, Ordering::Relaxed);
+            self.merge_count.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    /// Son mühürleme süresi (µs) — yazıcıyı bloke eden pencere.
+    pub fn last_seal_us(&self) -> u64 {
+        self.last_seal_us.load(Ordering::Relaxed)
+    }
+
+    /// Son merge süresi (µs) ve toplam merge sayısı.
+    pub fn last_merge_us(&self) -> u64 {
+        self.last_merge_us.load(Ordering::Relaxed)
+    }
+
+    pub fn merge_count(&self) -> u64 {
+        self.merge_count.load(Ordering::Relaxed)
+    }
+
+    /// WAL politikasını değiştirir (aynı dosyaya devam eder). Ölçümde üç
+    /// politikayı tek indeks üzerinde karşılaştırmak için.
+    pub fn set_wal_policy(&self, policy: SyncPolicy) -> Result<(), IndexError> {
+        let mut guard = self.wal.write().expect("kilit");
+        if let Some(old) = guard.take() {
+            let path = old.path().to_path_buf();
+            drop(old);
+            *guard = Some(
+                Wal::open_append(path, policy).map_err(|e| IndexError::Storage(e.to_string()))?,
+            );
+        }
+        Ok(())
+    }
+
+    /// Metadata yapılarının hesaplanan bellek maliyeti (byte):
+    /// (metadata haritası, Eq posting-list'leri, sayısal alan indeksleri).
+    /// 9c eşiği bu hesaplanan değerlere göre değerlendirilir — RSS'te
+    /// metadata ayrıştırılamaz (DECISIONS #40).
+    pub fn metadata_memory_bytes(&self) -> (usize, usize, usize) {
+        let meta = self.metadata.read().expect("kilit");
+        // HashMap girdisi: anahtar(8) + iç HashMap başlığı(~48) + doluluk payı
+        let mut meta_bytes = meta.capacity() * (8 + 48 + 16);
+        for m in meta.values() {
+            meta_bytes += m.capacity() * (std::mem::size_of::<String>() + 32 + 16);
+            for k in m.keys() {
+                meta_bytes += k.len();
+            }
+        }
+        let postings = self.postings.read().expect("kilit");
+        let mut post_bytes = postings.capacity() * 64;
+        for ((k, _), set) in postings.iter() {
+            post_bytes += k.len() + set.capacity() * (8 + 8);
+        }
+        let numeric = self.numeric.read().expect("kilit");
+        let num_bytes: usize = numeric
+            .iter()
+            .map(|(k, fi)| k.len() + fi.memory_bytes())
+            .sum();
+        (meta_bytes, post_bytes, num_bytes)
     }
 
     /// En küçük (canlı sayıya göre) iki segmenti tek segmentte yeniden inşa
@@ -943,7 +1027,7 @@ impl SegmentedIndex {
             dim: self.dim as u64,
             metric: self.metric,
             hnsw_params: self.hnsw_params.clone(),
-            seal_threshold: self.seal_threshold as u64,
+            seal_threshold: self.seal_threshold.load(Ordering::Relaxed) as u64,
             max_segments: self.max_segments as u64,
             segments: refs,
             metadata_file,

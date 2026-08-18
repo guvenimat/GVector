@@ -301,6 +301,454 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
     }
 }
 
+/// Aşama 8: 1M uçtan uca gerçeklik ölçümü (tam sistem — segmented +
+/// planlayıcı + filtreler + WAL). Ön-kayıtlı eşikler: DECISIONS #40/#41.
+fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric) {
+    use std::collections::HashSet;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use vector_gvector::index::segmented::SegmentedIndex;
+    use vector_gvector::meta::{Filter, MetaValue, Metadata, Predicate};
+    use vector_gvector::storage::wal::SyncPolicy;
+
+    let n = base.len();
+    let dim = base[0].len();
+    let seal = n / 8; // tavan=8 ile tam 8 segment
+    let dir = std::path::PathBuf::from("data/fullscale");
+    let _ = std::fs::remove_dir_all(&dir);
+    // Filtre kritik hücreleri için kümelenmiş eşleşme kümeleri ÖNCEDEN
+    // hesaplanır ve metadata alanı olarak işaretlenir — böylece ölçüm gerçek
+    // planlayıcı yolundan geçer (kol örtüşmesi ancak böyle ölçülebilir).
+    let center = base[0].clone();
+    let s_levels = [0.001f64, 0.05, 0.3];
+    let cluster_names = ["c001", "c05", "c3"];
+    println!("kümelenmiş filtre kümeleri hazırlanıyor (exact top-k × 3)...");
+    let t_prep = Instant::now();
+    let clusters: Vec<HashSet<u64>> = s_levels
+        .iter()
+        .map(|&s| {
+            let m = ((s * n as f64) as usize).max(1);
+            exact_top_k(base, &center, m, metric)
+                .iter()
+                .map(|r| r.id.0)
+                .collect()
+        })
+        .collect();
+    println!("  hazır ({:?})", t_prep.elapsed());
+    let meta_of = |i: usize| -> Metadata {
+        let mut m: Metadata = [
+            ("grup".to_string(), MetaValue::Int((i % 8) as i64)),
+            ("v".to_string(), MetaValue::Int(i as i64)),
+            ("f".to_string(), MetaValue::Float(i as f64 * 0.25)),
+        ]
+        .into();
+        for (name, set) in cluster_names.iter().zip(&clusters) {
+            if set.contains(&(i as u64)) {
+                m.insert((*name).to_string(), MetaValue::Bool(true));
+            }
+        }
+        m
+    };
+
+    println!("### 1. İnşa (n={n}, seal={seal}, tavan=8, 3 metadata alanı, WAL=group:20)");
+    let idx = SegmentedIndex::open_durable(
+        dir.clone(),
+        dim,
+        metric,
+        HnswParams::default(),
+        seal,
+        SyncPolicy::Group { window_ms: 20 },
+    )
+    .expect("open");
+    let t = Instant::now();
+    for (i, v) in base.iter().enumerate() {
+        idx.insert_with_meta(VectorId(i as u64), v, meta_of(i))
+            .expect("insert");
+        if (i + 1) % 250_000 == 0 {
+            println!("  {} / {n} ({:?})", i + 1, t.elapsed());
+        }
+    }
+    idx.commit_wal().expect("commit");
+    let build = t.elapsed();
+    let (n_seg, n_buf) = idx.shape();
+    println!("inşa: {build:.1?} → {n_seg} segment + {n_buf} buffer");
+
+    println!();
+    println!("### 2. Bellek (hesaplanan; RSS dışarıdan örneklenir)");
+    let index_mem = idx.memory_bytes();
+    let (m_meta, m_post, m_num) = idx.metadata_memory_bytes();
+    let meta_total = m_meta + m_post + m_num;
+    let mb = |b: usize| b as f64 / 1048576.0;
+    println!("vektör+graf (f32): {:.0} MB", mb(index_mem));
+    println!(
+        "metadata toplam: {:.0} MB (harita {:.0} + posting {:.0} + sayısal {:.0})",
+        mb(meta_total),
+        mb(m_meta),
+        mb(m_post),
+        mb(m_num)
+    );
+    let meta_share = meta_total as f64 / (index_mem + meta_total) as f64;
+    println!(
+        "metadata payı: {:.1}% — 9c eşiği %25 → {}",
+        meta_share * 100.0,
+        if meta_share > 0.25 { "GO" } else { "NO-GO" }
+    );
+
+    println!();
+    println!("### 3. Checkpoint + disk");
+    let t = Instant::now();
+    let gen = idx.checkpoint().expect("checkpoint");
+    let ck = t.elapsed();
+    let disk: u64 = std::fs::read_dir(&dir)
+        .unwrap()
+        .filter_map(|e| e.ok()?.metadata().ok().map(|m| m.len()))
+        .sum();
+    println!(
+        "checkpoint (gen={gen}): {ck:.2?}, disk {:.0} MB ({:.0} B/vektör)",
+        disk as f64 / 1048576.0,
+        disk as f64 / n as f64
+    );
+
+    println!();
+    println!("### 4. Recall tabanı (ef=100)");
+    // Resmi SIFT ground truth YALNIZ tam 1M taban için geçerli; alt kümede
+    // id'ler başka vektörlere işaret eder (smoke test'te recall 0.0000 olarak
+    // yakalandı). Alt kümede exact taramayla üretiyoruz.
+    let truth: Vec<Vec<VectorId>> = if n == 1_000_000 {
+        println!("  (resmi SIFT ground truth — tam set, geçerli)");
+        read_ivecs(std::path::Path::new("data/sift/sift_groundtruth.ivecs"))
+            .expect("ground truth")
+            .iter()
+            .take(queries.len())
+            .map(|row| row.iter().take(k).map(|&i| VectorId(i as u64)).collect())
+            .collect()
+    } else {
+        println!("  (alt küme: resmi GT geçersiz → exact taramayla üretiliyor)");
+        ground_truth(base, queries, k, metric)
+    };
+    let results: Vec<Vec<VectorId>> = queries
+        .iter()
+        .map(|q| idx.search_shared(q, k).iter().map(|r| r.id).collect())
+        .collect();
+    let recall = recall_at_k(&results, &truth, k);
+    let lat = measure_latency(queries, |q| {
+        std::hint::black_box(idx.search_shared(q, k));
+    });
+    println!(
+        "recall@{k} = {recall:.4} (eşik ≥0.99 → {}), p50={:?} p99={:?}",
+        if recall >= 0.99 { "TUTTU" } else { "TUTMADI" },
+        lat.p50,
+        lat.p99
+    );
+
+    println!();
+    println!("### 5. Filtre kritik hücreleri (clustered × uzak sorgu, gerçek planlayıcı yolu)");
+    let mut q_order: Vec<usize> = (0..queries.len()).collect();
+    q_order.sort_by(|&a, &b| {
+        metric
+            .distance(&queries[a], &center)
+            .total_cmp(&metric.distance(&queries[b], &center))
+    });
+    let far: Vec<Vec<f32>> = q_order[q_order.len() * 2 / 3..]
+        .iter()
+        .map(|&i| queries[i].clone())
+        .collect();
+    let scan_limit = (16 * k).max(n / 20);
+    println!("scan_limit = {scan_limit}");
+    println!("| s | eşleşme | kol (oracle) | recall | p50 |");
+    println!("|---|---------|--------------|--------|-----|");
+    let mut arm_agree = 0usize;
+    for (si, s) in s_levels.iter().enumerate() {
+        let allow_set = &clusters[si];
+        let filter = Filter {
+            must: vec![Predicate::Eq {
+                key: cluster_names[si].to_string(),
+                value: MetaValue::Bool(true),
+            }],
+        };
+        let arm = idx.debug_plan_arm(&filter, k);
+        let oracle = if allow_set.len() <= scan_limit {
+            "scan"
+        } else {
+            "post"
+        };
+        arm_agree += (arm == oracle) as usize;
+        let mut hits = 0usize;
+        let mut total = 0usize;
+        for q in &far {
+            // referans: yalnız eşleşenler üzerinde exact top-k
+            let mut cand: Vec<(f32, u64)> = allow_set
+                .iter()
+                .map(|&id| (metric.distance(q, &base[id as usize]), id))
+                .collect();
+            cand.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let tr: Vec<u64> = cand.iter().take(k).map(|x| x.1).collect();
+            let res = idx.search_filtered(q, k, &filter);
+            hits += res.iter().filter(|r| tr.contains(&r.id.0)).count();
+            total += tr.len();
+        }
+        let latf = measure_latency(&far, |q| {
+            std::hint::black_box(idx.search_filtered(q, k, &filter));
+        });
+        println!(
+            "| {s} | {} | {arm} ({oracle}) | {:.3} | {:?} |",
+            allow_set.len(),
+            hits as f64 / total.max(1) as f64,
+            latf.p50
+        );
+    }
+    println!(
+        "kol örtüşmesi: {arm_agree}/{} ({:.0}%)",
+        s_levels.len(),
+        arm_agree as f64 / s_levels.len() as f64 * 100.0
+    );
+
+    println!();
+    println!("### 6. Merge penceresi (9a gerekçesi ve tabanı)");
+    let extra = seal + 5_000; // 9. segmenti mühürler → merge tetiklenir
+    println!("  {extra} ek yazma (pencere öncesi+sonrası örnekleme için)");
+    let mut lats: Vec<std::time::Duration> = Vec::with_capacity(extra);
+    let t_all = Instant::now();
+    for i in 0..extra {
+        let id = (n + i) as u64;
+        let v = &base[i % n];
+        let t = Instant::now();
+        idx.insert_with_meta(VectorId(id), v, Metadata::new())
+            .expect("insert");
+        lats.push(t.elapsed());
+        if (i + 1) % 50_000 == 0 {
+            println!("    {} / {extra} ({:?})", i + 1, t_all.elapsed());
+        }
+    }
+    idx.commit_wal().expect("commit");
+    let mut sorted_lat = lats.clone();
+    sorted_lat.sort();
+    let pct =
+        |p: f64| sorted_lat[((sorted_lat.len() as f64 * p) as usize).min(sorted_lat.len() - 1)];
+    // Pencereler: en uzun yazma = seal+merge yapan çağrı
+    let max_lat = *sorted_lat.last().unwrap();
+    // Taban: en uzun 3 yazma (seal/merge çağrıları) hariç p99
+    let cutoff = sorted_lat.len().saturating_sub(3);
+    let base_p99 = sorted_lat[(cutoff as f64 * 0.99) as usize];
+    println!(
+        "taban p50={:?} p99={:?} (seal/merge çağrıları hariç)",
+        pct(0.5),
+        base_p99
+    );
+    println!(
+        "EN UZUN yazma: {:?} — seal {:?} + merge {:?} (toplam {} merge)",
+        max_lat,
+        std::time::Duration::from_micros(idx.last_seal_us()),
+        std::time::Duration::from_micros(idx.last_merge_us()),
+        idx.merge_count()
+    );
+    let ratio = max_lat.as_secs_f64() / base_p99.as_secs_f64().max(1e-9);
+    println!(
+        "oran: {ratio:.0}x (9a kabul eşiği 50x — 9a SONRASI ölçülecek; \
+         şimdiki değer 9a'nın gerekçesi)"
+    );
+    let (n_seg2, _) = idx.shape();
+    println!("segment sayısı: {n_seg2} (tavan 8 korunuyor)");
+
+    println!();
+    println!("### 7. Soğuk başlangıç (9b tabanı)");
+    idx.checkpoint().expect("checkpoint2");
+    drop(idx);
+    let mut cold_times = Vec::new();
+    for round in 0..3 {
+        let t = Instant::now();
+        let re = SegmentedIndex::open_durable(
+            dir.clone(),
+            dim,
+            metric,
+            HnswParams::default(),
+            seal,
+            SyncPolicy::Group { window_ms: 20 },
+        )
+        .expect("reopen");
+        let el = t.elapsed();
+        cold_times.push(el);
+        if round == 0 {
+            println!("  boş WAL: {el:.2?} ({} kayıt)", re.len_shared());
+        }
+    }
+    cold_times.sort();
+    println!(
+        "soğuk başlangıç medyan (3 tur, boş WAL): {:.2?}",
+        cold_times[1]
+    );
+
+    // 10K'lık WAL ile soğuk başlangıç
+    let idx = SegmentedIndex::open_durable(
+        dir.clone(),
+        dim,
+        metric,
+        HnswParams::default(),
+        seal,
+        SyncPolicy::Group { window_ms: 20 },
+    )
+    .expect("open");
+    for i in 0..10_000usize {
+        let id = (n + extra + i) as u64;
+        idx.insert_with_meta(VectorId(id), &base[i % n], Metadata::new())
+            .expect("insert");
+    }
+    idx.flush_wal().expect("flush");
+    let wal_mb = idx.wal_len_bytes() as f64 / 1048576.0;
+    drop(idx);
+    let t = Instant::now();
+    let re = SegmentedIndex::open_durable(
+        dir.clone(),
+        dim,
+        metric,
+        HnswParams::default(),
+        seal,
+        SyncPolicy::Group { window_ms: 20 },
+    )
+    .expect("reopen");
+    println!(
+        "soğuk başlangıç + 10K WAL ({wal_mb:.1} MB): {:.2?} (replay {} kayıt)",
+        t.elapsed(),
+        re.replay_report().applied
+    );
+
+    println!();
+    println!("### 8. Karışık yük: 8 okuyucu + 1 yazıcı × 3 fsync politikası");
+    // Yazıcı GERÇEKÇİ hızda çalışır (throttle). Sınırsız yazma iki şeyi
+    // birden bozuyordu: (a) buffer şişip okuyucuları brute-force taramaya
+    // mahkûm ediyor, (b) mühürleme tetiklenip tablo "fsync politikası"
+    // yerine "araya giren HNSW inşası" ölçüyordu. Sorumuz "yazıcı varken
+    // okuyucular yavaşlıyor mu", "yazıcı ne kadar hızlı" değil (o Aşama 7'de).
+    const WRITE_RATE: u64 = 200; // op/s hedefi (per_op bile yetişebilmeli)
+    let idx = Arc::new(re);
+    let bench_reads = |idx: &Arc<SegmentedIndex>,
+                       with_writer: bool|
+     -> (f64, f64, std::time::Duration) {
+        let stop = AtomicBool::new(false);
+        let reads = AtomicUsize::new(0);
+        let writes = AtomicUsize::new(0);
+        let read_ns = AtomicUsize::new(0);
+        let secs = 3u64;
+        std::thread::scope(|sc| {
+            for t in 0..8 {
+                let (idx, stop, reads, read_ns) = (idx, &stop, &reads, &read_ns);
+                sc.spawn(move || {
+                    let mut i = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        let q = &queries[(i + t) % queries.len()];
+                        let t0 = Instant::now();
+                        std::hint::black_box(idx.search_shared(q, k));
+                        read_ns.fetch_add(t0.elapsed().as_nanos() as usize, Ordering::Relaxed);
+                        i += 1;
+                        reads.fetch_add(1, Ordering::Relaxed);
+                    }
+                });
+            }
+            if with_writer {
+                let (idx, stop, writes) = (idx, &stop, &writes);
+                sc.spawn(move || {
+                    let interval = std::time::Duration::from_micros(1_000_000 / WRITE_RATE);
+                    let mut next = Instant::now();
+                    let mut i = 0usize;
+                    while !stop.load(Ordering::Relaxed) {
+                        next += interval;
+                        let id = VectorId(9_000_000 + i as u64);
+                        let _ = idx.insert_with_meta(id, &base[i % 1000], Metadata::new());
+                        let _ = idx.commit_wal();
+                        i += 1;
+                        writes.fetch_add(1, Ordering::Relaxed);
+                        let now = Instant::now();
+                        if next > now {
+                            std::thread::sleep(next - now);
+                        }
+                    }
+                });
+            }
+            std::thread::sleep(std::time::Duration::from_secs(secs));
+            stop.store(true, Ordering::Relaxed);
+        });
+        let r = reads.load(Ordering::Relaxed);
+        (
+            r as f64 / secs as f64,
+            writes.load(Ordering::Relaxed) as f64 / secs as f64,
+            std::time::Duration::from_nanos((read_ns.load(Ordering::Relaxed) / r.max(1)) as u64),
+        )
+    };
+    let (base_qps, _, base_p50) = bench_reads(&idx, false);
+    println!("yazıcısız taban: {base_qps:.0} QPS, okuma p50 {base_p50:?} (8 okuyucu)");
+    println!("| politika | okuma QPS | tabana oran | yazma op/s | okuma p50 |");
+    println!("|----------|-----------|-------------|------------|-----------|");
+    for policy in [
+        SyncPolicy::None,
+        SyncPolicy::Group { window_ms: 20 },
+        SyncPolicy::PerOp,
+    ] {
+        idx.set_wal_policy(policy).expect("policy");
+        let (qps, wps, p50) = bench_reads(&idx, true);
+        println!(
+            "| {} | {qps:.0} | {:.2} | {wps:.0} | {p50:?} |",
+            policy.label(),
+            qps / base_qps.max(1.0)
+        );
+    }
+
+    println!();
+    println!("### 9. 1M kaza testi (dolu WAL + kesme)");
+    let idx = Arc::try_unwrap(idx).ok().expect("tek referans");
+    // WAL'ı kasten mühürleme eşiğinin ÜSTÜNE çıkar: replay'in kurtarma
+    // süresini nasıl etkilediğini görmek için (replay insert'leri buffer'ı
+    // doldurunca HNSW inşası tetikleniyor — kurtarma süresi WAL boyutunda
+    // doğrusal DEĞİL).
+    let wal_fill = idx.seal_threshold().min(150_000) + 20_000;
+    println!(
+        "  WAL'a {wal_fill} kayıt yazılıyor (mühürleme eşiği {})",
+        idx.seal_threshold()
+    );
+    for i in 0..wal_fill {
+        let id = VectorId(20_000_000 + i as u64);
+        idx.insert_with_meta(id, &base[i % n], Metadata::new())
+            .expect("insert");
+    }
+    idx.flush_wal().expect("flush");
+    let wal_path = dir.join(vector_gvector::storage::Manifest::wal_file_name(
+        idx.generation(),
+    ));
+    let live_before = idx.len_shared();
+    drop(idx);
+    let full = std::fs::read(&wal_path).unwrap_or_default();
+    if full.is_empty() {
+        println!("WAL boş — kesme senaryosu atlandı");
+    } else {
+        let cut = full.len() * 2 / 3;
+        std::fs::write(&wal_path, &full[..cut]).expect("kes");
+        let (prefix, _) = vector_gvector::storage::wal::replay_bytes(&full[..cut]);
+        let t = Instant::now();
+        let re = SegmentedIndex::open_durable(
+            dir.clone(),
+            dim,
+            metric,
+            HnswParams::default(),
+            seal,
+            SyncPolicy::Group { window_ms: 20 },
+        )
+        .expect("kesik WAL ile açılış");
+        println!(
+            "kesik WAL ({:.1} MB → {:.1} MB) açılış: {:.2?}, replay {} kayıt (sağlam önek {} kayıt)",
+            full.len() as f64 / 1048576.0,
+            cut as f64 / 1048576.0,
+            t.elapsed(),
+            re.replay_report().applied,
+            prefix.len()
+        );
+        println!(
+            "  kayıt sayısı: kesme öncesi {live_before} → kurtarılan {} (fark = kesilen kuyruk)",
+            re.len_shared()
+        );
+    }
+    println!();
+    println!("=== fullscale tamamlandı ===");
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str).unwrap_or("random");
@@ -309,7 +757,7 @@ fn main() {
 
     let (base, queries, label) = match mode {
         "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter"
-        | "segcurve" | "mergecost" | "rangefilter" | "durability" | "wal" => {
+        | "segcurve" | "mergecost" | "rangefilter" | "durability" | "wal" | "fullscale" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -346,6 +794,88 @@ fn main() {
 
     if mode == "filter" {
         filter_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "coldprofile" {
+        // 9b kararı için: soğuk başlangıcın bileşenleri. mmap yalnız
+        // "dosya okuma + vektör kopyalama" kısmını kaldırabilir; graf parse'ı
+        // ve metadata yeniden kurma kalır. Kazancın ÜST SINIRI budur.
+        use vector_gvector::storage::{read_verified, Manifest};
+        let dir = std::path::PathBuf::from("data/fullscale");
+        let manifest = Manifest::read(&dir)
+            .expect("manifest")
+            .expect("manifest yok");
+        println!(
+            "generation={}, {} segment",
+            manifest.generation,
+            manifest.segments.len()
+        );
+
+        let t = Instant::now();
+        let mut blobs = Vec::new();
+        let mut total = 0usize;
+        for s in &manifest.segments {
+            let b = read_verified(&dir, &s.file, s.crc32).expect("segment oku");
+            total += b.len();
+            blobs.push(b);
+        }
+        let t_read = t.elapsed();
+        println!(
+            "(a) segment dosyaları okuma + CRC doğrulama: {t_read:.2?} ({:.0} MB)",
+            total as f64 / 1048576.0
+        );
+
+        let t = Instant::now();
+        let mut n_rec = 0usize;
+        for b in &blobs {
+            let h = HnswIndex::load_from_bytes(b).expect("parse");
+            n_rec += h.len();
+        }
+        let t_parse = t.elapsed();
+        println!("(b) segment parse (graf + vektör kopyası): {t_parse:.2?} ({n_rec} kayıt)");
+        drop(blobs);
+
+        let t = Instant::now();
+        let mfile = manifest.metadata_file.clone().expect("metadata dosyası");
+        let mbytes = read_verified(&dir, &mfile, manifest.metadata_crc).expect("meta oku");
+        let entries =
+            vector_gvector::storage::decode_metadata(&mbytes, &dir.join(&mfile)).expect("decode");
+        let t_meta_read = t.elapsed();
+        println!(
+            "(c) metadata okuma + decode: {t_meta_read:.2?} ({} kayıt, {:.0} MB)",
+            entries.len(),
+            mbytes.len() as f64 / 1048576.0
+        );
+
+        let t = Instant::now();
+        let full = vector_gvector::index::segmented::SegmentedIndex::open_or_create(
+            dir.clone(),
+            dim,
+            metric,
+            HnswParams::default(),
+            125_000,
+        )
+        .expect("aç");
+        let t_total = t.elapsed();
+        println!("(d) tam açılış (a+b+c+türetilmiş indeksler): {t_total:.2?}");
+        let derived = t_total.saturating_sub(t_read + t_parse + t_meta_read);
+        println!("    → türetilmiş indeksleri kurma ≈ {derived:.2?}");
+        println!();
+        println!(
+            "mmap'in kaldırabileceği ÜST SINIR ≈ (a) + (b)'nin vektör payı = {:.2?} + kısmi",
+            t_read
+        );
+        println!(
+            "9b eşiği: kazanç ≥ %40 VE ≥ 2 s. Toplam {t_total:.2?} → %40 = {:.2?}",
+            t_total.mul_f64(0.4)
+        );
+        println!("    (doğrulama: {} kayıt açıldı)", full.len_shared());
+        return;
+    }
+
+    if mode == "fullscale" {
+        full_scale(&base, &queries, k, metric);
         return;
     }
 
