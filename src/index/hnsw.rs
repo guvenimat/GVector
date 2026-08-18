@@ -184,6 +184,10 @@ impl HnswIndex {
     /// keşfedilir — bağlantılılık köprüsü olarak lazımlar) ama sonuç kümesine
     /// alınmazlar. İnşa sırasında false: yeni node tombstone'lara da bağlanabilir,
     /// compaction zaten onları toptan temizleyecek.
+    ///
+    /// `filter`: metadata filtresi aynı ilkeyle çalışır — eşleşmeyen node
+    /// gezilir (bağlantılılık), sonuca girmez. None = filtre yok.
+    #[allow(clippy::type_complexity)]
     fn search_layer(
         &self,
         query: &[f32],
@@ -191,6 +195,7 @@ impl HnswIndex {
         ef: usize,
         level: usize,
         exclude_deleted: bool,
+        filter: Option<&dyn Fn(usize) -> bool>,
     ) -> Vec<Cand> {
         // visited: slot başına bayrak. HashSet yerine Vec<bool>: n=100K'da bile
         // 100KB'lik tek allocation, dal başına hash maliyeti yok.
@@ -210,7 +215,8 @@ impl HnswIndex {
                 slot: ep,
             };
             candidates.push(Reverse(c));
-            if !(exclude_deleted && self.deleted[ep]) {
+            let admissible = !(exclude_deleted && self.deleted[ep]) && filter.is_none_or(|f| f(ep));
+            if admissible {
                 results.push(c);
             }
         }
@@ -234,8 +240,10 @@ impl HnswIndex {
                 if within {
                     let c = Cand { dist: d, slot: nb };
                     candidates.push(Reverse(c));
-                    // Tombstone gezilir ama sonuçlara girmez.
-                    if !(exclude_deleted && self.deleted[nb]) {
+                    // Tombstone / filtre-dışı node gezilir ama sonuçlara girmez.
+                    let admissible =
+                        !(exclude_deleted && self.deleted[nb]) && filter.is_none_or(|f| f(nb));
+                    if admissible {
                         results.push(c);
                         if results.len() > ef {
                             results.pop();
@@ -337,17 +345,68 @@ impl HnswIndex {
         let mut ep = entry;
         for level in (1..=top).rev() {
             // İnişte tombstone da geçerli durak: sadece yol gösteriyor.
-            ep = self.search_layer(query, &[ep], 1, level, false)[0].slot;
+            ep = self.search_layer(query, &[ep], 1, level, false, None)[0].slot;
         }
         // Taban katmanda geniş arama; ef en az k olmalı yoksa k sonuç çıkmaz.
         // Tombstone'lar burada sonuç dışı.
         let ef = ef.max(k);
-        let found = self.search_layer(query, &[ep], ef, 0, true);
+        let found = self.search_layer(query, &[ep], ef, 0, true, None);
         found
             .into_iter()
             .take(k)
             .map(|c| SearchResult::new(self.ids[c.slot], c.dist))
             .collect()
+    }
+
+    /// Filtreli arama: `allow(id)` true dönen kayıtlar aday olabilir.
+    /// Eşleşmeyen node'lar gezinti köprüsü olarak kullanılır (bkz. meta modülü).
+    ///
+    /// Doğruluk garantisi: graf araması k'dan az sonuç bulursa (aşırı seçici
+    /// filtre grafın gezilen bölgesinde az eşleşme bıraktıysa) tüm yaşayan
+    /// kayıtlar üzerinde filtreli doğrusal taramaya düşülür — yavaş ama eksiksiz.
+    pub fn search_filtered_with_ef(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+        allow: &dyn Fn(VectorId) -> bool,
+    ) -> Vec<SearchResult> {
+        let Some(entry) = self.entry else {
+            return Vec::new();
+        };
+        if k == 0 {
+            return Vec::new();
+        }
+        let normalized_query;
+        let query: &[f32] = if self.metric.requires_normalization() {
+            normalized_query = crate::distance::normalized(query);
+            &normalized_query
+        } else {
+            query
+        };
+        let top = self.links[entry].len() - 1;
+        let mut ep = entry;
+        for level in (1..=top).rev() {
+            ep = self.search_layer(query, &[ep], 1, level, false, None)[0].slot;
+        }
+        let ef = ef.max(k);
+        let slot_allow = |slot: usize| allow(self.ids[slot]);
+        let found = self.search_layer(query, &[ep], ef, 0, true, Some(&slot_allow));
+        if found.len() >= k {
+            return found
+                .into_iter()
+                .take(k)
+                .map(|c| SearchResult::new(self.ids[c.slot], c.dist))
+                .collect();
+        }
+        // Fallback: seçicilik gezilen bölgeyi aştı — doğrusal tarama.
+        let mut all: Vec<SearchResult> = (0..self.ids.len())
+            .filter(|&s| !self.deleted[s] && slot_allow(s))
+            .map(|s| SearchResult::new(self.ids[s], self.dist_to(query, s)))
+            .collect();
+        all.sort();
+        all.truncate(k);
+        all
     }
 
     /// Graf kenar belleği dahil toplam indeks belleği (byte).
@@ -407,14 +466,15 @@ impl VectorIndex for HnswIndex {
         // 1. faz: yeni node'un seviyesinin ÜSTÜNDEKİ katmanlarda sadece
         // greedy iniş — buralara kenar eklenmeyecek, sadece yaklaşıyoruz.
         for lc in ((level + 1)..=top).rev() {
-            ep = self.search_layer(&query, &[ep], 1, lc, false)[0].slot;
+            ep = self.search_layer(&query, &[ep], 1, lc, false, None)[0].slot;
         }
 
         // 2. faz: level..0 arası her katmanda ef_construction genişliğinde ara,
         // heuristic ile komşu seç, çift yönlü bağla, limit aşan komşuları kırp.
         let mut eps = vec![ep];
         for lc in (0..=level.min(top)).rev() {
-            let found = self.search_layer(&query, &eps, self.params.ef_construction, lc, false);
+            let found =
+                self.search_layer(&query, &eps, self.params.ef_construction, lc, false, None);
             let neighbors = self.select_neighbors_heuristic(&found, self.params.m);
             for &nb in &neighbors {
                 self.links[slot][lc].push(nb);

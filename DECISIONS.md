@@ -1,5 +1,23 @@
 # Mimari Kararlar
 
+## Metadata filtreleme — 2026-08-18
+
+### 26. Gezinti-içi filtre + brute-force fallback
+Üç seçenek vardı: post-filter (ara, sonra ele — düşük seçicilikte k'dan az
+sonuç), pre-filter (önce eşleşenleri bul, aralarında ara — graf bağlantılılığı
+kopar), gezinti-içi (eşleşmeyen node köprü olarak gezilir, sonuca girmez —
+tombstone mekanizmasının genellemesi). Üçüncüsü seçildi; `search_layer`'a
+opsiyonel slot predicate'i eklendi. Doğruluk garantisi: graf araması k'dan az
+sonuç bulursa filtreli doğrusal taramaya düşülür (aşırı seçici filtrede yavaş
+ama eksiksiz — testte tek-eşleşmeli senaryo bunu doğrular).
+
+### 27. Metadata id düzeyinde, segmentlerden ayrı
+`SegmentedIndex.metadata: HashMap<VectorId, Metadata>` — segmentler immutable
+kalır, metadata silme/yeniden eklemede id ile akar (silme metadata'yı düşürür,
+eski metadata yeni kayda sızmaz). Filtre modeli bilinçli dar: Eq + Range'in
+VE bağlacı; VEYA/negasyon ihtiyaç doğarsa ağaca genişletilir.
+
+
 ## SIMD — 2026-08-18
 
 ### 25. Açık SIMD: `wide::f32x8`, unsafe'siz

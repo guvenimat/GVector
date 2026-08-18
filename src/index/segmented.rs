@@ -30,8 +30,9 @@ use crate::distance::Metric;
 use crate::index::bruteforce::BruteForceIndex;
 use crate::index::hnsw::{HnswIndex, HnswParams};
 use crate::index::{IndexError, VectorIndex};
+use crate::meta::{Filter, Metadata};
 use crate::types::{SearchResult, VectorId};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 
 /// Mühürlü, immutable HNSW + kendi tombstone kümesi.
@@ -56,6 +57,9 @@ pub struct SegmentedIndex {
     buffer: RwLock<BruteForceIndex>,
     /// Sorgu genişliği (mühürlü segmentlerde).
     ef_search: usize,
+    /// id → metadata. Vektör verisinden ayrı tutulur: segmentler immutable
+    /// ama metadata idare (silme, yeniden ekleme) id düzeyinde akar.
+    metadata: RwLock<HashMap<VectorId, Metadata>>,
 }
 
 impl SegmentedIndex {
@@ -69,7 +73,63 @@ impl SegmentedIndex {
             segments: RwLock::new(Vec::new()),
             buffer: RwLock::new(BruteForceIndex::new(dim, metric)),
             ef_search,
+            metadata: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Metadata'lı insert. Metadata'sız `insert_shared` boş geçer.
+    pub fn insert_with_meta(
+        &self,
+        id: VectorId,
+        vector: &[f32],
+        meta: Metadata,
+    ) -> Result<(), IndexError> {
+        self.insert_shared(id, vector)?;
+        if !meta.is_empty() {
+            self.metadata.write().expect("kilit").insert(id, meta);
+        }
+        Ok(())
+    }
+
+    /// Filtreli arama: her segmentte gezinti-içi filtre + buffer'da filtreli
+    /// tarama, sonuçlar id bazında birleştirilir.
+    pub fn search_filtered(&self, query: &[f32], k: usize, filter: &Filter) -> Vec<SearchResult> {
+        if filter.must.is_empty() {
+            return self.search_shared(query, k);
+        }
+        if k == 0 {
+            return Vec::new();
+        }
+        let meta = self.metadata.read().expect("kilit");
+        let allow = |id: VectorId| filter.matches_id(&meta, id);
+        let segments: Vec<Arc<Segment>> = self
+            .segments
+            .read()
+            .expect("kilit")
+            .iter()
+            .cloned()
+            .collect();
+        let mut all: Vec<SearchResult> = Vec::new();
+        for seg in &segments {
+            let tombs = seg.tombstones.read().expect("kilit");
+            let allow_live = |id: VectorId| !tombs.contains(&id) && allow(id);
+            let want = k + tombs.len().min(k);
+            all.extend(seg.index.search_filtered_with_ef(
+                query,
+                want,
+                self.ef_search.max(want),
+                &allow_live,
+            ));
+        }
+        {
+            let buffer = self.buffer.read().expect("kilit");
+            all.extend(buffer.search_filtered(query, k, &allow));
+        }
+        all.sort();
+        let mut seen = HashSet::with_capacity(all.len());
+        all.retain(|r| seen.insert(r.id));
+        all.truncate(k);
+        all
     }
 
     /// Paylaşımlı (&self) insert — tek yazıcı thread'inden çağrılmalı.
@@ -144,7 +204,16 @@ impl SegmentedIndex {
     }
 
     /// Paylaşımlı (&self) silme — tek yazıcı thread'inden.
+    /// Metadata da düşürülür (yeniden eklemede eski metadata sızmasın).
     pub fn delete_shared(&self, id: VectorId) -> Result<(), IndexError> {
+        let res = self.delete_vector_only(id);
+        if res.is_ok() {
+            self.metadata.write().expect("kilit").remove(&id);
+        }
+        res
+    }
+
+    fn delete_vector_only(&self, id: VectorId) -> Result<(), IndexError> {
         // Önce buffer: oradaysa gerçek silme (brute-force swap-remove).
         {
             let mut buffer = self.buffer.write().expect("kilit");
@@ -369,6 +438,111 @@ mod tests {
         assert_eq!(res.len(), 3);
         assert!(res.iter().all(|r| !r.distance.is_nan()));
         assert!(res[..2].iter().all(|r| r.id != VectorId(0)));
+    }
+
+    // ---- Metadata filtreleme testleri ----
+
+    use crate::meta::{MetaValue, Predicate};
+
+    /// Çift id'li kayıtlar iki kategoriye bölünür; filtreli arama yalnız
+    /// istenen kategoriyi döndürmeli ve brute-force filtreli referansla örtüşmeli.
+    #[test]
+    fn filtered_search_matches_reference() {
+        let vecs = random_vectors(1_000, 8, 42);
+        let idx = SegmentedIndex::new(8, Metric::L2, HnswParams::default(), 400);
+        let mut bf = BruteForceIndex::new(8, Metric::L2);
+        for (i, v) in vecs.iter().enumerate() {
+            let meta: Metadata = [(
+                "grup".to_string(),
+                MetaValue::Str(if i % 2 == 0 { "çift" } else { "tek" }.into()),
+            )]
+            .into();
+            idx.insert_with_meta(VectorId(i as u64), v, meta).unwrap();
+            bf.insert(VectorId(i as u64), v).unwrap();
+        }
+        let filter = Filter {
+            must: vec![Predicate::Eq {
+                key: "grup".into(),
+                value: MetaValue::Str("çift".into()),
+            }],
+        };
+        let allow = |id: VectorId| id.0.is_multiple_of(2);
+        let queries = random_vectors(20, 8, 43);
+        let mut hits = 0;
+        for q in &queries {
+            let res = idx.search_filtered(q, 10, &filter);
+            assert_eq!(res.len(), 10);
+            assert!(
+                res.iter().all(|r| r.id.0.is_multiple_of(2)),
+                "filtre kaçağı"
+            );
+            let truth: Vec<_> = bf
+                .search_filtered(q, 10, &allow)
+                .iter()
+                .map(|r| r.id)
+                .collect();
+            hits += res.iter().filter(|r| truth.contains(&r.id)).count();
+        }
+        assert!(
+            hits as f64 / 200.0 >= 0.95,
+            "filtreli recall düşük: {hits}/200"
+        );
+    }
+
+    /// Aşırı seçici filtre (tek eşleşme): fallback doğrusal tarama devreye
+    /// girmeli ve o tek kaydı bulmalı.
+    #[test]
+    fn highly_selective_filter_falls_back_to_exact() {
+        let vecs = random_vectors(2_000, 8, 42);
+        let idx = SegmentedIndex::new(8, Metric::L2, HnswParams::default(), 500);
+        for (i, v) in vecs.iter().enumerate() {
+            let meta: Metadata = [("nadir".to_string(), MetaValue::Bool(i == 1_234))].into();
+            idx.insert_with_meta(VectorId(i as u64), v, meta).unwrap();
+        }
+        let filter = Filter {
+            must: vec![Predicate::Eq {
+                key: "nadir".into(),
+                value: MetaValue::Bool(true),
+            }],
+        };
+        let res = idx.search_filtered(&random_vectors(1, 8, 43)[0], 5, &filter);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, VectorId(1_234));
+        // hiç eşleşme yoksa boş dönmeli
+        let none = Filter {
+            must: vec![Predicate::Eq {
+                key: "yok".into(),
+                value: MetaValue::Bool(true),
+            }],
+        };
+        assert!(idx.search_filtered(&vecs[0].clone(), 5, &none).is_empty());
+    }
+
+    /// Silinen kaydın metadata'sı düşer; aynı id yeni metadata ile dönebilir.
+    #[test]
+    fn delete_drops_metadata_reinsert_gets_fresh() {
+        let vecs = random_vectors(100, 4, 42);
+        let idx = SegmentedIndex::new(4, Metric::L2, HnswParams::default(), 1_000);
+        for (i, v) in vecs.iter().enumerate() {
+            let meta: Metadata = [("v".to_string(), MetaValue::Int(1))].into();
+            idx.insert_with_meta(VectorId(i as u64), v, meta).unwrap();
+        }
+        idx.delete_shared(VectorId(7)).unwrap();
+        idx.insert_with_meta(
+            VectorId(7),
+            &vecs[7],
+            [("v".to_string(), MetaValue::Int(2))].into(),
+        )
+        .unwrap();
+        let f_v2 = Filter {
+            must: vec![Predicate::Eq {
+                key: "v".into(),
+                value: MetaValue::Int(2),
+            }],
+        };
+        let res = idx.search_filtered(&vecs[7].clone(), 1, &f_v2);
+        assert_eq!(res.len(), 1);
+        assert_eq!(res[0].id, VectorId(7));
     }
 
     /// Stres testi: çok okuyucu + tek yazıcı. Yazıcı insert+delete yaparken

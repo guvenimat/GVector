@@ -77,6 +77,33 @@ impl BruteForceIndex {
         heap
     }
 
+    /// Filtreli doğrusal tarama: `allow(id)` geçenler arasında top-k.
+    /// Brute-force'ta filtre bedava — taramada atlanır, referans doğruluk kaynağı.
+    pub fn search_filtered(
+        &self,
+        query: &[f32],
+        k: usize,
+        allow: &dyn Fn(VectorId) -> bool,
+    ) -> Vec<SearchResult> {
+        if k == 0 {
+            return Vec::new();
+        }
+        let normalized_query;
+        let query: &[f32] = if self.metric.requires_normalization() {
+            normalized_query = crate::distance::normalized(query);
+            &normalized_query
+        } else {
+            query
+        };
+        let mut all: Vec<SearchResult> = (0..self.ids.len())
+            .filter(|&s| allow(self.ids[s]))
+            .map(|s| SearchResult::new(self.ids[s], self.metric.distance(query, self.vector_at(s))))
+            .collect();
+        all.sort();
+        all.truncate(k);
+        all
+    }
+
     /// id indekste kayıtlı mı?
     pub fn contains(&self, id: VectorId) -> bool {
         self.slot_of.contains_key(&id)
