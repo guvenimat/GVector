@@ -51,6 +51,8 @@ pub struct HnswParams {
     pub ef_search: usize,
     /// Seviye atama rastgeleliği için seed (tekrarlanabilirlik).
     pub seed: u64,
+    /// Tombstone oranı bu eşiği aşınca delete otomatik compaction tetikler.
+    pub tombstone_threshold: f64,
 }
 
 impl Default for HnswParams {
@@ -61,6 +63,7 @@ impl Default for HnswParams {
             ef_construction: 200,
             ef_search: 50,
             seed: crate::dataset::DEFAULT_SEED,
+            tombstone_threshold: 0.3,
         }
     }
 }
@@ -121,6 +124,10 @@ pub struct HnswIndex {
     links: Vec<Vec<Vec<usize>>>,
     /// Graf giriş noktası (en yüksek seviyeli node).
     entry: Option<usize>,
+    /// Tombstone bayrakları: silinen node graf'ta GEZİLİR (bağlantılılık
+    /// için köprü görevi sürer) ama sonuçlara girmez. Gerçek temizlik compaction'da.
+    deleted: Vec<bool>,
+    deleted_count: usize,
     rng: StdRng,
 }
 
@@ -138,6 +145,8 @@ impl HnswIndex {
             slot_of: HashMap::new(),
             links: Vec::new(),
             entry: None,
+            deleted: Vec::new(),
+            deleted_count: 0,
         }
     }
 
@@ -169,12 +178,18 @@ impl HnswIndex {
 
     /// Algorithm 2 — SEARCH-LAYER: `entry_points`'ten başlayıp `level`'da
     /// ef genişliğinde greedy best-first arama. Artan mesafeli ef sonuç döndürür.
+    ///
+    /// `exclude_deleted`: true ise tombstone'lu node'lar GEZİLİR (komşuları
+    /// keşfedilir — bağlantılılık köprüsü olarak lazımlar) ama sonuç kümesine
+    /// alınmazlar. İnşa sırasında false: yeni node tombstone'lara da bağlanabilir,
+    /// compaction zaten onları toptan temizleyecek.
     fn search_layer(
         &self,
         query: &[f32],
         entry_points: &[usize],
         ef: usize,
         level: usize,
+        exclude_deleted: bool,
     ) -> Vec<Cand> {
         // visited: slot başına bayrak. HashSet yerine Vec<bool>: n=100K'da bile
         // 100KB'lik tek allocation, dal başına hash maliyeti yok.
@@ -194,7 +209,9 @@ impl HnswIndex {
                 slot: ep,
             };
             candidates.push(Reverse(c));
-            results.push(c);
+            if !(exclude_deleted && self.deleted[ep]) {
+                results.push(c);
+            }
         }
 
         while let Some(Reverse(cur)) = candidates.pop() {
@@ -211,14 +228,17 @@ impl HnswIndex {
                 }
                 visited[nb] = true;
                 let d = self.dist_to(query, nb);
-                let should_add =
-                    results.len() < ef || d < results.peek().expect("results dolu").dist;
-                if should_add {
+                let within =
+                    results.len() < ef || results.peek().is_none_or(|worst| d < worst.dist);
+                if within {
                     let c = Cand { dist: d, slot: nb };
                     candidates.push(Reverse(c));
-                    results.push(c);
-                    if results.len() > ef {
-                        results.pop();
+                    // Tombstone gezilir ama sonuçlara girmez.
+                    if !(exclude_deleted && self.deleted[nb]) {
+                        results.push(c);
+                        if results.len() > ef {
+                            results.pop();
+                        }
                     }
                 }
             }
@@ -315,11 +335,13 @@ impl HnswIndex {
         let top = self.links[entry].len() - 1;
         let mut ep = entry;
         for level in (1..=top).rev() {
-            ep = self.search_layer(query, &[ep], 1, level)[0].slot;
+            // İnişte tombstone da geçerli durak: sadece yol gösteriyor.
+            ep = self.search_layer(query, &[ep], 1, level, false)[0].slot;
         }
         // Taban katmanda geniş arama; ef en az k olmalı yoksa k sonuç çıkmaz.
+        // Tombstone'lar burada sonuç dışı.
         let ef = ef.max(k);
-        let found = self.search_layer(query, &[ep], ef, 0);
+        let found = self.search_layer(query, &[ep], ef, 0, true);
         found
             .into_iter()
             .take(k)
@@ -366,6 +388,7 @@ impl VectorIndex for HnswIndex {
         }
         self.ids.push(id);
         self.slot_of.insert(id, slot);
+        self.deleted.push(false);
 
         let level = self.random_level();
         self.links.push(vec![Vec::new(); level + 1]);
@@ -383,14 +406,14 @@ impl VectorIndex for HnswIndex {
         // 1. faz: yeni node'un seviyesinin ÜSTÜNDEKİ katmanlarda sadece
         // greedy iniş — buralara kenar eklenmeyecek, sadece yaklaşıyoruz.
         for lc in ((level + 1)..=top).rev() {
-            ep = self.search_layer(&query, &[ep], 1, lc)[0].slot;
+            ep = self.search_layer(&query, &[ep], 1, lc, false)[0].slot;
         }
 
         // 2. faz: level..0 arası her katmanda ef_construction genişliğinde ara,
         // heuristic ile komşu seç, çift yönlü bağla, limit aşan komşuları kırp.
         let mut eps = vec![ep];
         for lc in (0..=level.min(top)).rev() {
-            let found = self.search_layer(&query, &eps, self.params.ef_construction, lc);
+            let found = self.search_layer(&query, &eps, self.params.ef_construction, lc, false);
             let neighbors = self.select_neighbors_heuristic(&found, self.params.m);
             for &nb in &neighbors {
                 self.links[slot][lc].push(nb);
@@ -412,13 +435,63 @@ impl VectorIndex for HnswIndex {
         self.search_with_ef(query, k, self.params.ef_search)
     }
 
-    fn delete(&mut self, _id: VectorId) -> Result<(), IndexError> {
-        // Aşama 4'te tombstone tabanlı silme gelecek.
-        Err(IndexError::Unsupported("delete Aşama 4'te eklenecek"))
+    /// Tombstone tabanlı silme: node graf'ta kalır (köprü görevi), sonuçlardan
+    /// düşer. `slot_of`'tan çıkarıldığı için aynı id yeniden eklenebilir.
+    fn delete(&mut self, id: VectorId) -> Result<(), IndexError> {
+        let slot = self.slot_of.remove(&id).ok_or(IndexError::NotFound(id))?;
+        self.deleted[slot] = true;
+        self.deleted_count += 1;
+        // Kritik durum: giriş noktası silindi. Tombstone waypoint olarak
+        // çalışmaya devam edebilirdi ama tüm aramaların ölü bir node'dan
+        // başlaması hem kafa karıştırıcı hem compaction'ı zorlaştırır —
+        // yaşayan en yüksek seviyeli node'u yeni giriş yap.
+        if self.entry == Some(slot) {
+            self.pick_new_entry();
+        }
+        let ratio = self.deleted_count as f64 / self.ids.len() as f64;
+        if ratio >= self.params.tombstone_threshold {
+            self.compact();
+        }
+        Ok(())
     }
 
     fn len(&self) -> usize {
-        self.ids.len()
+        self.ids.len() - self.deleted_count
+    }
+}
+
+impl HnswIndex {
+    /// Yaşayan node'lar arasından en yüksek seviyeliyi giriş noktası yapar.
+    /// Hepsi silinmişse entry None olur (arama boş döner, insert sıfırdan kurar).
+    fn pick_new_entry(&mut self) {
+        self.entry = (0..self.ids.len())
+            .filter(|&s| !self.deleted[s])
+            .max_by_key(|&s| self.links[s].len());
+    }
+
+    /// Tombstone oranı ne olursa olsun indeksi yaşayan elemanlardan yeniden
+    /// kurar: vektör verisi, graf kenarları ve tombstone bellekleri gerçekten
+    /// geri verilir. O(n · insert) maliyetli — eşikle tetiklenmesinin nedeni bu.
+    pub fn compact(&mut self) {
+        let mut fresh = HnswIndex::new(self.dim, self.metric, self.params.clone());
+        for slot in 0..self.ids.len() {
+            if !self.deleted[slot] {
+                // Cosine: saklanan vektör zaten normalize; tekrar normalize idempotent.
+                fresh
+                    .insert(self.ids[slot], self.vector_at(slot))
+                    .expect("compaction insert'i başarısız olamaz");
+            }
+        }
+        *self = fresh;
+    }
+
+    /// Tombstone oranı (test ve gözlem için).
+    pub fn tombstone_ratio(&self) -> f64 {
+        if self.ids.is_empty() {
+            0.0
+        } else {
+            self.deleted_count as f64 / self.ids.len() as f64
+        }
     }
 }
 
@@ -465,6 +538,9 @@ struct Meta {
     ids: Vec<VectorId>,
     links: Vec<Vec<Vec<u64>>>,
     entry: Option<u64>,
+    /// Tombstone bayrakları (Aşama 4). Silinip yeniden eklenen id'ler yüzünden
+    /// `ids` içinde aynı id iki slotta görünebilir; yaşayan olan tekildir.
+    deleted: Vec<bool>,
 }
 
 fn corrupt(msg: impl Into<String>) -> PersistError {
@@ -489,6 +565,7 @@ impl HnswIndex {
                 })
                 .collect(),
             entry: self.entry.map(|e| e as u64),
+            deleted: self.deleted.clone(),
         };
         let meta_bytes = bincode::serialize(&meta)?;
 
@@ -608,16 +685,26 @@ impl HnswIndex {
             }
             links.push(node_levels);
         }
+        if meta.deleted.len() != n {
+            return Err(corrupt("deleted uzunluğu n ile uyuşmuyor"));
+        }
+        let deleted_count = meta.deleted.iter().filter(|&&d| d).count();
         let entry = match meta.entry {
             Some(e) if (e as usize) < n => Some(e as usize),
             Some(_) => return Err(corrupt("entry point sınır dışı")),
-            None if n == 0 => None,
-            None => return Err(corrupt("n>0 ama entry yok")),
+            // Tüm elemanlar tombstone'sa entry meşru olarak None olabilir.
+            None if deleted_count == n => None,
+            None => return Err(corrupt("yaşayan eleman var ama entry yok")),
         };
-        let mut slot_of = HashMap::with_capacity(n);
+        // Sadece yaşayan slotlar id haritasına girer; tombstone slotundaki id
+        // yeniden eklenmiş olabilir ve yaşayan kopyası haritada olmalı.
+        let mut slot_of = HashMap::with_capacity(n - deleted_count);
         for (slot, &id) in meta.ids.iter().enumerate() {
+            if meta.deleted[slot] {
+                continue;
+            }
             if slot_of.insert(id, slot).is_some() {
-                return Err(corrupt("yinelenen VectorId"));
+                return Err(corrupt("yinelenen yaşayan VectorId"));
             }
         }
         let ml = 1.0 / (meta.params.m.max(2) as f64).ln();
@@ -635,6 +722,8 @@ impl HnswIndex {
             slot_of,
             links,
             entry,
+            deleted: meta.deleted,
+            deleted_count,
         })
     }
 }
@@ -764,6 +853,165 @@ mod tests {
         }
         let recall = hits as f64 / total as f64;
         assert!(recall >= 0.95, "recall {recall} < 0.95");
+    }
+
+    // ---- Silme / compaction testleri (Aşama 4) ----
+
+    /// Compaction tetiklenmesin diye yüksek eşikli parametre.
+    fn no_compact_params() -> HnswParams {
+        HnswParams {
+            tombstone_threshold: 2.0, // asla otomatik tetiklenmez
+            ..Default::default()
+        }
+    }
+
+    fn build_with(vecs: &[Vec<f32>], params: HnswParams) -> HnswIndex {
+        let mut idx = HnswIndex::new(vecs[0].len(), Metric::L2, params);
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert(VectorId(i as u64), v).unwrap();
+        }
+        idx
+    }
+
+    #[test]
+    fn delete_removes_from_results_and_len() {
+        let vecs = random_vectors(100, 8, 42);
+        let mut idx = build_with(&vecs, no_compact_params());
+        idx.delete(VectorId(7)).unwrap();
+        assert_eq!(idx.len(), 99);
+        let res = idx.search(&vecs[7].clone(), 10);
+        assert!(res.iter().all(|r| r.id != VectorId(7)));
+        assert_eq!(
+            idx.delete(VectorId(7)),
+            Err(IndexError::NotFound(VectorId(7)))
+        );
+    }
+
+    #[test]
+    fn delete_entry_point_picks_new_entry_and_search_works() {
+        let vecs = random_vectors(500, 8, 42);
+        let mut idx = build_with(&vecs, no_compact_params());
+        // giriş noktasını bul ve sil — kritik senaryo
+        let entry_slot = idx.entry.unwrap();
+        let entry_id = idx.ids[entry_slot];
+        idx.delete(entry_id).unwrap();
+        let new_entry = idx.entry.expect("yeni entry seçilmeliydi");
+        assert_ne!(new_entry, entry_slot);
+        assert!(!idx.deleted[new_entry]);
+        // yeni entry yaşayanların en yüksek seviyelisi olmalı
+        let max_level = (0..idx.ids.len())
+            .filter(|&s| !idx.deleted[s])
+            .map(|s| idx.links[s].len())
+            .max()
+            .unwrap();
+        assert_eq!(idx.links[new_entry].len(), max_level);
+        // arama hâlâ çalışıyor ve silinen id dönmüyor
+        let res = idx.search(&vecs[0].clone(), 10);
+        assert_eq!(res.len(), 10);
+        assert!(res.iter().all(|r| r.id != entry_id));
+    }
+
+    #[test]
+    fn delete_all_then_reinsert() {
+        let vecs = random_vectors(20, 4, 42);
+        let mut idx = build_with(&vecs, no_compact_params());
+        for i in 0..20 {
+            idx.delete(VectorId(i)).unwrap();
+        }
+        assert_eq!(idx.len(), 0);
+        assert!(idx.search(&[0.0; 4], 5).is_empty());
+        assert!(idx.entry.is_none());
+        // boşalmış indekse ekleme sıfırdan kurulum gibi çalışmalı
+        idx.insert(VectorId(100), &[1.0; 4]).unwrap();
+        assert_eq!(idx.search(&[1.0; 4], 1)[0].id, VectorId(100));
+    }
+
+    #[test]
+    fn deleted_id_can_be_reinserted_with_new_vector() {
+        let vecs = random_vectors(50, 4, 42);
+        let mut idx = build_with(&vecs, no_compact_params());
+        idx.delete(VectorId(5)).unwrap();
+        idx.insert(VectorId(5), &[9.0; 4]).unwrap();
+        assert_eq!(idx.len(), 50);
+        let res = idx.search(&[9.0; 4], 1);
+        assert_eq!(res[0].id, VectorId(5));
+    }
+
+    #[test]
+    fn recall_stays_high_after_20pct_deletion() {
+        let vecs = random_vectors(2_000, 16, 42);
+        let queries = random_vectors(30, 16, 43);
+        let mut idx = build_with(&vecs, no_compact_params());
+        let mut bf = BruteForceIndex::new(16, Metric::L2);
+        for (i, v) in vecs.iter().enumerate() {
+            bf.insert(VectorId(i as u64), v).unwrap();
+        }
+        // her 5. elemanı sil (%20)
+        for i in (0..2_000).step_by(5) {
+            idx.delete(VectorId(i)).unwrap();
+            bf.delete(VectorId(i)).unwrap();
+        }
+        let mut hits = 0;
+        let mut total = 0;
+        for q in &queries {
+            let truth: Vec<_> = bf.search(q, 10).iter().map(|r| r.id).collect();
+            let got = idx.search_with_ef(q, 10, 100);
+            assert_eq!(got.len(), 10, "silme sonrası eksik sonuç");
+            hits += got.iter().filter(|r| truth.contains(&r.id)).count();
+            total += truth.len();
+        }
+        let recall = hits as f64 / total as f64;
+        assert!(recall >= 0.95, "silme sonrası recall {recall} < 0.95");
+    }
+
+    #[test]
+    fn compaction_triggers_at_threshold_and_frees_memory() {
+        let vecs = random_vectors(1_000, 16, 42);
+        let mut idx = build_with(
+            &vecs,
+            HnswParams {
+                tombstone_threshold: 0.3,
+                ..Default::default()
+            },
+        );
+        let (vec_before, link_before) = idx.memory_bytes();
+        // %30 eşiğin hemen altına kadar sil — compaction tetiklenmemeli
+        for i in 0..299 {
+            idx.delete(VectorId(i)).unwrap();
+        }
+        assert!(idx.tombstone_ratio() > 0.0);
+        // eşiği aşan silme compaction tetikler
+        idx.delete(VectorId(299)).unwrap();
+        assert_eq!(
+            idx.tombstone_ratio(),
+            0.0,
+            "compaction tombstone bırakmamalı"
+        );
+        assert_eq!(idx.len(), 700);
+        let (vec_after, link_after) = idx.memory_bytes();
+        assert!(
+            vec_after < vec_before && link_after < link_before,
+            "bellek düşmedi: vec {vec_before}->{vec_after}, link {link_before}->{link_after}"
+        );
+        // compaction sonrası arama sağlıklı
+        let res = idx.search(&vecs[500].clone(), 5);
+        assert_eq!(res[0].id, VectorId(500));
+    }
+
+    #[test]
+    fn persist_roundtrip_with_tombstones() {
+        let vecs = random_vectors(200, 8, 42);
+        let mut idx = build_with(&vecs, no_compact_params());
+        for i in (0..200).step_by(7) {
+            idx.delete(VectorId(i)).unwrap();
+        }
+        // silinmiş bir id'yi yeniden ekle: ids'te çift kayıt senaryosu
+        idx.insert(VectorId(0), &[0.5; 8]).unwrap();
+        let loaded = HnswIndex::load_from_bytes(&save_to_bytes(&idx)).unwrap();
+        assert_eq!(idx.len(), loaded.len());
+        for q in random_vectors(10, 8, 43) {
+            assert_eq!(idx.search(&q, 10), loaded.search(&q, 10));
+        }
     }
 
     // ---- Kalıcılık testleri (Aşama 3) ----

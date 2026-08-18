@@ -1,5 +1,20 @@
 # Benchmark Kayıtları
 
+## Aşama 4 — 2026-08-18 (silme + compaction, SIFT 10K, M=16, ef=50)
+
+| Ölçüm | Değer |
+|---|---|
+| silme öncesi recall@10 | 0.9990 |
+| %20 silme sonrası recall@10 | 0.9990 (bozulma yok ✓) |
+| compaction süresi | 1.9 s (8K yaşayan eleman yeniden inşa) |
+| bellek (vektör) | 5.0 → 4.0 MB (−%20 ✓) |
+| bellek (graf) | 3.8 → 3.1 MB ✓ |
+| compaction sonrası recall@10 | 1.0000 |
+
+Entry point silme senaryosu ayrı testte: yeni entry yaşayanların en yüksek
+seviyelisi seçiliyor, arama kesintisiz (`delete_entry_point_picks_new_entry_and_search_works`).
+
+
 ## Aşama 3 — 2026-08-18 (kalıcılık, SIFT 100K, M=16/ef_c=200)
 
 | Ölçüm | Değer |

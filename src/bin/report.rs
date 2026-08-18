@@ -83,7 +83,7 @@ fn main() {
     let metric = Metric::L2; // SIFT literatürde L2 ile değerlendirilir
 
     let (base, queries, label) = match mode {
-        "sift" | "sweep" | "persist" => {
+        "sift" | "sweep" | "persist" | "delete" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -115,6 +115,63 @@ fn main() {
 
     if mode == "sweep" {
         hnsw_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "delete" {
+        // Aşama 4 doğrulaması: %20 silme sonrası recall + compaction bellek etkisi.
+        let mut hnsw = HnswIndex::new(
+            dim,
+            metric,
+            HnswParams {
+                tombstone_threshold: 2.0, // manuel compaction için otomatiği kapat
+                ..Default::default()
+            },
+        );
+        let mut bf = BruteForceIndex::new(dim, metric);
+        for (i, v) in base.iter().enumerate() {
+            hnsw.insert(VectorId(i as u64), v).expect("insert");
+            bf.insert(VectorId(i as u64), v).expect("insert");
+        }
+        let recall_of = |hnsw: &HnswIndex, bf: &BruteForceIndex| {
+            let truth: Vec<Vec<VectorId>> = queries
+                .iter()
+                .map(|q| bf.search(q, k).iter().map(|r| r.id).collect())
+                .collect();
+            let results: Vec<Vec<VectorId>> = queries
+                .iter()
+                .map(|q| hnsw.search_with_ef(q, k, 50).iter().map(|r| r.id).collect())
+                .collect();
+            recall_at_k(&results, &truth, k)
+        };
+        println!(
+            "silme öncesi recall@{k} (ef=50) = {:.4}",
+            recall_of(&hnsw, &bf)
+        );
+        for i in (0..base.len()).step_by(5) {
+            hnsw.delete(VectorId(i as u64)).expect("hnsw delete");
+            bf.delete(VectorId(i as u64)).expect("bf delete");
+        }
+        println!(
+            "%20 silme sonrası recall@{k} = {:.4} (tombstone oranı {:.2})",
+            recall_of(&hnsw, &bf),
+            hnsw.tombstone_ratio()
+        );
+        let (v0, l0) = hnsw.memory_bytes();
+        let t = Instant::now();
+        hnsw.compact();
+        println!(
+            "compaction: {:?}; bellek vec {:.1}→{:.1} MB, link {:.1}→{:.1} MB",
+            t.elapsed(),
+            v0 as f64 / 1048576.0,
+            hnsw.memory_bytes().0 as f64 / 1048576.0,
+            l0 as f64 / 1048576.0,
+            hnsw.memory_bytes().1 as f64 / 1048576.0
+        );
+        println!(
+            "compaction sonrası recall@{k} = {:.4}",
+            recall_of(&hnsw, &bf)
+        );
         return;
     }
 

@@ -1,5 +1,27 @@
 # Mimari Kararlar
 
+## Aşama 4 — 2026-08-18
+
+### 15. Silme: tombstone + gezinmede köprü, sonuçta dışlama
+Silinen node graftan sökülmez (kenar onarımı pahalı ve bağlantılılığı
+riske atar); `deleted` bayrağıyla işaretlenir. `search_layer` tombstone'ları
+GEZMEYE devam eder (komşuları keşfedilir, köprü görevi sürer) ama sonuç
+kümesine almaz. İnşa sırasında yeni node'lar tombstone'lara bağlanabilir —
+compaction toptan temizler.
+
+### 16. Entry point silinirse: yaşayan en yüksek seviyeli node yeni giriş
+Tombstone waypoint olarak işleyebilirdi ama tüm aramaların ölü node'dan
+başlaması kırılganlık ekler; silme anında `pick_new_entry` çalışır.
+Tüm elemanlar silinirse entry None olur; sonraki insert sıfırdan kurar.
+
+### 17. Compaction: eşikli tam yeniden inşa
+Tombstone oranı `tombstone_threshold`'u (varsayılan 0.3) aşınca delete
+otomatik compaction tetikler: yaşayanlar taze indekse yeniden insert edilir.
+Yerinde slot geri kazanımı yerine tam inşa: basit, doğruluğu garanti,
+ve HNSW inşası zaten hızlı (10K → ~2 s). Bedeli: compaction anlık duraklama
+yaratır — Aşama 5'in eşzamanlılık modeli bunu arka plana alabilir.
+
+
 ## Aşama 3 — 2026-08-18
 
 ### 11. Dosya formatı: magic + versiyon + bincode meta + ham f32 bölümü + CRC32
