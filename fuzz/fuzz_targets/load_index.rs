@@ -1,7 +1,7 @@
-//! Deserialization fuzz hedefi: rastgele baytlar HİÇBİR girdide panic
-//! üretmemeli — geçersiz dosya her zaman Err ile dönmeli.
+//! Deserialization fuzz target: random bytes must NEVER cause a panic for any
+//! input — an invalid file must always come back as Err.
 //!
-//! Çalıştırma (nightly gerektirir):
+//! Running it (requires nightly):
 //!   cargo install cargo-fuzz
 //!   cargo +nightly fuzz run load_index
 #![no_main]
@@ -10,6 +10,6 @@ use libfuzzer_sys::fuzz_target;
 use vector_gvector::index::hnsw::HnswIndex;
 
 fuzz_target!(|data: &[u8]| {
-    // Sonuç ne olursa olsun (Ok/Err) kabul; tek başarısızlık kriteri panic.
+    // Any outcome (Ok/Err) is acceptable; the only failure criterion is a panic.
     let _ = HnswIndex::load_from_bytes(data);
 });

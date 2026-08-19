@@ -1,6 +1,6 @@
-# target-cpu=native: bu makinenin SIMD setini (AVX2 vb.) kullan.
-# Bedeli: üretilen binary başka/eski CPU'da çalışmayabilir — bu bir öğrenme
-# projesi olduğu için taşınabilirlik yerine yerel performans seçildi
-# (DECISIONS.md, SIMD bölümü).
+# target-cpu=native: use this machine's SIMD set (AVX2 and so on).
+# The price: the produced binary may not run on a different/older CPU — since
+# this is a learning project, local performance was chosen over portability
+# (DECISIONS.md, the SIMD section).
 [build]
 rustflags = ["-C", "target-cpu=native"]

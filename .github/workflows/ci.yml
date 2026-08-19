@@ -6,8 +6,9 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
-    # Eşzamanlılık kodu olan bir projede deadlock'un belirtisi ASILMAKTIR.
-    # Timeout olmazsa CI varsayılan 6 saat bekler ve neden belirsiz kalır.
+    # In a project with concurrency code, the symptom of a deadlock is a HANG.
+    # Without a timeout, CI waits the default six hours and the cause stays
+    # unclear.
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4

@@ -26,4 +26,4 @@ name = "distance"
 harness = false
 
 [profile.release]
-debug = true # profil alabilmek için sembolleri tut; performansı etkilemez
+debug = true # keep symbols so profiling is possible; does not affect performance
