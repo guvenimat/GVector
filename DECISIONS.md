@@ -1,5 +1,77 @@
 # Mimari Kararlar
 
+## Aşama 9a-2 — kriterlerin değerlendirmesi (KARARLAR) — 2026-08-19
+
+Ölçüm sonuçları BENCHMARKS'ta ve AYRI bir commit'te (ef2ce04). Bu bölüm
+o sonuçlardan çıkarılan kararlardır.
+
+### 60. Kriter 1 (#40) KARŞILANMADI — ve eşiğin altındaki dünya değişti
+Sonuç "geçmedi" olarak DURUR (609x / 943x, eşik 50x). Eşik yeniden
+yorumlanmadı. Yanına kusur kaydı eklenir:
+
+**#40, backpressure'ın var olmadığı bir sistemde tanımlandı.** O tarihte
+uzun bir yazma DAİMA bir kusurun belirtisiydi — yazıcı hiçbir zaman
+kasten beklemiyordu. #53 ile backpressure eklendiği anda bu ontoloji
+değişti: artık uzun yazma, sistemin DOĞRU çalıştığının kanıtı olabilir
+(kuyruğu sınırlamanın tek yolu yazıcıyı bekletmektir). Nitekim WAL
+kapalı teşhis koşusunda en uzun yazma 24.9 s çıktı ve bunun tamamı
+tasarlanmış backpressure'dı.
+
+Yani "en uzun yazma" metriği artık İKİ FARKLI OLGUYU (kusur ve kasıtlı
+kısıtlama) aynı sayıda topluyor. Bu, #58'deki kriter-2 kusuruyla
+**yapısal olarak aynı hata sınıfı, tersten**: orada iki farklı BÜYÜKLÜĞÜ
+toplamıştık (kuyruk + segment), burada iki farklı NEDENİ.
+
+**Bu bir eşik hatası değil, eşiğin altındaki dünyanın değişmesidir.**
+
+**VE ŞU NET DURMALI: 9a-2 hedefini TUTTURDU.** Mühürlemenin yazıcıyı
+blokladığı süre 20.8 s → **0 ns – 2 µs**. Eşiğin geçilmemesi bununla
+ilgisiz; kalan 6–10 ms'lik sıçramalar mühürleme noktasıyla ilgisiz
+yerlerde ve kaynakları fsync + (hipotez) buffer realloc. Tabloya altı ay
+sonra bakan biri 9a-2'nin başarısız olduğunu SANMAMALI.
+
+### 61. YENİ ÖN-KAYIT — kriter 1'in ikinci sürümü (ölçüm KOŞULMADAN önce)
+- **Birincil:** **backpressure DIŞINDAKİ** en uzun yazma / taban p99.
+  Backpressure süresi tasarım parametresidir (kuyruk eşiği ve mühürleme
+  hızının fonksiyonu), kusur değil — ölçüde ayrıştırılır.
+- **İkincil (bu turda YALNIZ ÖLÇÜLÜR, EŞİK YOK):** backpressure kaynaklı
+  beklemelerin dağılımı — kaç yazma etkilendi, en uzun bekleme ne kadar.
+  Gerekçe: backpressure'ı ölçümden tamamen çıkarmak "sistem yazmaları
+  saatlerce bekletiyor ama kriter geçiyor" durumunu mümkün kılar. Eşik
+  koymak için yeterli veri yok; eşik BİR SONRAKİ tura bırakılıyor.
+- **Koşul:** ölçüm HER İKİ fsync politikasında koşulur (group:20 ve
+  kapalı), böylece fsync katkısı ile buffer realloc katkısı ayrışır.
+- **Önce yapılacak iş:** yazma buffer'ında `with_capacity` (realloc'u
+  kaldırır). Sonra ölçülür; realloc hipotezi kanıtlanır ya da çürür.
+
+### 62. Segment birikmesi AYRI KALEM — bu arc'ta değil
+Sayılar: mühürleme ~25 s'de bir segment ÜRETİYOR, merge ~54 s'de bir
+EKSİLTİYOR. Sürekli yüksek yükte birikme kaçınılmaz (10 dk'da 0 → 16).
+
+Bu 9a-2'nin sorunu değil, **merge tavanı mekanizmasının** sorunu; 9a-2'nin
+kabulüne bağlamak iki farklı işi birbirine kilitler. Ama kayıt güçlü
+olmalı: **bu şu an sistemin tek sınırsız büyüyen boyutudur** ve daha önce
+tam da bunu kapatmıştık (segment tavanı). Geri döndü, çünkü **mühürleme
+hızlandı, merge hızlanmadı** — 9a'nın kendi başarısının yan etkisi.
+
+Muhtemel çözümler (ikisi de ayrı tasarım işi): paralel merge, ya da
+merge'in iki yerine üç segmenti birden alması.
+
+**Yeniden bakma koşulu:** "sürekli yazma yükü öngörülen kullanımın parçası
+olursa". Hedeflenen senaryolarda (RAG, iç araç) sürekli 5K op/s yazma
+yok — gerçek ama şu an TEORİK bir sorun.
+
+### 63. Ön-kayıt disiplininin bilinen sınırı: kriterler birbiriyle çelişebilir
+Bu turun asıl dersi: **kriter 2'yi geçiren mekanizma, kriter 1'i
+geçilemez hale getirdi.** Kriterler birbirinden bağımsız yazılıyor ama
+sistem bir bütün. Kusuru kaydedip devam etmek doğru cevaptır, ancak
+bundan sonra eşik yazarken şu soru da sorulacak:
+
+> **"Bu kriter, başka hangi kriterle çelişebilir?"**
+
+Bu, ön-kayıt kuralının kalıcı bir maddesidir.
+
+
 ## Aşama 9a-2 — kriter 2 ikinci ölçüm + yeni ön-kayıt — 2026-08-19
 
 ### 56. Backpressure sinyali yanlış seçildi: "yavaşlat" tasarlayıp "durdur" elde etmek

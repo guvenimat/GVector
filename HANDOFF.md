@@ -13,7 +13,7 @@ tavanı, 1M gerçeklik ölçümü). Devam eden arc: **ölçümün yönlendirdiğ
 |---|---|
 | 8a — int8 ölçeklenme ölçümü | **bitti** — int8 performans gerekçesiyle REDDEDİLDİ (#45) |
 | 9a-1 — merge arka plana | **bitti** — pencere 80.5 s → ~29 s (#46–#48) |
-| 9a-2 — mühürleme arka plana | kod+testler bitti ama **KABUL EDİLMEDİ**: kriter 2 aşıldı → önce tek-worker + backpressure (#51, #52) |
+| 9a-2 — mühürleme arka plana | tek worker + backpressure yapıldı (#53). Kriter 2 birincil **GEÇTİ**, kriter 1 **GEÇMEDİ** (#60) → yeni ön-kayıt #61 |
 | 9c — metadata sıkıştırma | sırada (kapsam planda revize edildi) |
 | 9d — türetilmiş indeks snapshot'ı | 9c'den SONRA (sıra gerekçesi planda) |
 | 10 — README + v0.1.0 | en son |
@@ -26,14 +26,23 @@ Plan dosyası: `~/.claude/plans/bir-soru-fallback-e-i-ini-prancy-bachman.md`
   yazmaların p99'u, taban p99'un (7.8 µs, **fsync'siz** ölçüldü) 50 katını
   aşmamalı. Ölçüm koşulu Aşama 8 ile aynı tutulmalı; fsync'li ölçüm eşiği
   otomatik aşar ve yanlış "kabul edilmedi" sonucu doğurur.
-- **#49** — 9a-2'nin İKİNCİ kriteri (birikme): 2 dk tam hız yazma altında
-  segment+mühürlenen sayısı dengeleniyorsa (son 1/3 ort. ≤ ilk 1/3 ort.
-  +%20) **ve** zirve ≤ 12 ise backpressure'sız kabul; aksi halde
-  backpressure aynı arc'ta yapılır.
+- **#49** — SONUÇ: karşılanmadı (metrik kusuru #58). Yerine **#59**
+  (kuyruk birincil, 10 dk) → birincil GEÇTİ.
+- **#61** — kriter 1'in ikinci sürümü: birincil = **backpressure dışındaki**
+  en uzun yazma; ikincil = backpressure beklemelerinin dağılımı (bu turda
+  yalnız ÖLÇÜLÜR, eşik yok); her iki fsync politikasında koşulur.
+  Önce `with_capacity` işi yapılır.
 - **9c eşiği (#40):** metadata payı > %25 → GO (ölçüldü: %51.5, f32 modunda,
   hesaplanan boyutlara göre).
 - **9b:** NO-GO, `deny(unsafe_code)` bu arc'ta açılmaz (yeniden bakma koşulu
   #40'ta: veri RAM'e sığmazsa).
+
+## Ön-kayıt kuralının kalıcı maddesi (#63)
+
+Eşik yazarken şu soru DA sorulur: **"Bu kriter, başka hangi kriterle
+çelişebilir?"** — 9a-2'de kriter 2'yi geçiren mekanizma (backpressure)
+kriter 1'i geçilemez hale getirdi. Kriterler bağımsız yazılıyor ama
+sistem bir bütün.
 
 ## Sözleşmeler (gerileme yasak)
 
@@ -65,13 +74,15 @@ clippy uyarısız + fmt + tüm testler yeşil (şu an **115 unit + 6 kaza**).
 
 ## SIRADAKİ İŞ (net)
 
-1. `seal()` her çağrıda `thread::spawn` yapıyor → 35 eşzamanlı mühürleme,
-   hiçbiri bitmiyor (#52). **Tek worker + kuyruk** yap (merge'deki
-   `MergeContext` kalıbı hazır örnek).
-2. **Backpressure:** kuyruk eşiği aşılınca yazma yolunda kısa bekleme.
-3. Ön-kayıt #49'un İKİ kriterini de yeniden ölç (`mergewindow` +
-   `accumulation`); 9a-2 ancak ikisi de geçerse kabul.
-4. Sonra 9c → 9d → 10 (plan dosyasındaki sıra).
+1. **`with_capacity`** — yazma buffer'ı 125K kaydı baştan ayırsın; 64 MB'lık
+   realloc sıçramasını kaldırır (ön-kayıt #61'in ön şartı).
+2. **Kriter 1'i #61'e göre yeniden ölç:** backpressure dışındaki en uzun
+   yazma + backpressure beklemelerinin dağılımı, HER İKİ fsync
+   politikasında. Realloc hipotezi burada kanıtlanır ya da çürür.
+3. Sonra 9c → 9d → 10 (plan dosyasındaki sıra).
+4. **Ertelendi (#62):** segment birikmesi (mühürleme 25 s'de üretiyor,
+   merge 54 s'de eksiltiyor). Yeniden bakma koşulu: sürekli yazma yükü
+   öngörülen kullanımın parçası olursa.
 
 ## Yeniden koşulabilir ölçümler
 
