@@ -436,7 +436,7 @@ impl SegmentedIndex {
             seal_threshold: AtomicUsize::new(seal_threshold),
             segments: Arc::new(RwLock::new(Vec::new())),
             sealing: Arc::new(RwLock::new(Vec::new())),
-            buffer: RwLock::new(BruteForceIndex::new(dim, metric)),
+            buffer: RwLock::new(BruteForceIndex::with_capacity(dim, metric, seal_threshold)),
             ef_search,
             metadata: RwLock::new(HashMap::new()),
             postings: RwLock::new(HashMap::new()),
@@ -938,7 +938,14 @@ impl SegmentedIndex {
             if buffer.is_empty() {
                 return;
             }
-            std::mem::replace(&mut *buffer, BruteForceIndex::new(self.dim, self.metric))
+            // Yeni buffer da kapasiteli: aksi halde her mühürlemeden sonra
+            // realloc merdiveni baştan başlar (#61).
+            let fresh = BruteForceIndex::with_capacity(
+                self.dim,
+                self.metric,
+                self.seal_threshold.load(Ordering::Relaxed),
+            );
+            std::mem::replace(&mut *buffer, fresh)
         };
         let sealing = Arc::new(Sealing {
             data: sealed_data,

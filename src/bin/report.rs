@@ -1030,22 +1030,72 @@ fn main() {
         let extra = idx.seal_threshold() + 5_000;
         println!("{extra} yazma ölçülüyor (pencere öncesi+sonrası örnekleme dahil)...");
         let mut lats: Vec<std::time::Duration> = Vec::with_capacity(extra);
+        // #61: backpressure kaynaklı beklemeler AYRI kalem. Her yazmadan
+        // önce/sonra stall sayacı okunur (iki relaxed atomik yükleme, ns
+        // mertebesinde) — böylece "kusur" ile "kasıtlı kısıtlama" aynı
+        // sayıda toplanmaz (#60'ın kaydettiği metrik kusuru).
+        let mut stalled: Vec<bool> = Vec::with_capacity(extra);
         let t_all = Instant::now();
         for i in 0..extra {
             let id = VectorId(base_id + 1_000_000 + i as u64);
+            let (c0, _) = idx.stall_stats();
             let t = Instant::now();
             idx.insert_with_meta(id, &base[i % base.len()], Metadata::new())
                 .expect("insert");
             lats.push(t.elapsed());
+            let (c1, _) = idx.stall_stats();
+            stalled.push(c1 > c0);
         }
         let wall = t_all.elapsed();
         // 6 ms'lik sıçramanın KAYNAĞINI bulmak için: en yavaş 5 yazmanın
         // sıra numarası, mühürlemenin düştüğü sıra numarasıyla karşılaştırılır.
         // (Eşik değişmiyor; bu yalnız teşhis.) Mühürleme buffer eşiğine
         // varınca olur, yani sıra numarası önceden hesaplanabilir.
+        // #61 BİRİNCİL: backpressure DIŞINDAKİ en uzun yazma.
+        let clean: Vec<std::time::Duration> = lats
+            .iter()
+            .zip(stalled.iter())
+            .filter(|(_, st)| !**st)
+            .map(|(d, _)| *d)
+            .collect();
+        let bp: Vec<std::time::Duration> = lats
+            .iter()
+            .zip(stalled.iter())
+            .filter(|(_, st)| **st)
+            .map(|(d, _)| *d)
+            .collect();
+        let max_clean = clean.iter().max().copied().unwrap_or_default();
+        let mut sorted_clean = clean.clone();
+        sorted_clean.sort();
+        let p99_clean = sorted_clean
+            .get(sorted_clean.len() * 99 / 100)
+            .copied()
+            .unwrap_or_default();
+        println!();
+        println!("| #61 kalem | değer |");
+        println!("|-----------|-------|");
+        println!("| BİRİNCİL: backpressure dışındaki en uzun yazma | {max_clean:?} |");
+        println!("| backpressure dışı p99 | {p99_clean:?} |");
+        println!(
+            "| BİRİNCİL oran (en uzun / p99) | {:.0}x |",
+            max_clean.as_secs_f64() / p99_clean.as_secs_f64().max(1e-12)
+        );
+        println!(
+            "| İKİNCİL (eşik YOK): bekletilen yazma sayısı | {} |",
+            bp.len()
+        );
+        println!(
+            "| İKİNCİL: en uzun bekleme | {:?} |",
+            bp.iter().max().copied().unwrap_or_default()
+        );
+        println!(
+            "| İKİNCİL: toplam bekleme | {:?} |",
+            bp.iter().sum::<std::time::Duration>()
+        );
+
         let mut slowest: Vec<(usize, std::time::Duration)> =
             lats.iter().copied().enumerate().collect();
-        slowest.sort_by(|a, b| b.1.cmp(&a.1));
+        slowest.sort_by_key(|b| std::cmp::Reverse(b.1));
         let seal_at = idx.seal_threshold().saturating_sub(buf0);
         println!();
         println!("teşhis: mühürleme ~{seal_at}. yazmada; en yavaş 5 yazma:");

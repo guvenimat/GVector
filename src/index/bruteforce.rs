@@ -39,6 +39,28 @@ impl BruteForceIndex {
         }
     }
 
+    /// Kapasitesi ÖNCEDEN ayrılmış boş indeks (#61).
+    ///
+    /// Yazma buffer'ı için: buffer mühürleme eşiğine kadar büyüyor ve
+    /// `Vec`'in kademeli büyümesi eşiğe yakın yerlerde ~64 MB'lık bir
+    /// realloc + memcpy'ye dönüşüyor — tek bir insert'in milisaniyelere
+    /// çıkması bunun belirtisi. Kapasite TAM boyutta ayrılır (büyüme payı
+    /// eklenmez): buffer zaten eşiğe varınca mühürleniyor, fazladan pay
+    /// realloc'u önlemez ama bellek zirvesini şişirir.
+    ///
+    /// ÜÇ yapı da ayrılır — yalnız vektör bloğu değil: `ids` ve `slot_of`
+    /// da kayıt sayısıyla büyüyor, `HashMap`'in yeniden hash'lenmesi de
+    /// aynı sınıfta bir sıçrama üretir.
+    pub fn with_capacity(dim: usize, metric: Metric, records: usize) -> Self {
+        Self {
+            metric,
+            dim,
+            data: Vec::with_capacity(records * dim),
+            ids: Vec::with_capacity(records),
+            slot_of: HashMap::with_capacity(records),
+        }
+    }
+
     pub fn dim(&self) -> usize {
         self.dim
     }

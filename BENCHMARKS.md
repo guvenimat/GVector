@@ -1,5 +1,51 @@
 # Benchmark Kayıtları
 
+## Aşama 9a-2 — `with_capacity` sonrası kriter 1 (ön-kayıt #61) — 2026-08-19
+
+Yalnız ölçüm sonuçları. `data/fullscale` sıfırdan kuruldu (1M, 8 segment),
+aynı protokol her iki fsync politikasında koşuldu, 130.000 yazma.
+
+| ölçüm | **group:20** (ön-kayıtlı koşul) | **sync kapalı** (fark izolasyonu) |
+|---|---|---|
+| taban p50 | 900 ns | 2.7 µs |
+| taban p99 | 10.3 µs | 16.5 µs |
+| **BİRİNCİL: backpressure dışı en uzun yazma** | **4.435 ms** | **200.3 µs** |
+| BİRİNCİL oran (kendi p99'una) | **426x** | **12x** |
+| oran (Aşama 8 tabanı 7.8 µs'e göre) | 569x | 26x |
+| ön-kayıtlı 50x eşiği | **GEÇMEDİ** | **GEÇTİ** |
+| mühürlemenin yazıcıyı bloke ettiği süre | 53 µs | 58 µs |
+| İKİNCİL: bekletilen yazma (backpressure) | **0** | **0** |
+
+### `with_capacity`ın etkisi (realloc hipotezi KANITLANDI)
+
+En yavaş 5 yazma, önce/sonra:
+
+| politika | `with_capacity` ÖNCESİ | SONRASI |
+|---|---|---|
+| group:20 | 4.0 – 10.0 ms | 4.03 – 4.44 ms |
+| sync kapalı | 1.8 – 4.4 ms | **98 – 200 µs** |
+
+Sync kapalıyken sıçramalar **~20x küçüldü** (ms mertebesinden yüz µs'ye).
+Buffer'ın kademeli büyümesi (≈64 MB realloc + memcpy) fsync dışı
+sıçramaların kaynağıydı; kapasite baştan ayrılınca kalmadı.
+
+### Kalan sıçrama tamamen fsync
+
+group:20'de kalan beş sıçrama **4.03, 4.04, 4.06, 4.10, 4.44 ms** — dar bir
+kümede ve 130.000 yazmaya dağılmış (#14824, #46099, #61013, #107181,
+#129620), mühürleme noktasıyla (#21266) ilgisiz. Sync kapatılınca tamamen
+kayboluyor. Yani kalan pay dayanıklılık politikasının bedeli, yazma
+yolunun kusuru değil.
+
+### İkincil kalem: veri yok
+
+Her iki koşuda da backpressure hiç devreye girmedi (0 bekletme): ölçüm
+130.000 yazma sürüyor ve kuyruk eşiği aşılmıyor. #61'in ikincil kalemi
+için bu turda veri üretilemedi; dağılım ancak sürekli yük altında
+(`accumulation` modu) gözlenebiliyor — orada 10 dakikada 21 bekletme,
+toplam 594 s ölçülmüştü.
+
+
 ## Aşama 9a-2 — ön-kayıtlı iki kriterin ölçümü (SONUÇLAR) — 2026-08-19
 
 Bu bölüm YALNIZ ölçüm sonuçlarıdır. Sonuçlardan çıkarılan kararlar ve
