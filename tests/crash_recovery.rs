@@ -9,17 +9,17 @@
 //! WAL's **intact prefix** — nothing missing (a lost op) and nothing extra (a
 //! phantom op).
 
+use gvector::dataset::random_vectors;
+use gvector::distance::Metric;
+use gvector::index::hnsw::HnswParams;
+use gvector::index::segmented::SegmentedIndex;
+use gvector::index::VectorIndex;
+use gvector::meta::{MetaValue, Metadata};
+use gvector::storage::wal::{replay_bytes, SyncPolicy, WalRecord};
+use gvector::storage::{temp_dir, Manifest};
+use gvector::types::VectorId;
 use proptest::prelude::*;
 use std::collections::HashSet;
-use vector_gvector::dataset::random_vectors;
-use vector_gvector::distance::Metric;
-use vector_gvector::index::hnsw::HnswParams;
-use vector_gvector::index::segmented::SegmentedIndex;
-use vector_gvector::index::VectorIndex;
-use vector_gvector::meta::{MetaValue, Metadata};
-use vector_gvector::storage::wal::{replay_bytes, SyncPolicy, WalRecord};
-use vector_gvector::storage::{temp_dir, Manifest};
-use vector_gvector::types::VectorId;
 
 const DIM: usize = 8;
 

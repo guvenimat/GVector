@@ -1,10 +1,10 @@
 [package]
-name = "vector-gvector"
+name = "gvector"
 version = "0.1.0"
 edition = "2021"
 license = "Apache-2.0"
 description = "A vector search engine written from scratch in Rust: HNSW, segment model, WAL, and a measurement-driven query planner."
-repository = "https://github.com/guvenimat/vector-gvector"
+repository = "https://github.com/guvenimat/gvector"
 readme = "README.md"
 keywords = ["vector-search", "hnsw", "ann", "embeddings"]
 categories = ["database-implementations", "algorithms"]

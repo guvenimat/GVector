@@ -2,8 +2,8 @@
 //! 128-dimensional vectors generated from a fixed seed — same dimension as SIFT.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use vector_gvector::dataset::random_vectors;
-use vector_gvector::distance::{dot, l2_squared, normalized, Metric};
+use gvector::dataset::random_vectors;
+use gvector::distance::{dot, l2_squared, normalized, Metric};
 
 fn bench_distances(c: &mut Criterion) {
     let vecs = random_vectors(2, 128, 42);
@@ -21,7 +21,7 @@ fn bench_distances(c: &mut Criterion) {
     });
 
     // ADC (the quantized search path) — for comparison against the f32 paths
-    use vector_gvector::index::quant::ScalarQuantizer;
+    use gvector::index::quant::ScalarQuantizer;
     let base = random_vectors(100, 128, 43);
     let quant = ScalarQuantizer::fit(base.iter().map(|v| v.as_slice()), 128);
     let mut code = Vec::new();

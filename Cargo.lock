@@ -394,6 +394,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "gvector"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bincode",
+ "bytemuck",
+ "crc32fast",
+ "criterion",
+ "memmap2",
+ "proptest",
+ "rand 0.8.7",
+ "rayon",
+ "serde",
+ "serde_json",
+ "thiserror",
+ "tokio",
+ "wide",
+]
+
+[[package]]
 name = "half"
 version = "2.7.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1134,26 +1154,6 @@ name = "unicode-ident"
 version = "1.0.24"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e6e4313cd5fcd3dad5cafa179702e2b244f760991f45397d14d4ebf38247da75"
-
-[[package]]
-name = "vector-gvector"
-version = "0.1.0"
-dependencies = [
- "axum",
- "bincode",
- "bytemuck",
- "crc32fast",
- "criterion",
- "memmap2",
- "proptest",
- "rand 0.8.7",
- "rayon",
- "serde",
- "serde_json",
- "thiserror",
- "tokio",
- "wide",
-]
 
 [[package]]
 name = "wait-timeout"

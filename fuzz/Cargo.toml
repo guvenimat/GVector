@@ -1,5 +1,5 @@
 [package]
-name = "vector-gvector-fuzz"
+name = "gvector-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -9,7 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-vector-gvector = { path = ".." }
+gvector = { path = ".." }
 
 [[bin]]
 name = "load_index"

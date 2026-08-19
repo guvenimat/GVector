@@ -26,15 +26,15 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use gvector::distance::Metric;
+use gvector::index::hnsw::HnswParams;
+use gvector::index::segmented::SegmentedIndex;
+use gvector::index::IndexError;
+use gvector::meta::{Filter, Metadata};
+use gvector::storage::wal::SyncPolicy;
+use gvector::types::VectorId;
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot};
-use vector_gvector::distance::Metric;
-use vector_gvector::index::hnsw::HnswParams;
-use vector_gvector::index::segmented::SegmentedIndex;
-use vector_gvector::index::IndexError;
-use vector_gvector::meta::{Filter, Metadata};
-use vector_gvector::storage::wal::SyncPolicy;
-use vector_gvector::types::VectorId;
 
 /// Commands sent to the writer task. The reply comes back over a oneshot —
 /// a client never receives a 200 before its write has actually been applied.
@@ -340,7 +340,7 @@ async fn main() {
         .with_state(AppState { index, writer: tx });
 
     let addr = format!("127.0.0.1:{port}");
-    println!("vector-gvector API dinliyor: http://{addr} (dim={dim})");
+    println!("gvector API dinliyor: http://{addr} (dim={dim})");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     // Graceful shutdown: ctrl-c → yeni istek alma, bekleyenleri bitir,
     // then force an fsync of the WAL. On shutdown we fsync regardless of the

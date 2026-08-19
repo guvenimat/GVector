@@ -7,7 +7,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use vector_gvector::index::hnsw::HnswIndex;
+use gvector::index::hnsw::HnswIndex;
 
 fuzz_target!(|data: &[u8]| {
     // Any outcome (Ok/Err) is acceptable; the only failure criterion is a panic.

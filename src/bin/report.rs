@@ -8,14 +8,14 @@
 //! subset we generate the GT ourselves with an exact scan (otherwise recall
 //! comes out wrong).
 
+use gvector::dataset::{random_vectors, read_fvecs_subset, read_ivecs, DEFAULT_SEED};
+use gvector::distance::Metric;
+use gvector::eval::{exact_top_k, ground_truth, measure_latency, recall_at_k};
+use gvector::index::bruteforce::BruteForceIndex;
+use gvector::index::hnsw::{HnswIndex, HnswParams};
+use gvector::index::VectorIndex;
+use gvector::types::VectorId;
 use std::time::Instant;
-use vector_gvector::dataset::{random_vectors, read_fvecs_subset, read_ivecs, DEFAULT_SEED};
-use vector_gvector::distance::Metric;
-use vector_gvector::eval::{exact_top_k, ground_truth, measure_latency, recall_at_k};
-use vector_gvector::index::bruteforce::BruteForceIndex;
-use vector_gvector::index::hnsw::{HnswIndex, HnswParams};
-use vector_gvector::index::VectorIndex;
-use vector_gvector::types::VectorId;
 
 /// HNSW parameter sweep: prints a recall/latency table for combinations of
 /// M × ef_search and reports the speedup against the brute-force reference.
@@ -87,8 +87,8 @@ fn hnsw_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
 /// - contig: the first s·n records, contiguous in id space (kept separate for
 ///   the interaction with segment boundaries)
 fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric) {
+    use gvector::meta::{Filter, MetaValue, Metadata, Predicate};
     use std::collections::HashSet;
-    use vector_gvector::meta::{Filter, MetaValue, Metadata, Predicate};
 
     let n = base.len();
     let dim = base[0].len();
@@ -113,7 +113,7 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
 
     // Planning cost: how expensive would an O(n) metadata scan be for a query
     // planner? Build a realistic metadata map and time a full count.
-    let mut meta_store = vector_gvector::meta::MetaStore::new();
+    let mut meta_store = gvector::meta::MetaStore::new();
     for i in 0..n {
         meta_store.insert(
             VectorId(i as u64),
@@ -238,7 +238,7 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
     // ---- The "after" table: SegmentedIndex with the planner, end to end ----
     // Her s seviyesi bir Bool etiketi olur ("s0".."s6"); filtre Eq ile
     // uses the posting-list path. One build per variant.
-    use vector_gvector::index::segmented::SegmentedIndex;
+    use gvector::index::segmented::SegmentedIndex;
     println!();
     println!("== SegmentedIndex with planner (posting list + scan / unfiltered over-fetch) ==");
     println!("| varyant | s | grup | recall | p50 |");
@@ -325,12 +325,12 @@ fn rss_bytes() -> u64 {
 /// Phase 8: the 1M end-to-end reality check (the full system: segmented index,
 /// planner, filters and WAL). Pre-registered thresholds: DECISIONS #40/#41.
 fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric) {
+    use gvector::index::segmented::SegmentedIndex;
+    use gvector::meta::{Filter, MetaValue, Metadata, Predicate};
+    use gvector::storage::wal::SyncPolicy;
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
-    use vector_gvector::index::segmented::SegmentedIndex;
-    use vector_gvector::meta::{Filter, MetaValue, Metadata, Predicate};
-    use vector_gvector::storage::wal::SyncPolicy;
 
     let n = base.len();
     let dim = base[0].len();
@@ -731,9 +731,7 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
             .expect("insert");
     }
     idx.flush_wal().expect("flush");
-    let wal_path = dir.join(vector_gvector::storage::Manifest::wal_file_name(
-        idx.generation(),
-    ));
+    let wal_path = dir.join(gvector::storage::Manifest::wal_file_name(idx.generation()));
     let live_before = idx.len_shared();
     drop(idx);
     let full = std::fs::read(&wal_path).unwrap_or_default();
@@ -742,7 +740,7 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     } else {
         let cut = full.len() * 2 / 3;
         std::fs::write(&wal_path, &full[..cut]).expect("kes");
-        let (prefix, _) = vector_gvector::storage::wal::replay_bytes(&full[..cut]);
+        let (prefix, _) = gvector::storage::wal::replay_bytes(&full[..cut]);
         let t = Instant::now();
         let re = SegmentedIndex::open_durable(
             dir.clone(),
@@ -848,10 +846,10 @@ fn main() {
         // RANDOM order it degrades to O(n²). Our measurements always generated ids
         // in ascending order, so this difference was invisible — here it is broken
         // on purpose.
+        use gvector::index::segmented::SegmentedIndex;
+        use gvector::meta::{MetaValue, Metadata};
         use rand::seq::SliceRandom;
         use rand::SeedableRng;
-        use vector_gvector::index::segmented::SegmentedIndex;
-        use vector_gvector::meta::{MetaValue, Metadata};
 
         let n = base.len().min(200_000);
         println!("{n} records into a single posting list (all sharing one Eq value)");
@@ -886,8 +884,8 @@ fn main() {
         // step, comparing the estimate (capacity × a fixed factor) with the real
         // delta. 9c's GO decision (a 51.5% share) rests on that estimate; if it is
         // far off, 9c's scope has to be redrawn.
-        use vector_gvector::index::segmented::SegmentedIndex;
-        use vector_gvector::storage::wal::SyncPolicy;
+        use gvector::index::segmented::SegmentedIndex;
+        use gvector::storage::wal::SyncPolicy;
 
         let dir = std::path::PathBuf::from("data/fullscale");
         if !dir.join("MANIFEST").exists() {
@@ -958,11 +956,11 @@ fn main() {
         // third may exceed that of the first third by at most 20% AND no sample
         // may exceed ceiling+4 (12) → accepted without backpressure. Otherwise
         // backpressure is done in the same arc.
+        use gvector::index::segmented::SegmentedIndex;
+        use gvector::meta::Metadata;
+        use gvector::storage::wal::SyncPolicy;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
-        use vector_gvector::index::segmented::SegmentedIndex;
-        use vector_gvector::meta::Metadata;
-        use vector_gvector::storage::wal::SyncPolicy;
 
         // WAL OFF: the accumulation measurement targets the INTERNAL dynamics of
         // the write path; with the WAL on, the first attempt wrote a 4.3 GB log in
@@ -1124,9 +1122,9 @@ fn main() {
         // is kept identical to phase 8 (WAL group:20, NO commit inside the loop) —
         // an fsync-inclusive measurement would blow the threshold no matter how
         // good 9a was.
-        use vector_gvector::index::segmented::SegmentedIndex;
-        use vector_gvector::meta::Metadata;
-        use vector_gvector::storage::wal::SyncPolicy;
+        use gvector::index::segmented::SegmentedIndex;
+        use gvector::meta::Metadata;
+        use gvector::storage::wal::SyncPolicy;
 
         let dir = std::path::PathBuf::from("data/fullscale");
         if !dir.join("MANIFEST").exists() {
@@ -1323,10 +1321,10 @@ fn main() {
         // int8 side is measured at the SAME segment count (comparing against a
         // single-graph int8
         // would credit int8 with the 1→8 segment difference from segcurve).
+        use gvector::index::quant::QuantizedHnsw;
+        use gvector::index::segmented::SegmentedIndex;
+        use gvector::types::SearchResult;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-        use vector_gvector::index::quant::QuantizedHnsw;
-        use vector_gvector::index::segmented::SegmentedIndex;
-        use vector_gvector::types::SearchResult;
 
         let dir = std::path::PathBuf::from("data/fullscale");
         if !dir.join("MANIFEST").exists() {
@@ -1511,7 +1509,7 @@ fn main() {
         // For the 9b decision: the components of cold start. mmap can only remove
         // the "file read + vector copy" part; graph parsing and metadata rebuild
         // remain. This is the UPPER BOUND on the gain.
-        use vector_gvector::storage::{read_verified, Manifest};
+        use gvector::storage::{read_verified, Manifest};
         let dir = std::path::PathBuf::from("data/fullscale");
         let manifest = Manifest::read(&dir)
             .expect("manifest")
@@ -1550,7 +1548,7 @@ fn main() {
         let mfile = manifest.metadata_file.clone().expect("metadata file");
         let mbytes = read_verified(&dir, &mfile, manifest.metadata_crc).expect("meta oku");
         let entries =
-            vector_gvector::storage::decode_metadata(&mbytes, &dir.join(&mfile)).expect("decode");
+            gvector::storage::decode_metadata(&mbytes, &dir.join(&mfile)).expect("decode");
         let t_meta_read = t.elapsed();
         println!(
             "(c) metadata read + decode: {t_meta_read:.2?} ({} records, {:.0} MB)",
@@ -1559,7 +1557,7 @@ fn main() {
         );
 
         let t = Instant::now();
-        let full = vector_gvector::index::segmented::SegmentedIndex::open_or_create(
+        let full = gvector::index::segmented::SegmentedIndex::open_or_create(
             dir.clone(),
             dim,
             metric,
@@ -1591,9 +1589,9 @@ fn main() {
 
     if mode == "wal" {
         // The phase 7c measurement: fsync policy × write throughput + replay.
-        use vector_gvector::index::segmented::SegmentedIndex;
-        use vector_gvector::meta::{MetaValue, Metadata};
-        use vector_gvector::storage::wal::SyncPolicy;
+        use gvector::index::segmented::SegmentedIndex;
+        use gvector::meta::{MetaValue, Metadata};
+        use gvector::storage::wal::SyncPolicy;
 
         let n = base.len().min(20_000);
         // The server's writer task batches commands and performs a SINGLE commit
@@ -1713,8 +1711,8 @@ fn main() {
 
     if mode == "durability" {
         // The phase 7a measurement: checkpoint + cold-start cost.
-        use vector_gvector::index::segmented::SegmentedIndex;
-        use vector_gvector::meta::{MetaValue, Metadata};
+        use gvector::index::segmented::SegmentedIndex;
+        use gvector::meta::{MetaValue, Metadata};
         let dir = std::path::PathBuf::from("data/durability");
         let _ = std::fs::remove_dir_all(&dir);
         let idx = SegmentedIndex::open_or_create(
@@ -1788,11 +1786,11 @@ fn main() {
         // uniform + skewed (log-normal) distributions, estimated interval vs
         // truth, a correlated Eq+Range cell, the arm agreement rate, and the
         // maintenance cost.
+        use gvector::index::segmented::SegmentedIndex;
+        use gvector::meta::{Filter, MetaValue, Metadata, Predicate};
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
         use std::collections::HashSet;
-        use vector_gvector::index::segmented::SegmentedIndex;
-        use vector_gvector::meta::{Filter, MetaValue, Metadata, Predicate};
 
         let n = base.len();
         // log-normal alan: exp(N(0,1)), deterministik
@@ -1990,7 +1988,7 @@ fn main() {
 
     if mode == "mergecost" {
         // The cost of the ceiling guard: same data, with and without a ceiling.
-        use vector_gvector::index::segmented::SegmentedIndex;
+        use gvector::index::segmented::SegmentedIndex;
         let seal = base.len() / 10; // produces 10 segments without a ceiling
         for (label, ceiling) in [("no ceiling", 100usize), ("ceiling=8", 8)] {
             let mut idx = SegmentedIndex::new(dim, metric, HnswParams::default(), seal);
@@ -2026,7 +2024,7 @@ fn main() {
         // The segment count × latency/recall curve (an input to the merge
         // policy). The same data is split with different seal thresholds; searches
         // are unfiltered.
-        use vector_gvector::index::segmented::SegmentedIndex;
+        use gvector::index::segmented::SegmentedIndex;
         let truth = ground_truth(&base, &queries, k, metric);
         println!("| segments | p50 | p99 | recall@{k} | build |");
         println!("|---------|-----|-----|-----------|------|");
@@ -2113,7 +2111,7 @@ fn main() {
     if mode == "sift1m" {
         // Tam 1M stres testi: resmi ground truth (sift_groundtruth.ivecs)
         // is VALID here — unlike with subsets, we do not generate it ourselves.
-        use vector_gvector::index::quant::QuantizedHnsw;
+        use gvector::index::quant::QuantizedHnsw;
         let gt = read_ivecs(std::path::Path::new("data/sift/sift_groundtruth.ivecs"))
             .expect("could not read the ground truth");
         let truth: Vec<Vec<VectorId>> = gt
@@ -2187,7 +2185,7 @@ fn main() {
     }
 
     if mode == "quant" {
-        use vector_gvector::index::quant::QuantizedHnsw;
+        use gvector::index::quant::QuantizedHnsw;
         let truth = ground_truth(&base, &queries, k, metric);
         let mut hnsw = HnswIndex::new(dim, metric, HnswParams::default());
         for (i, v) in base.iter().enumerate() {
@@ -2238,9 +2236,9 @@ fn main() {
     }
 
     if mode == "concurrent" {
+        use gvector::index::segmented::SegmentedIndex;
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
-        use vector_gvector::index::segmented::SegmentedIndex;
 
         let idx = Arc::new(SegmentedIndex::new(
             dim,
