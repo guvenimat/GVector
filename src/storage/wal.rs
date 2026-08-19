@@ -1,17 +1,19 @@
-//! Write-ahead log (Aşama 7b): yazma buffer'ının sıcak dayanıklılığı.
+//! Write-ahead log (phase 7b): hot durability for the write buffer.
 //!
-//! Segmentler checkpoint ile dayanıklı; aradaki yazmalar yalnız bellekte
-//! yaşıyordu. WAL bu boşluğu kapatır: her mutasyon önce loga, sonra belleğe.
+//! Segments are made durable by checkpoints; the writes in between lived only
+//! in memory. The WAL closes that gap: every mutation goes to the log first,
+//! then to memory.
 //!
-//! **Çerçeve:** `[len: u32 LE][crc32: u32 LE][payload: bincode]`.
-//! CRC yalnız payload'ı kapsar; uzunluk başlığı ayrı okunur ki kesik kuyruk
-//! (dosya kaydın ortasında bitmiş) ile bozuk gövde ayırt edilebilsin.
+//! **Framing:** `[len: u32 LE][crc32: u32 LE][payload: bincode]`.
+//! The CRC covers the payload only; the length header is read separately so
+//! that a truncated tail (the file ended mid-record) can be told apart from a
+//! corrupted body.
 //!
-//! **Kurtarma sözleşmesi:** replay ilk tutarsızlıkta DURUR — kısmi kayıt,
-//! CRC uyuşmazlığı ya da mantıksız uzunluk. Hayalet op asla türetilmez;
-//! o noktadan sonrası yok sayılır ve dosya ORADA KESİLİR. Kesmezsek bir
-//! sonraki append bozuk kuyruğun üstüne yazar ve dosya kalıcı olarak
-//! tutarsız kalırdı.
+//! **Recovery contract:** replay STOPS at the first inconsistency — a partial
+//! record, a CRC mismatch or an implausible length. A phantom operation is
+//! never synthesized; everything past that point is discarded and the file is
+//! TRUNCATED THERE. Without truncating, the next append would write on top of
+//! a corrupted tail and the file would stay permanently inconsistent.
 
 use crate::meta::Metadata;
 use crate::storage::{meta_to_repr, repr_to_meta, MetaRepr, StorageError};
@@ -21,21 +23,22 @@ use std::io::{BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-/// Tek kaydın üst sınırı — bozuk uzunluk başlığında GB'lık ayırma yapmamak
-/// için. 128 boyutlu vektör + metadata bunun binde biri.
+/// Upper bound for a single record — so a corrupted length header cannot
+/// trigger a gigabyte allocation. A 128-dimensional vector plus metadata is a
+/// thousandth of this.
 const MAX_RECORD_BYTES: u32 = 64 * 1024 * 1024;
 
-/// fsync politikası. Hangi politikada HTTP 200'ün ne anlama geldiği
-/// DECISIONS #36'da tanımlı.
+/// The fsync policy. What an HTTP 200 means under each policy is defined in
+/// DECISIONS #36.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncPolicy {
-    /// fsync yok; dayanıklılık yalnız checkpoint'te. WAL yine de yazılır,
-    /// yani SÜREÇ çökmesine dayanır — MAKİNE çökmesine dayanmaz.
+    /// No fsync; durability only at checkpoints. The WAL is still written, so
+    /// it survives a PROCESS crash — but not a MACHINE crash.
     None,
-    /// Her kayıttan sonra fsync. En güvenli, en yavaş.
+    /// fsync after every record. Safest, slowest.
     PerOp,
-    /// Grup commit: pencere içindeki kayıtlar tek fsync paylaşır.
-    /// Yanıt yine fsync'i bekler (bkz. DECISIONS #36).
+    /// Group commit: records within a window share a single fsync.
+    /// The response still waits for that fsync (see DECISIONS #36).
     Group { window_ms: u64 },
 }
 
@@ -60,9 +63,9 @@ impl SyncPolicy {
     }
 }
 
-/// WAL kaydı. Checkpoint işareti YOK: checkpoint WAL'ı rotasyona sokup yeni
-/// dosya açtığı için "bu noktadan öncesi segmentlerde" bilgisi dosya
-/// sınırının kendisidir.
+/// A WAL record. There is NO checkpoint marker: because a checkpoint rotates
+/// the WAL and opens a new file, the information "everything before this point
+/// is in the segments" is carried by the file boundary itself.
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub enum WalRecord {
     Insert {
@@ -89,12 +92,12 @@ impl WalRecord {
     }
 }
 
-/// Replay sonucu — kaç kayıt uygulandı, nerede durdu ve neden.
+/// The replay result — how many records were applied, where it stopped, why.
 #[derive(Debug, Clone, Default)]
 pub struct ReplayReport {
     pub applied: usize,
     pub bytes_ok: u64,
-    /// Sağlam önekin bittiği offset; dosya bundan sonrası atıldıysa Some.
+    /// Offset where the intact prefix ends; Some if the rest was discarded.
     pub truncated_at: Option<u64>,
     pub reason: Option<String>,
 }
@@ -105,13 +108,13 @@ pub struct Wal {
     policy: SyncPolicy,
     bytes: u64,
     records: u64,
-    /// Son fsync'ten beri yazılmış (henüz dayanıklı olmayan) kayıt var mı?
+    /// Are there records written since the last fsync (not yet durable)?
     dirty: bool,
     last_sync: Instant,
 }
 
 impl Wal {
-    /// Var olan dosyaya ekleyerek açar; yoksa oluşturur.
+    /// Opens for appending to an existing file; creates it if absent.
     pub fn open_append(path: PathBuf, policy: SyncPolicy) -> Result<Wal, StorageError> {
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
         let bytes = file.metadata()?.len();
@@ -145,14 +148,14 @@ impl Wal {
         self.policy
     }
 
-    /// Kaydı loga ekler. `PerOp`'ta fsync burada olur; `Group`'ta pencere
-    /// dolduysa olur; `None`'da hiç olmaz.
+    /// Appends a record to the log. Under `PerOp` the fsync happens here;
+    /// under `Group` it happens if the window has elapsed; under `None` never.
     pub fn append(&mut self, rec: &WalRecord) -> Result<(), StorageError> {
         let payload = bincode::serialize(rec)?;
         if payload.len() as u64 > MAX_RECORD_BYTES as u64 {
             return Err(StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "kayıt üst sınırı aşıyor",
+                "record exceeds the size limit",
             )));
         }
         let crc = crate::storage::crc32(&payload);
@@ -171,15 +174,15 @@ impl Wal {
                 }
             }
             SyncPolicy::None => {
-                // Yalnız buffer'ı OS'e ver; fsync checkpoint'e kalır.
+                // Only hand the buffer to the OS; the fsync is left to the checkpoint.
                 self.writer.flush()?;
             }
         }
         Ok(())
     }
 
-    /// Zorla fsync (grup penceresini kapatır; graceful shutdown ve checkpoint
-    /// bunu çağırır). Zaten temizse ucuz.
+    /// Forces an fsync (closing the group window; graceful shutdown and
+    /// checkpoint call this). Cheap if already clean.
     pub fn sync(&mut self) -> Result<(), StorageError> {
         self.writer.flush()?;
         if self.dirty {
@@ -190,7 +193,8 @@ impl Wal {
         Ok(())
     }
 
-    /// Grup penceresi dolduysa fsync'ler. Yazıcı task'i batch sonunda çağırır.
+    /// fsyncs if the group window has elapsed. The writer task calls this at
+    /// the end of a batch.
     pub fn sync_if_due(&mut self) -> Result<bool, StorageError> {
         match self.policy {
             SyncPolicy::Group { window_ms } => {
@@ -204,15 +208,16 @@ impl Wal {
         }
     }
 
-    /// Henüz dayanıklı olmayan kayıt var mı?
+    /// Are there records that are not durable yet?
     pub fn is_dirty(&self) -> bool {
         self.dirty
     }
 
-    /// Batch sonu commit: politikanın vaat ettiği dayanıklılığı sağlar.
-    /// `None`'da fsync YOK (sözleşme bu; yalnız OS'e teslim), diğerlerinde
-    /// fsync. Yazıcı task'i yanıtları göndermeden önce bunu çağırır —
-    /// group commit'in "200 = fsync'lendi" sözleşmesi buna dayanır.
+    /// End-of-batch commit: provides exactly the durability the policy
+    /// promises. Under `None` there is NO fsync (that is the contract; the data
+    /// is only handed to the OS); under the others there is. The writer task
+    /// calls this before sending responses — the "200 = fsynced" contract of
+    /// group commit rests on it.
     pub fn commit(&mut self) -> Result<(), StorageError> {
         match self.policy {
             SyncPolicy::None => {
@@ -224,8 +229,9 @@ impl Wal {
     }
 }
 
-/// WAL dosyasını sırayla okur. İlk tutarsızlıkta durur ve dosyayı sağlam
-/// önekin sonunda keser. Dosya yoksa boş rapor döner (hata değil).
+/// Reads the WAL file sequentially. Stops at the first inconsistency and
+/// truncates the file at the end of the intact prefix. Returns an empty report
+/// if the file does not exist (not an error).
 pub fn replay(path: &Path) -> Result<(Vec<WalRecord>, ReplayReport), StorageError> {
     let mut report = ReplayReport::default();
     let mut file = match File::open(path) {
@@ -238,7 +244,7 @@ pub fn replay(path: &Path) -> Result<(Vec<WalRecord>, ReplayReport), StorageErro
     let (records, rep) = replay_bytes(&bytes);
     report = rep;
     if let Some(cut) = report.truncated_at {
-        // Bozuk/kesik kuyruğu at: sonraki append'ler temiz devam etsin.
+        // Discard the corrupt/truncated tail so later appends continue cleanly.
         let f = OpenOptions::new().write(true).open(path)?;
         f.set_len(cut)?;
         f.sync_all()?;
@@ -246,7 +252,7 @@ pub fn replay(path: &Path) -> Result<(Vec<WalRecord>, ReplayReport), StorageErro
     Ok((records, report))
 }
 
-/// Bayt tamponundan replay — testler ve fuzz bu yolu paylaşır (dosya IO yok).
+/// Replay from a byte buffer — tests and fuzzing share this path (no file IO).
 pub fn replay_bytes(bytes: &[u8]) -> (Vec<WalRecord>, ReplayReport) {
     let mut out = Vec::new();
     let mut report = ReplayReport::default();
@@ -258,23 +264,23 @@ pub fn replay_bytes(bytes: &[u8]) -> (Vec<WalRecord>, ReplayReport) {
         }
         let stop = |reason: &str| -> Option<String> { Some(reason.to_string()) };
         if bytes.len() - off < 8 {
-            report.reason = stop("kesik kayıt başlığı");
+            report.reason = stop("truncated record header");
             break;
         }
         let len = u32::from_le_bytes(bytes[off..off + 4].try_into().expect("4 byte"));
         let crc = u32::from_le_bytes(bytes[off + 4..off + 8].try_into().expect("4 byte"));
         if len == 0 || len > MAX_RECORD_BYTES {
-            report.reason = stop("mantıksız kayıt uzunluğu");
+            report.reason = stop("implausible record length");
             break;
         }
         let end = off + 8 + len as usize;
         if end > bytes.len() {
-            report.reason = stop("kesik kayıt gövdesi");
+            report.reason = stop("truncated record body");
             break;
         }
         let payload = &bytes[off + 8..end];
         if crate::storage::crc32(payload) != crc {
-            report.reason = stop("crc uyuşmuyor");
+            report.reason = stop("crc mismatch");
             break;
         }
         match bincode::deserialize::<WalRecord>(payload) {
@@ -284,8 +290,8 @@ pub fn replay_bytes(bytes: &[u8]) -> (Vec<WalRecord>, ReplayReport) {
                 off = end;
             }
             Err(_) => {
-                // CRC tuttu ama çözülemedi: format uyuşmazlığı. Yine dur.
-                report.reason = stop("kayıt çözülemedi");
+                // CRC matched but decoding failed: a format mismatch. Stop anyway.
+                report.reason = stop("record could not be decoded");
                 break;
             }
         }
@@ -295,7 +301,7 @@ pub fn replay_bytes(bytes: &[u8]) -> (Vec<WalRecord>, ReplayReport) {
     (out, report)
 }
 
-/// Kaydın metadata'sını uygulama tipine çevirir.
+/// Converts a record's metadata into the application type.
 pub fn record_meta(meta: MetaRepr) -> Metadata {
     repr_to_meta(meta)
 }
@@ -364,19 +370,19 @@ mod tests {
         let dir = temp_dir("wal-trunc");
         let path = write_all(&dir, SyncPolicy::PerOp);
         let good = std::fs::read(&path).unwrap();
-        // Kaydın ORTASINDA kes
+        // Cut in the MIDDLE of a record
         for cut in [good.len() - 1, good.len() - 5, good.len() / 2] {
             std::fs::write(&path, &good[..cut]).unwrap();
             let (recs, rep) = replay(&path).unwrap();
-            assert!(recs.len() < 3, "kesik dosyadan tam kayıt çıktı: {cut}");
+            assert!(recs.len() < 3, "a full record came out of a truncated file: {cut}");
             assert!(rep.truncated_at.is_some());
-            // dosya sağlam önekte kesilmiş olmalı
+            // the file must have been truncated at the intact prefix
             let after = std::fs::metadata(&path).unwrap().len();
             assert_eq!(after, rep.bytes_ok);
-            // ikinci replay aynı sonucu vermeli ve artık kesmemeli
+            // a second replay must give the same result and no longer truncate
             let (recs2, rep2) = replay(&path).unwrap();
             assert_eq!(recs2, recs);
-            assert!(rep2.truncated_at.is_none(), "ikinci replay temiz olmalı");
+            assert!(rep2.truncated_at.is_none(), "the second replay must be clean");
         }
     }
 
@@ -385,13 +391,13 @@ mod tests {
         let dir = temp_dir("wal-boundary");
         let path = write_all(&dir, SyncPolicy::PerOp);
         let good = std::fs::read(&path).unwrap();
-        // İlk kaydın tam sınırında kes
+        // Cut exactly at the boundary of the first record
         let first_len = u32::from_le_bytes(good[0..4].try_into().unwrap()) as usize;
         let boundary = 8 + first_len;
         std::fs::write(&path, &good[..boundary]).unwrap();
         let (recs, rep) = replay(&path).unwrap();
-        assert_eq!(recs.len(), 1, "sınırda kesme tam kaydı korumalı");
-        assert!(rep.truncated_at.is_none(), "sınır temiz son sayılır");
+        assert_eq!(recs.len(), 1, "a cut at the boundary must preserve the full record");
+        assert!(rep.truncated_at.is_none(), "a boundary counts as a clean end");
     }
 
     #[test]
@@ -399,15 +405,15 @@ mod tests {
         let dir = temp_dir("wal-corrupt");
         let path = write_all(&dir, SyncPolicy::PerOp);
         let good = std::fs::read(&path).unwrap();
-        // İkinci kaydın gövdesini boz
+        // Corrupt the body of the second record
         let first_len = u32::from_le_bytes(good[0..4].try_into().unwrap()) as usize;
         let second_body = 8 + first_len + 8;
         let mut bad = good.clone();
         bad[second_body + 1] ^= 0xff;
         std::fs::write(&path, &bad).unwrap();
         let (recs, rep) = replay(&path).unwrap();
-        assert_eq!(recs.len(), 1, "bozuk kayıttan sonrası uygulanmamalı");
-        assert_eq!(rep.reason.as_deref(), Some("crc uyuşmuyor"));
+        assert_eq!(recs.len(), 1, "nothing after a corrupt record may be applied");
+        assert_eq!(rep.reason.as_deref(), Some("crc mismatch"));
         assert_eq!(rep.truncated_at, Some(8 + first_len as u64));
     }
 
@@ -415,13 +421,13 @@ mod tests {
     fn garbage_length_header_is_rejected() {
         let dir = temp_dir("wal-garbage");
         let path = dir.join("w.log");
-        // Devasa uzunluk başlığı: ayırma denemeden reddedilmeli
+        // A gigantic length header: must be rejected without attempting to allocate
         let mut bytes = u32::MAX.to_le_bytes().to_vec();
         bytes.extend(0u32.to_le_bytes());
         std::fs::write(&path, &bytes).unwrap();
         let (recs, rep) = replay(&path).unwrap();
         assert!(recs.is_empty());
-        assert_eq!(rep.reason.as_deref(), Some("mantıksız kayıt uzunluğu"));
+        assert_eq!(rep.reason.as_deref(), Some("implausible record length"));
     }
 
     #[test]
@@ -441,6 +447,6 @@ mod tests {
             let p = SyncPolicy::parse(s).unwrap();
             assert_eq!(SyncPolicy::parse(&p.label()).unwrap(), p);
         }
-        assert!(SyncPolicy::parse("saçma").is_none());
+        assert!(SyncPolicy::parse("nonsense").is_none());
     }
 }
