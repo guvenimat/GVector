@@ -73,8 +73,14 @@ olamaz. Replay ilk tutarsızlıkta durur ve dosyayı sağlam önekte keser.
 
 ## Kurulum ve kullanım
 
-Gereken: Rust (stable). Veri kümesi için SIFT-1M'i `data/sift/` altına açın
-(`sift_base.fvecs`, `sift_query.fvecs`, `sift_groundtruth.ivecs`).
+Gereken: Rust (stable). Gerçek ölçümler için SIFT-1M'i `data/sift/` altına
+açın (`sift_base.fvecs`, `sift_query.fvecs`, `sift_groundtruth.ivecs`).
+
+Veri kümesi yoksa `report` rastgele vektörlere düşer ve bunu uyararak
+söyler — böylece indirmeden de koşturabilirsiniz. Ama **rastgele veride
+recall rakamları SIFT sonuçlarıyla karşılaştırılamaz**: rastgele yüksek
+boyutlu veri ANN için en kötü durumdur, gerçek gömme vektörlerinin sahip
+olduğu kümelenme yapısı yoktur.
 
 ```bash
 cargo build --release
@@ -86,7 +92,7 @@ cargo test --release
 
 ### Ölçümleri koşturma
 
-En hızlı başlangıç — parametre süpürmesi (SIFT gerektirmez, birkaç dakika):
+En hızlı başlangıç — parametre süpürmesi (veri kümesi olmadan da koşar):
 
 ```bash
 cargo run --release --bin report -- sweep 10000 128

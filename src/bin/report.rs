@@ -779,15 +779,36 @@ fn main() {
         | "postingcost" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
-            let mut f = std::io::BufReader::new(
-                std::fs::File::open("data/sift/sift_base.fvecs").expect("data/sift yok mu?"),
-            );
-            let base = read_fvecs_subset(&mut f, n).expect("base okunamadı");
-            let mut fq = std::io::BufReader::new(
-                std::fs::File::open("data/sift/sift_query.fvecs").expect("query dosyası"),
-            );
-            let queries = read_fvecs_subset(&mut fq, n_query).expect("query okunamadı");
-            (base, queries, format!("SIFT alt küme n={n}"))
+            // SIFT yoksa PANİK YERİNE rastgele veriye düşülür: projeye yeni
+            // bakan biri 1 GB'lık veri kümesini indirmeden bir ölçüm
+            // koşturabilmeli. Düşüş SESSİZ DEĞİL — recall rakamları gerçek
+            // veriyle karşılaştırılamaz, o yüzden uyarı basılır ve etiket
+            // "random" olur.
+            match std::fs::File::open("data/sift/sift_base.fvecs") {
+                Ok(bf) => {
+                    let mut f = std::io::BufReader::new(bf);
+                    let base = read_fvecs_subset(&mut f, n).expect("base okunamadı");
+                    let mut fq = std::io::BufReader::new(
+                        std::fs::File::open("data/sift/sift_query.fvecs").expect("query dosyası"),
+                    );
+                    let queries = read_fvecs_subset(&mut fq, n_query).expect("query okunamadı");
+                    (base, queries, format!("SIFT alt küme n={n}"))
+                }
+                Err(_) => {
+                    eprintln!(
+                        "UYARI: data/sift bulunamadı → rastgele vektörlerle koşuluyor.
+                         Rastgele veride recall rakamları SIFT sonuçlarıyla karşılaştırılamaz
+                         (rastgele yüksek boyutlu veri ANN için en kötü durumdur).
+                         Gerçek ölçüm için SIFT-1M'i data/sift/ altına açın."
+                    );
+                    let dim = 128;
+                    (
+                        random_vectors(n, dim, DEFAULT_SEED),
+                        random_vectors(n_query, dim, DEFAULT_SEED + 1),
+                        format!("random n={n} (SIFT yok)"),
+                    )
+                }
+            }
         }
         _ => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
