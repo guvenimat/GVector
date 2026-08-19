@@ -1,5 +1,77 @@
 # Mimari Kararlar
 
+## Aşama 9c — metadata bellek sıkıştırması (KARARLAR) — 2026-08-19
+
+### 64. Posting listeleri: `HashSet<VectorId>` → sıralı `Vec<VectorId>`
+Mühürlü segmentlerde küme değişmiyor; üyelik ikili aramayla O(log n) ve
+id başına tam 8 byte tutuluyor (`HashSet`'te 16 + doluluk payı + tablo
+başlığı). Kazanç beklenenden küçük çıktı (353 → 299 MB): baskın terim
+kümelerin İÇİ değil, **ayrı (alan, değer) anahtarı sayısı** — sayısal
+alanların her ayrık değeri bir posting girdisi üretiyor ve dış `HashMap`
+hakim. Doğru kalem doğru çözüldü, ama kalemin iç dağılımı tahminden
+farklıydı.
+
+**Bilinen maliyet (ölçüldü):** sıralı `Vec`'e ekleme O(n) kaydırma yapar.
+id'ler artan sırada gelirse konum daima sondadır (O(1)); rastgele sırada
+**8.8x** yavaşlar (200K tek listede 144 ms → 1.27 s). O(n²) büyümesi bu
+boyutta ısırmıyor çünkü liste (1.6 MB) önbelleğe sığıyor; 1M'lik TEK
+liste ~30 s eder. Kabul edildi: o seçicilikte (tek değere milyonlarca
+kayıt) tarama kolu zaten devreye girmez.
+
+### 65. id→metadata: şema tabanlı kompakt temsil (`MetaStore`)
+Kayıt başına `HashMap<String, MetaValue>` yerine: alan adları BİR KEZ
+sözlükte (u32 id), kayıt gövdesi `Box<[(u32, MetaValue)]>`. `Box<[T]>`
+seçildi çünkü kapasite payı yok ve başlığı `Vec`'ten 8 byte küçük. Alan
+sayısı kayıt başına bir avuç olduğu için arama DOĞRUSAL — o boyutta hash
+tablosu kurmak kazandırmaz, sorunun kendisi zaten oydu.
+
+**421 → 158 MB (2.7x)**, 9c'nin asıl kazancı. Koşul mantığı tek yerde
+tutuldu (`Predicate::matches_with`, erişim yolundan bağımsız), yoksa iki
+depo iki ayrı filtre koduna dönüşürdü.
+
+### 66. `metadata_memory_bytes()` SİSTEMATİK olarak eksik gösteriyor
+9c-0 doğrulamasında üç kalemin ÜÇÜNDE DE aynı yönde saptı (toplam 0.77x).
+Rastgele hata olsaydı yön karışık olurdu. Muhtemel sebep: allocator
+overhead'i ve `HashMap`'in boş bucket'ları sayılmıyor.
+
+Düzeltmek kapsam dışı bırakıldı, ama kayda geçiyor: **aynı fonksiyon
+`/stats`'ta da kullanılıyor**, yani kullanıcıya sistematik olarak DÜŞÜK
+bellek rakamı gösteriliyor. Kullanan biri kapasite planlaması yaparsa
+gerçek kullanım gösterilenin ~1.3 katı olacak.
+
+### 67. Sayısal indeksler ERTELENDİ — gerekçe bellek payı değil, risk/kazanç
+197 MB (gerçek ölçüm), metadata toplamının ~%16'sı. Dokunulmadı.
+
+Gerekçe **bellek payı değil**: o yapı (`BTreeMap` + histogram) filtre
+planlayıcısının **kesin-sayım kolunu** besliyor — projedeki en incelikli
+doğruluk mekanizmasının altında duruyor. Kapanışa giderken en riskli
+bileşene el atmak yanlış zamanlama.
+
+**Yeniden bakma koşulu:** bellek gerçekten sınırlayıcı olursa VE aynı
+turda kesin-sayım kolunun regresyon testleri güçlendirilebilirse.
+
+### 68. Kalan pay hâlâ eşiğin üstünde: bir sonraki adım yazıldı ve ERTELENDİ
+Gerçek pay %41.0 → **%33.3** (eşik %25). Kural gereği bir sonraki adım
+yazılıp erteleniyor:
+
+**Sonraki adım — sayısal alanlar için Eq posting'i hiç tutmamak.** Kalan
+payın en büyük iki kalemi (posting'in dış `HashMap`'i ve sayısal
+indeksler) aynı kökten besleniyor: sayısal bir alanın her ayrık değeri
+HEM bir posting anahtarı HEM bir `BTreeMap` girdisi üretiyor. Range zaten
+sayısal indeksten karşılanıyor; sayısal Eq de oradan karşılanabilir. Bu
+bir optimizasyon değil, **tekrarın kaldırılması** olurdu.
+
+### 69. `with_capacity` regresyonu: tembel tahsis kayboldu
+#61'in `with_capacity` işi, eşiğin `usize::MAX` verildiği yerlerde
+(ölçüm/test: "pratikte mühürleme yok") **kapasite taşmasıyla panik**
+üretti — önceden tahsis tembeldi. Ayırma bayt cinsinden sınırlandı
+(512 MB); sınırın üstünde `Vec` eski kademeli büyümeye döner. Regresyon
+testi eklendi (`huge_seal_threshold_does_not_panic`).
+
+Ders: bir performans düzeltmesi, düzeltilen yolun DIŞINDAKİ uç
+girdilerin davranışını değiştirebilir.
+
+
 ## Aşama 9a-2 — kriterlerin değerlendirmesi (KARARLAR) — 2026-08-19
 
 Ölçüm sonuçları BENCHMARKS'ta ve AYRI bir commit'te (ef2ce04). Bu bölüm
