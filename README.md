@@ -1,4 +1,4 @@
-# gvector
+# GVector
 
 A vector search engine written **from scratch** in Rust: HNSW graph, segment
 model, WAL-based persistence, metadata filtering, and a measurement-driven
