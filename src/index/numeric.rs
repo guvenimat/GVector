@@ -1,21 +1,24 @@
-//! Sayısal alan indeksi: Range koşulları için kardinalite tahmini + sınırlı
-//! sayım (DECISIONS #31).
+//! Numeric field index: cardinality estimation for Range predicates plus
+//! bounded counting (DECISIONS #31).
 //!
-//! İki bileşen, iki ayrı görev:
-//! - **Eşit genişlikli histogram (64 kova)**: büyük-kol ŝ tahmini. Tahmin
-//!   TEK SAYI DEĞİL [alt, üst] aralığıdır: tam içerilen kovalar alt sınırı,
-//!   sınır kovaları eklenince üst sınırı verir. Kova içi düzgün dağılım
-//!   varsayımı hiç yapılmaz — varsayım yerine belirsizlik açıkça taşınır,
-//!   planlayıcı muhafazakâr tarafı seçer.
-//! - **Değer-sıralı BTreeMap**: küçük-matches kararı tahminle DEĞİL,
-//!   `enumerate_up_to(limit)` ile verilir — limit+1 elemana kadar gerçek
-//!   sayım. Karar kesindir ve eşleşen id'ler tarama koluna bedavaya çıkar.
-//!   (Histogram-yalnız tasarımda küçük kol kararı tahmine kalırdı; sınırda
-//!   yanlış kol seçimi tam da kaçınmak istediğimiz patoloji.)
+//! Two components, two distinct jobs:
+//! - **Equal-width histogram (64 buckets)**: the ŝ estimate for the large arm.
+//!   The estimate is NOT A SINGLE NUMBER but an [lower, upper] interval: the
+//!   fully contained buckets give the lower bound, adding the boundary buckets
+//!   gives the upper one. No within-bucket uniformity is ever assumed —
+//!   instead of an assumption, the uncertainty is carried explicitly and the
+//!   planner picks the conservative side.
+//! - **Value-ordered BTreeMap**: the small-match decision is NOT made from an
+//!   estimate but via `enumerate_up_to(limit)` — a real count up to limit+1
+//!   elements. The decision is exact, and the matching ids fall out for free
+//!   for the scan arm. (In a histogram-only design the small-arm decision
+//!   would rest on an estimate; picking the wrong arm at the boundary is
+//!   exactly the pathology we want to avoid.)
 //!
-//! Bakım: insert/remove O(log distinct). Aralık dışı insert'te histogram
-//! %12.5 payla genişletilip sorted map'ten yeniden kurulur (O(distinct)) —
-//! pay, monoton artan değer akışında sürekli yeniden kurmayı amorti eder.
+//! Maintenance: insert/remove is O(log distinct). On an out-of-range insert
+//! the histogram is widened by 12.5% and rebuilt from the sorted map
+//! (O(distinct)) — the margin amortizes constant rebuilding under a
+//! monotonically increasing value stream.
 
 use crate::meta::ordered_bits;
 use crate::types::VectorId;
@@ -25,7 +28,7 @@ const BUCKETS: usize = 64;
 
 #[derive(Debug)]
 pub struct NumericFieldIndex {
-    /// değer(bits) → o değerdeki id'ler.
+    /// value(bits) → the ids at that value.
     sorted: BTreeMap<u64, Vec<VectorId>>,
     total: usize,
     lo: f64,
@@ -62,8 +65,9 @@ impl NumericFieldIndex {
         self.sorted.entry(ordered_bits(v)).or_default().push(id);
         self.total += 1;
         if v < self.lo || v > self.hi {
-            // Genişleme payı: sınıra tam oturtmak yerine %12.5 taşır —
-            // monoton akışta her insert'te yeniden kurulumu engeller.
+            // Widening margin: rather than fitting exactly to the boundary it
+            // overshoots by 12.5% — this avoids a rebuild on every insert under
+            // a monotone stream.
             let span = (self.hi - self.lo).max(v.abs().max(1.0) * 0.01);
             self.lo = self.lo.min(v - span * 0.125);
             self.hi = self.hi.max(v + span * 0.125);
@@ -82,7 +86,7 @@ impl NumericFieldIndex {
                     self.sorted.remove(&ordered_bits(v));
                 }
                 self.total -= 1;
-                // Aralık yalnız büyür; v her zaman [lo, hi] içindedir.
+                // The range only ever grows; v is always within [lo, hi].
                 let b = self.bucket(v);
                 self.hist[b] = self.hist[b].saturating_sub(1);
             }
@@ -91,10 +95,11 @@ impl NumericFieldIndex {
 
     fn rebuild_hist(&mut self) {
         self.hist.iter_mut().for_each(|c| *c = 0);
-        // bits → f64 geri dönüşü yerine kova ataması için değeri saklamak
-        // gerekirdi; bits monoton olduğundan kovayı bits uzayında hesaplamak
-        // eşdeğer SANILABİLİR ama eşit-genişlik f64 uzayında tanımlı.
-        // Bu yüzden değeri bits'ten geri çöz: ordered_bits tersinir.
+        // The alternative to converting bits → f64 would be storing the value
+        // alongside for bucket assignment. Since bits are monotone, computing
+        // the bucket in bits space MIGHT SEEM equivalent — but equal width is
+        // defined in f64 space. So decode the value back from bits:
+        // ordered_bits is invertible.
         for (&bits, ids) in &self.sorted {
             let v = Self::bits_to_f64(bits);
             let b = self.bucket(v);
@@ -111,8 +116,9 @@ impl NumericFieldIndex {
         f64::from_bits(b)
     }
 
-    /// [qlo, qhi] (kapalı aralık) için kardinalite ARALIĞI: (alt, üst).
-    /// Alt = tamamen içerilen kovaların toplamı; üst = + sınır kovaları.
+    /// The cardinality INTERVAL for [qlo, qhi] (closed range): (lower, upper).
+    /// Lower = sum of the fully contained buckets; upper = plus the boundary
+    /// buckets.
     pub fn estimate(&self, qlo: f64, qhi: f64) -> (usize, usize) {
         if self.total == 0 || qhi < self.lo || qlo > self.hi {
             return (0, 0);
@@ -128,9 +134,10 @@ impl NumericFieldIndex {
         (lower, lower + self.hist[b_lo] + self.hist[b_hi])
     }
 
-    /// [qlo, qhi] içindeki id'leri sayarak topla; `limit`'i aşarsa None.
-    /// Küçük-matches kararının kesin yolu: histogram sadece "büyük" derse
-    /// kullanılır, "küçük" kararı her zaman gerçek sayımdır.
+    /// Collects the ids within [qlo, qhi] by counting; returns None if the
+    /// count exceeds `limit`. This is the exact path for the small-match
+    /// decision: the histogram is only used when it says "large"; a "small"
+    /// verdict is always a real count.
     pub fn enumerate_up_to(&self, qlo: f64, qhi: f64, limit: usize) -> Option<Vec<VectorId>> {
         let mut out = Vec::new();
         for ids in self
@@ -146,7 +153,7 @@ impl NumericFieldIndex {
         Some(out)
     }
 
-    /// Sınırsız tam sayım (post-filter fallback'i için).
+    /// Unbounded full enumeration (for the post-filter fallback).
     pub fn enumerate_all(&self, qlo: f64, qhi: f64) -> Vec<VectorId> {
         self.sorted
             .range(ordered_bits(qlo)..=ordered_bits(qhi))
@@ -154,11 +161,11 @@ impl NumericFieldIndex {
             .collect()
     }
 
-    /// Hesaplanan bellek maliyeti (byte). BTreeMap düğüm ek yükü girdi
-    /// başına kaba bir sabitle modellenir; kesin değil ama tutarlı — 9c
-    /// eşiği oransal olduğu için bu yeterli (DECISIONS #40).
+    /// Computed memory cost (bytes). BTreeMap node overhead is modelled with
+    /// a rough per-entry constant; not exact but consistent — which suffices
+    /// because the 9c threshold is proportional (DECISIONS #40).
     pub fn memory_bytes(&self) -> usize {
-        const BTREE_ENTRY_OVERHEAD: usize = 48; // düğüm payı + anahtar
+        const BTREE_ENTRY_OVERHEAD: usize = 48; // node share + key
         let vec_headers = self.sorted.len() * std::mem::size_of::<Vec<VectorId>>();
         let ids = self.total * std::mem::size_of::<VectorId>();
         self.sorted.len() * BTREE_ENTRY_OVERHEAD + vec_headers + ids + self.hist.len() * 8
@@ -203,7 +210,7 @@ mod tests {
             let (l, u) = idx.estimate(lo, hi);
             assert!(
                 l <= truth && truth <= u,
-                "[{lo},{hi}]: {l} ≤ {truth} ≤ {u} değil"
+                "[{lo},{hi}]: {l} ≤ {truth} ≤ {u} does not hold"
             );
         }
     }
@@ -212,7 +219,7 @@ mod tests {
     fn enumerate_exact_and_limited() {
         let mut idx = NumericFieldIndex::new();
         for i in 0..100 {
-            idx.insert((i % 10) as f64, VectorId(i)); // tekrar eden değerler
+            idx.insert((i % 10) as f64, VectorId(i)); // repeated values
         }
         let ids = idx.enumerate_up_to(2.0, 3.0, 100).unwrap();
         assert_eq!(ids.len(), 20);
@@ -233,15 +240,15 @@ mod tests {
         assert_eq!(idx.len(), truth);
         let (l, u) = idx.estimate(f64::NEG_INFINITY, f64::INFINITY);
         assert!(l <= truth && truth <= u);
-        // histogram toplamı total ile eşit kalmalı
+        // the histogram sum must stay equal to total
         let hist_sum: usize = idx.hist.iter().sum();
         assert_eq!(hist_sum, truth);
     }
 
     #[test]
     fn monotonic_inserts_amortized_widening() {
-        // Genişleme payı sayesinde monoton akış patlamamalı (davranış testi:
-        // sadece doğruluk — histogram toplamı korunur).
+        // Thanks to the widening margin a monotone stream must not blow up
+        // (behavioural test: correctness only — the histogram sum is preserved).
         let mut idx = NumericFieldIndex::new();
         for i in 0..10_000 {
             idx.insert(i as f64, VectorId(i));

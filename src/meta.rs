@@ -1,18 +1,18 @@
 //! Metadata ve filtre modeli.
 //!
-//! Filtre stratejisi (gerekçe DECISIONS.md #26): eşleşmeyen node'lar HNSW
-//! gezintisinde ziyaret edilir ama sonuç kümesine alınmaz — tombstone'larla
-//! aynı mekanizma. "Önce ara sonra filtrele" (post-filter) düşük seçicilikte
-//! k'dan az sonuç bırakır; "önce filtrele sonra ara" (pre-filter) ise graf
-//! bağlantılılığını koparır. Gezinti-içi filtre ikisinin de tuzağından kaçar;
-//! yine de sonuç k'nın altında kalırsa çağıran katman brute-force fallback
-//! çalıştırır (doğruluk garantisi).
+//! Filter strategy (rationale in DECISIONS.md #26): non-matching nodes are
+//! visited during HNSW traversal but not admitted into the result set — the
+//! same mechanism as tombstones. "Search first, filter after" (post-filter)
+//! leaves fewer than k results at low selectivity; "filter first, search
+//! after" (pre-filter) breaks graph connectivity. In-traversal filtering
+//! avoids both traps; and if the result still falls below k, the calling layer
+//! runs a brute-force fallback (correctness guarantee).
 
 use crate::types::VectorId;
 use std::collections::HashMap;
 
-/// Tek metadata değeri. Sayılar karşılaştırmalarda f64'e normalize edilir
-/// (Int(3) ile Float(3.0) aynı kabul edilir — kullanıcı sürprizi olmasın).
+/// A single metadata value. Numbers are normalized to f64 in comparisons
+/// (Int(3) and Float(3.0) are considered equal — no surprises for the user).
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(untagged)]
 pub enum MetaValue {
@@ -41,9 +41,9 @@ impl MetaValue {
 
 pub type Metadata = HashMap<String, MetaValue>;
 
-/// Posting-list anahtarı: `MetaValue`'nun hash'lenebilir izdüşümü.
-/// Float'lar tam sayıysa Int'e normalize edilir (Eq semantiğiyle tutarlı:
-/// Int(3) == Float(3.0)); değilse bit deseni kullanılır.
+/// Posting-list key: a hashable projection of `MetaValue`.
+/// Floats that are whole numbers are normalized to Int (consistent with the Eq
+/// semantics: Int(3) == Float(3.0)); otherwise the bit pattern is used.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum MetaKey {
     Bool(bool),
@@ -66,9 +66,9 @@ impl MetaValue {
     }
 }
 
-/// f64 → sıralamayı koruyan u64 (BTreeMap anahtarı için).
-/// Negatiflerde bitler ters çevrilir, pozitiflerde işaret biti set edilir;
-/// sonuç, f64 sıralamasıyla birebir aynı sıralanan bir tamsayıdır.
+/// f64 → order-preserving u64 (for use as a BTreeMap key).
+/// For negatives the bits are inverted, for positives the sign bit is set; the
+/// result is an integer that sorts exactly like the original f64.
 pub fn ordered_bits(x: f64) -> u64 {
     let b = x.to_bits();
     if b >> 63 == 1 {
@@ -79,9 +79,10 @@ pub fn ordered_bits(x: f64) -> u64 {
 }
 
 impl Filter {
-    /// Filtredeki Eq koşullarının posting-list anahtarları.
-    /// Kardinalite tahmini VE bağlacında bunların minimumudur (üst sınır);
-    /// Range koşulları tahmine katılmaz (histogramsız — DECISIONS #28).
+    /// The posting-list keys of the Eq predicates in the filter.
+    /// Under an AND conjunction, the cardinality estimate is the minimum of
+    /// these (an upper bound); Range predicates do not take part in the
+    /// estimate (no histogram — DECISIONS #28).
     pub fn eq_keys(&self) -> Vec<(&str, MetaKey)> {
         self.must
             .iter()
@@ -93,8 +94,8 @@ impl Filter {
     }
 }
 
-/// Tek koşul. `Range` uçları kapalıdır (min ≤ x ≤ max); tek uç için diğerine
-/// ±∞ verilebilir.
+/// A single predicate. `Range` endpoints are closed (min ≤ x ≤ max); for a
+/// one-sided range, pass ±∞ for the other end.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Predicate {
@@ -103,11 +104,12 @@ pub enum Predicate {
 }
 
 impl Predicate {
-    /// Değere ERİŞİM YOLUNDAN bağımsız değerlendirme.
+    /// Evaluation independent of HOW the value is accessed.
     ///
-    /// İki depo var: kullanıcıdan gelen ham `Metadata` (HashMap) ve içeride
-    /// tutulan kompakt `MetaStore` (9c). Koşul mantığı tek yerde kalsın diye
-    /// ikisi de buraya bir arama kapanışı veriyor.
+    /// There are two stores: the raw `Metadata` (a HashMap) coming from the
+    /// user, and the compact `MetaStore` kept internally (9c). So that the
+    /// predicate logic lives in exactly one place, both hand a lookup closure
+    /// to this function.
     fn matches_with<'a>(&self, get: impl Fn(&str) -> Option<&'a MetaValue>) -> bool {
         match self {
             Predicate::Eq { key, value } => get(key).is_some_and(|v| v.equals(value)),
@@ -122,8 +124,9 @@ impl Predicate {
     }
 }
 
-/// Koşulların VE bağlacı (boş filtre her şeyi geçirir).
-/// VEYA/negasyon bilinçli olarak yok: ihtiyaç çıkarsa ağaç yapısına genişletilir.
+/// The AND conjunction of predicates (an empty filter passes everything).
+/// OR/negation are deliberately absent: this would be extended to a tree
+/// structure if the need arose.
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
 pub struct Filter {
     pub must: Vec<Predicate>,
@@ -134,8 +137,8 @@ impl Filter {
         self.must.iter().all(|p| p.matches(meta))
     }
 
-    /// id → metadata deposu üzerinden slot bağımsız değerlendirme.
-    /// Metadata'sı hiç olmayan kayıtlar yalnız boş filtreden geçer.
+    /// Slot-independent evaluation over the id → metadata store.
+    /// Records with no metadata at all pass only the empty filter.
     pub fn matches_id(&self, store: &MetaStore, id: VectorId) -> bool {
         if self.must.is_empty() {
             return true;
@@ -149,17 +152,18 @@ impl Filter {
 
 /// id → metadata deposunun KOMPAKT temsili (9c, DECISIONS #65).
 ///
-/// Neden: kayıt başına `HashMap<String, MetaValue>` tutmak 1M'de 499 MB
-/// yiyordu (ölçüldü, BENCHMARKS 9c-0). Şişkinlik ağırlıkla HashMap'in
-/// KENDİSİNDE: her kayıt için tablo başlığı, bucket dizisi ve doluluk payı
-/// — string anahtarların tekrarında değil. Bu yüzden çözüm yalnız
-/// "anahtar interning" değil, kayıt temsilinin tamamen değişmesi:
+/// Why: keeping a `HashMap<String, MetaValue>` per record was consuming
+/// 499 MB at 1M (measured, BENCHMARKS 9c-0). The bloat is mostly in the
+/// HashMap ITSELF — a table header, a bucket array and load-factor slack per
+/// record — not in the repetition of the string keys. So the fix is not merely
+/// "key interning" but changing the record representation entirely:
 ///
-/// - Alan adları BİR KEZ sözlükte tutulur (`fields`), kayıtlar u32 id taşır.
-/// - Kayıt gövdesi `Box<[(u32, MetaValue)]>` — tam boyutlu, kapasite payı
-///   yok (`Vec`'in 24 byte'lık başlığı yerine 16 byte'lık fat pointer).
-/// - Alan sayısı kayıt başına bir avuç olduğu için arama DOĞRUSAL; bu
-///   boyutta ikili arama ya da hash tablosu kurmak kazandırmaz.
+/// - Field names are stored ONCE in a dictionary (`fields`); records carry a
+///   u32 id.
+/// - The record body is a `Box<[(u32, MetaValue)]>` — exactly sized, no
+///   capacity slack (a 16-byte fat pointer instead of `Vec`'s 24-byte header).
+/// - Lookup is LINEAR because there is a handful of fields per record; at that
+///   size neither binary search nor a hash table would pay off.
 #[derive(Debug, Default)]
 pub struct MetaStore {
     fields: Vec<String>,
@@ -167,7 +171,7 @@ pub struct MetaStore {
     records: HashMap<VectorId, Box<[(u32, MetaValue)]>>,
 }
 
-/// Tek kaydın okuma görünümü: alan adı → değer.
+/// Read view of a single record: field name → value.
 pub struct MetaRef<'a> {
     store: &'a MetaStore,
     rec: &'a [(u32, MetaValue)],
@@ -179,8 +183,8 @@ impl<'a> MetaRef<'a> {
         self.rec.iter().find(|(f, _)| *f == fid).map(|(_, v)| v)
     }
 
-    /// Ham `Metadata`'ya geri çevirir (silme yolu posting/sayısal indeksleri
-    /// güncellerken kaydın alan-değer çiftlerine ihtiyaç duyuyor).
+    /// Converts back to a raw `Metadata` (the delete path needs the record's
+    /// field-value pairs to update the posting and numeric indexes).
     pub fn to_metadata(&self) -> Metadata {
         self.rec
             .iter()
@@ -209,8 +213,8 @@ impl MetaStore {
             .into_iter()
             .map(|(k, v)| (self.field_id(&k), v))
             .collect();
-        // Alan id'sine göre sıralı: aynı şemadaki kayıtlar aynı düzende
-        // durur, karşılaştırma ve hata ayıklama öngörülebilir olur.
+        // Sorted by field id: records sharing a schema are laid out in the
+        // same order, which makes comparison and debugging predictable.
         rec.sort_by_key(|(f, _)| *f);
         self.records.insert(id, rec.into_boxed_slice());
     }
@@ -222,7 +226,7 @@ impl MetaStore {
         })
     }
 
-    /// Kaydı düşürür ve ham hâlini döndürür (silme yolu için).
+    /// Drops the record and returns its raw form (for the delete path).
     pub fn remove(&mut self, id: VectorId) -> Option<Metadata> {
         let rec = self.records.remove(&id)?;
         Some(
@@ -252,8 +256,8 @@ impl MetaStore {
         })
     }
 
-    /// Yaklaşık bellek kullanımı (bkz. 9c-0: bu tahminler SİSTEMATİK OLARAK
-    /// EKSİK gösteriyor, DECISIONS #66).
+    /// Approximate memory usage (see 9c-0: these estimates SYSTEMATICALLY
+    /// UNDER-REPORT, DECISIONS #66).
     pub fn memory_bytes(&self) -> usize {
         let dict: usize = self.fields.iter().map(|f| f.len() + 24).sum::<usize>()
             + self.field_ids.capacity() * (std::mem::size_of::<String>() + 4 + 8);
