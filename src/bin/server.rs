@@ -1,24 +1,25 @@
-//! HTTP API (axum) — SegmentedIndex'i dışa açar.
+//! HTTP API (axum) — exposes the SegmentedIndex.
 //!
-//! Eşzamanlılık modeli Aşama 5'in sözleşmesini HTTP'ye taşır: aramalar
-//! herhangi bir worker thread'inden `&self` ile koşar; TÜM yazmalar tek bir
-//! yazıcı task'ine mpsc kanalıyla sıralanır (SegmentedIndex'in tek-yazar
-//! sözleşmesi HTTP istemcileri çok olsa da korunur).
+//! The concurrency model carries phase 5's contract over to HTTP: searches run
+//! from any worker thread via `&self`, while ALL writes are serialized onto a
+//! single writer task through an mpsc channel (so SegmentedIndex's
+//! single-writer contract holds even with many HTTP clients).
 //!
-//! Uç noktalar:
+//! Endpoints:
 //!   POST   /vectors        {"id": 1, "vector": [...], "metadata": {"k": "v"}}
 //!   POST   /search         {"vector": [...], "k": 10, "filter": {"must": [...]}}
 //!   DELETE /vectors/{id}
-//!   POST   /checkpoint     (mühürle + snapshot + manifest takası)
+//!   POST   /checkpoint     (seal + snapshot + manifest swap)
 //!   GET    /stats
 //!
-//! Kullanım: cargo run --release --bin server -- [port] [dim] [data-dir] [sync]
-//! data-dir verilirse indeks kalıcıdır (açılışta manifest + WAL'dan kurtarılır).
-//! sync: none | per_op | group:<ms> (varsayılan group:20).
+//! Usage: cargo run --release --bin server -- [port] [dim] [data-dir] [sync]
+//! If data-dir is given the index is persistent (recovered from the manifest +
+//! WAL at startup). sync: none | per_op | group:<ms> (default group:20).
 //!
-//! HTTP 200 sözleşmesi (DECISIONS #36): yazma yanıtı, politikanın vaat ettiği
-//! dayanıklılık sağlandıktan SONRA döner. Yazıcı task'i komutları batch'ler,
-//! batch sonunda tek commit yapar, ancak ondan sonra yanıtları gönderir —
+//! The HTTP 200 contract (DECISIONS #36): a write response is returned only
+//! AFTER the durability the policy promises has been achieved. The writer task
+//! batches commands, performs a single commit at the end of the batch, and only
+//! then sends the responses —
 //! group commit budur.
 
 use axum::extract::{Path, State};
@@ -35,8 +36,8 @@ use vector_gvector::meta::{Filter, Metadata};
 use vector_gvector::storage::wal::SyncPolicy;
 use vector_gvector::types::VectorId;
 
-/// Yazıcı task'ine gönderilen komutlar. Yanıt oneshot ile geri döner —
-/// istemci, yazması gerçekten uygulanmadan 200 almaz.
+/// Commands sent to the writer task. The reply comes back over a oneshot —
+/// a client never receives a 200 before its write has actually been applied.
 enum WriteCmd {
     Insert {
         id: VectorId,
@@ -48,9 +49,9 @@ enum WriteCmd {
         id: VectorId,
         reply: oneshot::Sender<Result<(), IndexError>>,
     },
-    /// Checkpoint de bir yazma işidir (buffer'ı mühürler): tek yazar
-    /// sözleşmesi gereği aynı kuyruktan geçer, eşzamanlı insert'lerle
-    /// yarışmaz.
+    /// A checkpoint is a write operation too (it seals the buffer): under the
+    /// single-writer contract it goes through the same queue and never races
+    /// with concurrent inserts.
     Checkpoint {
         reply: oneshot::Sender<Result<u64, String>>,
     },
@@ -114,7 +115,7 @@ async fn insert_vector(
         .map_err(|_| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": "yazıcı kapalı" })),
+                Json(serde_json::json!({ "error": "writer is closed" })),
             )
         })?;
     match rx.await {
@@ -122,7 +123,7 @@ async fn insert_vector(
         Ok(Err(e)) => Err(index_error_response(e)),
         Err(_) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "yazıcı yanıt vermedi" })),
+            Json(serde_json::json!({ "error": "writer did not respond" })),
         )),
     }
 }
@@ -141,7 +142,7 @@ async fn delete_vector(
         .map_err(|_| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": "yazıcı kapalı" })),
+                Json(serde_json::json!({ "error": "writer is closed" })),
             )
         })?;
     match rx.await {
@@ -149,13 +150,14 @@ async fn delete_vector(
         Ok(Err(e)) => Err(index_error_response(e)),
         Err(_) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "yazıcı yanıt vermedi" })),
+            Json(serde_json::json!({ "error": "writer did not respond" })),
         )),
     }
 }
 
 async fn search(State(app): State<AppState>, Json(req): Json<SearchReq>) -> Json<Vec<SearchHit>> {
-    // Arama CPU işi: blocking havuzunda koş ki tokio worker'ları tıkanmasın.
+    // Search is CPU work: run it on the blocking pool so the tokio workers do
+    // not stall.
     let index = app.index.clone();
     let hits = tokio::task::spawn_blocking(move || {
         index
@@ -182,7 +184,7 @@ async fn checkpoint(
         .map_err(|_| {
             (
                 StatusCode::SERVICE_UNAVAILABLE,
-                Json(serde_json::json!({ "error": "yazıcı kapalı" })),
+                Json(serde_json::json!({ "error": "writer is closed" })),
             )
         })?;
     match rx.await {
@@ -193,7 +195,7 @@ async fn checkpoint(
         )),
         Err(_) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "yazıcı yanıt vermedi" })),
+            Json(serde_json::json!({ "error": "writer did not respond" })),
         )),
     }
 }
@@ -236,10 +238,10 @@ async fn main() {
                 10_000,
                 policy,
             )
-            .expect("indeks açılamadı");
+            .expect("could not open the index");
             let rep = idx.replay_report();
             println!(
-                "kalıcı mod: {} (generation={}, {} kayıt, sync={}, {:?})",
+                "persistent mode: {} (generation={}, {} records, sync={}, {:?})",
                 dir.display(),
                 idx.generation(),
                 idx.len_shared(),
@@ -248,7 +250,7 @@ async fn main() {
             );
             if rep.applied > 0 || rep.truncated_at.is_some() {
                 println!(
-                    "  WAL replay: {} kayıt uygulandı{}",
+                    "  WAL replay: {} records applied{}",
                     rep.applied,
                     match (&rep.reason, rep.truncated_at) {
                         (Some(r), Some(at)) => format!("; kuyruk {at} offsetinde kesildi ({r})"),
@@ -259,21 +261,21 @@ async fn main() {
             idx
         }
         None => {
-            println!("bellek-içi mod (data-dir verilmedi): veriler kalıcı DEĞİL");
+            println!("in-memory mode (no data-dir given): data is NOT persistent");
             SegmentedIndex::new(dim, Metric::L2, HnswParams::default(), 10_000)
         }
     });
 
-    // Tek yazıcı task'i: tüm mutasyonlar buradan sırayla geçer.
+    // The single writer task: every mutation passes through here in order.
     let (tx, mut rx) = mpsc::channel::<WriteCmd>(1024);
     {
         let index = index.clone();
-        // Mühürleme (HNSW inşası) saniyeler sürebilir: blocking thread'de koş.
+        // Sealing (HNSW construction) can take seconds: run it on a blocking thread.
         tokio::task::spawn_blocking(move || {
-            // Group commit: hazır bekleyen komutlar tek batch'te uygulanır,
-            // batch sonunda TEK commit yapılır ve yanıtlar ancak ondan sonra
-            // gönderilir. Böylece "200 = dayanıklı" sözleşmesi korunurken
-            // fsync maliyeti batch'e yayılır.
+            // Group commit: commands already waiting are applied as one batch,
+            // a SINGLE commit is performed at the end of the batch, and only
+            // then are the responses sent. This preserves the "200 = durable"
+            // contract while spreading the fsync cost across the batch.
             const MAX_BATCH: usize = 256;
             let mut pending: Vec<oneshot::Sender<Result<(), IndexError>>> = Vec::new();
             let mut results: Vec<Result<(), IndexError>> = Vec::new();
@@ -301,8 +303,8 @@ async fn main() {
                             pending.push(reply);
                         }
                         WriteCmd::Checkpoint { reply } => {
-                            // Checkpoint kendi dayanıklılığını sağlar; bekleyen
-                            // yazmaları önce commit et ki sıra bozulmasın.
+                            // A checkpoint provides its own durability; commit
+                            // the pending writes first so the ordering holds.
                             let _ = index.commit_wal();
                             for (tx, r) in pending.drain(..).zip(results.drain(..)) {
                                 let _ = tx.send(r);
@@ -314,8 +316,8 @@ async fn main() {
                 if !pending.is_empty() {
                     let commit = index.commit_wal();
                     for (tx, r) in pending.drain(..).zip(results.drain(..)) {
-                        // Commit başarısızsa yazma dayanıklı değildir: istemci
-                        // bunu 200 olarak görmemeli.
+                        // If the commit fails the write is not durable: the
+                        // client must not see this as a 200.
                         let _ = tx.send(match (&commit, r) {
                             (Err(e), _) => Err(IndexError::Storage(e.to_string())),
                             (Ok(()), r) => r,
@@ -323,7 +325,7 @@ async fn main() {
                     }
                 }
             }
-            // Kanal kapandı (graceful shutdown): kalanı dayanıklı yap.
+            // The channel closed (graceful shutdown): make the remainder durable.
             let _ = index.flush_wal();
         });
     }
@@ -341,18 +343,18 @@ async fn main() {
     println!("vector-gvector API dinliyor: http://{addr} (dim={dim})");
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     // Graceful shutdown: ctrl-c → yeni istek alma, bekleyenleri bitir,
-    // ardından WAL'ı zorla fsync'le. Kapanışta politika ne olursa olsun
-    // fsync yapılır — veri kaybetmenin bir faydası yok.
+    // then force an fsync of the WAL. On shutdown we fsync regardless of the
+    // policy — there is nothing to gain from losing data.
     let shutdown_index = index_for_shutdown;
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             let _ = tokio::signal::ctrl_c().await;
-            println!("\nkapanıyor: WAL flush ediliyor...");
+            println!("\nshutting down: flushing the WAL...");
         })
         .await
         .expect("serve");
     if let Err(e) = shutdown_index.flush_wal() {
-        eprintln!("WAL flush hatası: {e}");
+        eprintln!("WAL flush error: {e}");
     }
-    println!("temiz kapanış.");
+    println!("clean shutdown.");
 }
