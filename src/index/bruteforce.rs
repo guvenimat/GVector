@@ -1,8 +1,8 @@
-//! Brute-force (doğrusal tarama) indeksi.
+//! Brute-force (linear scan) index.
 //!
-//! Proje boyunca doğruluk referansı: her yeni indeks (HNSW vb.) buna karşı
-//! sınanır. Bu yüzden burada "akıllı" hiçbir şey yok — okunabilirlik ve
-//! doğruluk her şeyin önünde.
+//! The correctness reference for the whole project: every new index (HNSW and
+//! so on) is checked against it. That is why there is nothing "clever" here —
+//! readability and correctness come before everything else.
 
 use crate::distance::{normalize, Metric};
 use crate::index::{IndexError, VectorIndex};
@@ -11,20 +11,22 @@ use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::collections::HashMap;
 
-/// Kaç elemandan sonra aramayı rayon ile paralelleştireceğimiz eşiği.
-/// Küçük indekslerde thread dağıtım maliyeti taramanın kendisinden pahalı;
-/// eşik kabaca "tek çekirdeğin ~1 ms'de taradığı" boyut seçildi.
+/// The element count above which the search is parallelized with rayon.
+/// On small indexes the cost of distributing work across threads exceeds the
+/// scan itself; the threshold was chosen as roughly "what one core scans in
+/// ~1 ms".
 const PARALLEL_THRESHOLD: usize = 20_000;
 
 pub struct BruteForceIndex {
     metric: Metric,
     dim: usize,
-    /// Vektör verisi tek bitişik blokta (satır-major). `Vec<Vec<f32>>` yerine
-    /// düz blok: cache dostu tarama + vektör başına 24 byte Vec başlığı yok.
+    /// Vector data in one contiguous block (row-major). A flat block rather
+    /// than `Vec<Vec<f32>>`: cache-friendly scanning, and no 24-byte Vec
+    /// header per vector.
     data: Vec<f32>,
-    /// Slot -> dışa dönük id. `data`'daki i. vektörün sahibi `ids[i]`.
+    /// Slot -> external id. The i-th vector in `data` belongs to `ids[i]`.
     ids: Vec<VectorId>,
-    /// Dışa dönük id -> slot. Delete ve duplicate kontrolü O(1) olsun diye.
+    /// External id -> slot, so that delete and duplicate checks are O(1).
     slot_of: HashMap<VectorId, usize>,
 }
 
@@ -39,18 +41,18 @@ impl BruteForceIndex {
         }
     }
 
-    /// Kapasitesi ÖNCEDEN ayrılmış boş indeks (#61).
+    /// An empty index with capacity allocated UP FRONT (#61).
     ///
-    /// Yazma buffer'ı için: buffer mühürleme eşiğine kadar büyüyor ve
-    /// `Vec`'in kademeli büyümesi eşiğe yakın yerlerde ~64 MB'lık bir
-    /// realloc + memcpy'ye dönüşüyor — tek bir insert'in milisaniyelere
-    /// çıkması bunun belirtisi. Kapasite TAM boyutta ayrılır (büyüme payı
-    /// eklenmez): buffer zaten eşiğe varınca mühürleniyor, fazladan pay
-    /// realloc'u önlemez ama bellek zirvesini şişirir.
+    /// For the write buffer: the buffer grows up to the sealing threshold, and
+    /// near that threshold `Vec`'s incremental growth turns into a ~64 MB
+    /// realloc + memcpy — a single insert taking milliseconds is the symptom.
+    /// Capacity is allocated at the EXACT size (no growth margin): the buffer
+    /// is sealed as soon as it reaches the threshold, so extra margin would not
+    /// prevent a realloc, it would only inflate the memory peak.
     ///
-    /// ÜÇ yapı da ayrılır — yalnız vektör bloğu değil: `ids` ve `slot_of`
-    /// da kayıt sayısıyla büyüyor, `HashMap`'in yeniden hash'lenmesi de
-    /// aynı sınıfta bir sıçrama üretir.
+    /// ALL THREE structures are pre-allocated, not just the vector block:
+    /// `ids` and `slot_of` grow with the record count too, and rehashing the
+    /// `HashMap` produces a spike of the same class.
     pub fn with_capacity(dim: usize, metric: Metric, records: usize) -> Self {
         Self {
             metric,
@@ -69,14 +71,15 @@ impl BruteForceIndex {
         self.metric
     }
 
-    /// i. slottaki vektör dilimi.
+    /// The vector slice at slot i.
     #[inline]
     fn vector_at(&self, slot: usize) -> &[f32] {
         &self.data[slot * self.dim..(slot + 1) * self.dim]
     }
 
-    /// Verilen slot aralığını tarayıp yerel top-k heap'i döndürür.
-    /// Paralel ve seri yol aynı çekirdeği kullansın diye ayrık fonksiyon.
+    /// Scans the given slot range and returns a local top-k heap.
+    /// A separate function so that the parallel and serial paths share the same
+    /// core.
     fn scan_range(
         &self,
         query: &[f32],
@@ -99,8 +102,9 @@ impl BruteForceIndex {
         heap
     }
 
-    /// Filtreli doğrusal tarama: `allow(id)` geçenler arasında top-k.
-    /// Brute-force'ta filtre bedava — taramada atlanır, referans doğruluk kaynağı.
+    /// Filtered linear scan: top-k among those passing `allow(id)`.
+    /// Filtering is free in brute force — non-matches are skipped during the
+    /// scan, which makes this the reference source of truth.
     pub fn search_filtered(
         &self,
         query: &[f32],
@@ -126,18 +130,18 @@ impl BruteForceIndex {
         all
     }
 
-    /// id indekste kayıtlı mı?
+    /// Is this id present in the index?
     pub fn contains(&self, id: VectorId) -> bool {
         self.slot_of.contains_key(&id)
     }
 
-    /// id'nin (cosine'da normalize edilmiş) vektörü.
+    /// The vector for an id (normalized, under cosine).
     pub fn vector_of(&self, id: VectorId) -> Option<&[f32]> {
         self.slot_of.get(&id).map(|&s| self.vector_at(s))
     }
 
-    /// (id, vektör) çiftleri — segment mühürleme buffer'ı boşaltırken kullanır.
-    /// Cosine'da dönen vektörler normalize edilmiş halidir (idempotent).
+    /// (id, vector) pairs — used by segment sealing when draining the buffer.
+    /// Under cosine the returned vectors are already normalized (idempotent).
     pub fn entries(&self) -> impl Iterator<Item = (VectorId, &[f32])> {
         self.ids
             .iter()
@@ -145,11 +149,11 @@ impl BruteForceIndex {
             .map(|(slot, &id)| (id, self.vector_at(slot)))
     }
 
-    /// İndeksin yaklaşık bellek kullanımı (byte) — BENCHMARKS raporu için.
+    /// Approximate memory usage of the index (bytes) — for the BENCHMARKS report.
     pub fn memory_bytes(&self) -> usize {
         self.data.capacity() * std::mem::size_of::<f32>()
             + self.ids.capacity() * std::mem::size_of::<VectorId>()
-            // HashMap girdisi başına kaba tahmin: (key + value) * doluluk payı
+            // Rough estimate per HashMap entry: (key + value) * load-factor slack
             + self.slot_of.capacity() * (std::mem::size_of::<(VectorId, usize)>() + 8)
     }
 }
@@ -167,7 +171,7 @@ impl VectorIndex for BruteForceIndex {
         }
         let slot = self.ids.len();
         self.data.extend_from_slice(vector);
-        // Cosine politikası: normalizasyon insert anında, yerinde (bkz. DECISIONS.md)
+        // Cosine policy: normalize at insert time, in place (see DECISIONS.md)
         if self.metric.requires_normalization() {
             let start = slot * self.dim;
             normalize(&mut self.data[start..start + self.dim]);
@@ -181,7 +185,7 @@ impl VectorIndex for BruteForceIndex {
         if k == 0 || self.ids.is_empty() {
             return Vec::new();
         }
-        // Cosine sözleşmesinin query tarafı: aramada bir kez normalize et.
+        // The query side of the cosine contract: normalize once per search.
         let normalized_query;
         let query: &[f32] = if self.metric.requires_normalization() {
             normalized_query = crate::distance::normalized(query);
@@ -194,8 +198,8 @@ impl VectorIndex for BruteForceIndex {
         let mut heap = if n < PARALLEL_THRESHOLD {
             self.scan_range(query, k, 0..n)
         } else {
-            // Her rayon parçası kendi yerel top-k'sını üretir, sonra k'lık
-            // heap'ler birleştirilir: paylaşılan mutable durum yok, kilit yok.
+            // Each rayon chunk produces its own local top-k, then the k-sized
+            // heaps are merged: no shared mutable state, no locks.
             let chunk = n.div_ceil(rayon::current_num_threads().max(1));
             (0..n)
                 .into_par_iter()
@@ -219,15 +223,16 @@ impl VectorIndex for BruteForceIndex {
         while let Some(r) = heap.pop() {
             out.push(r);
         }
-        out.reverse(); // heap kötüden iyiye boşalır; artan mesafe istiyoruz
+        out.reverse(); // the heap drains worst-to-best; we want ascending distance
         out
     }
 
     fn delete(&mut self, id: VectorId) -> Result<(), IndexError> {
         let slot = self.slot_of.remove(&id).ok_or(IndexError::NotFound(id))?;
         let last = self.ids.len() - 1;
-        // swap-remove: son vektörü silinen slota taşı, O(1) silme.
-        // Brute-force'ta slot sırası anlam taşımadığı için güvenli.
+        // swap-remove: move the last vector into the deleted slot, O(1)
+        // deletion. Safe here because slot order carries no meaning in brute
+        // force.
         if slot != last {
             let (head, tail) = self.data.split_at_mut(last * self.dim);
             head[slot * self.dim..(slot + 1) * self.dim].copy_from_slice(&tail[..self.dim]);
@@ -326,7 +331,7 @@ mod tests {
         let res = idx.search(&[1.0, 0.0, 0.0], 2);
         assert_eq!(res.len(), 2);
         assert!(res.iter().all(|r| !r.distance.is_nan()));
-        assert_eq!(res[0].id, VectorId(1)); // gerçek eş, sıfır vektörden önce
+        assert_eq!(res[0].id, VectorId(1)); // the true match, ahead of the zero vector
     }
 
     #[test]
@@ -347,14 +352,14 @@ mod tests {
         assert_eq!(idx.len(), 10);
     }
 
-    /// Ana doğruluk testi: referans exact_top_k ile birebir aynı sonuç.
+    /// The main correctness test: results identical to the reference exact_top_k.
     #[test]
     fn matches_reference_exact_scan_all_metrics() {
         let vecs = random_vectors(500, 16, 42);
         let queries = random_vectors(20, 16, 43);
         for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
             let idx = build(&vecs, metric);
-            // referans tarafında cosine sözleşmesini elle uygula
+            // apply the cosine contract by hand on the reference side
             let base: Vec<Vec<f32>> = if metric.requires_normalization() {
                 vecs.iter()
                     .map(|v| crate::distance::normalized(v))
@@ -377,7 +382,7 @@ mod tests {
         }
     }
 
-    /// Paralel yol (n > eşik) seri yolla aynı sonucu vermeli.
+    /// The parallel path (n > threshold) must give the same result as the serial one.
     #[test]
     fn parallel_path_matches_serial() {
         let n = PARALLEL_THRESHOLD + 5_000;

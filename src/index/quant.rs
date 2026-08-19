@@ -1,19 +1,22 @@
-//! Scalar quantization (Aşama 6): f32 → u8, per-dimension min/max kalibrasyonu.
+//! Scalar quantization (phase 6): f32 → u8 with per-dimension min/max
+//! calibration.
 //!
-//! Tasarım: graf f32 hassasiyetle inşa edilir (inşa kalitesi tam hassasiyetten
-//! yararlanır), sonra `QuantizedHnsw::from_hnsw` ile DONDURULUR: vektör verisi
-//! u8 kodlara çevrilir, f32 kopyası atılır. Arama ADC (asymmetric distance
-//! computation) kullanır: query f32 kalır, kodlar mesafe hesabı sırasında
-//! anlık dequantize edilir — iki taraf birden quantize edilseydi hata iki kat
-//! birikirdi, ADC bunun yarısını bedavaya kurtarır.
+//! Design: the graph is built at f32 precision (build quality benefits from
+//! full precision), then FROZEN via `QuantizedHnsw::from_hnsw`: the vector data
+//! is converted to u8 codes and the f32 copy is dropped. Search uses ADC
+//! (asymmetric distance computation): the query stays f32 while the codes are
+//! dequantized on the fly during distance computation — had both sides been
+//! quantized, the error would accumulate twice; ADC saves half of it for free.
 //!
-//! Rerank YOK (saf quantization): gerekçe DECISIONS.md #23'te. Kısaca:
-//! per-dimension kalibrasyonla SIFT tipi veride recall kaybı zaten < 0.02
-//! hedefinin çok altında; diskten f32 okuyup yeniden sıralamak bir IO yolu,
-//! bir dosya formatı bağımlılığı ve latency belirsizliği ekler.
+//! There is NO rerank (pure quantization): the rationale is in DECISIONS.md
+//! #23. In short: with per-dimension calibration the recall loss on SIFT-like
+//! data is already far below the 0.02 target, whereas reading f32 from disk to
+//! re-rank would add an IO path, a file-format dependency and latency
+//! uncertainty.
 //!
-//! Donmuş indeks salt-okunurdur: insert/delete `Unsupported` döner. Segment
-//! modelinde (Aşama 5) doğal karşılığı "mühürlenmiş segmentin quantize hali"dir;
+//! A frozen index is read-only: insert/delete return `Unsupported`. In the
+//! segment model (phase 5) its natural counterpart is "the quantized form of a
+//! sealed segment";
 //! yazma zaten buffer'a gider.
 
 use crate::distance::Metric;
@@ -23,17 +26,17 @@ use crate::types::{SearchResult, VectorId};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
-/// Per-dimension doğrusal quantizer: `değer ≈ min[d] + scale[d] * kod`.
+/// Per-dimension linear quantizer: `value ≈ min[d] + scale[d] * code`.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ScalarQuantizer {
     mins: Vec<f32>,
-    /// (max-min)/255; sabit boyutlarda (max==min) 0 olur, kod hep 0 üretir
-    /// ve decode min'i döndürür — bilgi kaybı yok.
+    /// (max-min)/255; for constant dimensions (max==min) it becomes 0, the
+    /// code is always 0 and decoding returns min — no information is lost.
     scales: Vec<f32>,
 }
 
 impl ScalarQuantizer {
-    /// Kalibrasyon: veri kümesinin her boyutunda gözlenen min/max.
+    /// Calibration: the min/max observed in each dimension of the dataset.
     pub fn fit<'a>(vectors: impl Iterator<Item = &'a [f32]>, dim: usize) -> Self {
         let mut mins = vec![f32::INFINITY; dim];
         let mut maxs = vec![f32::NEG_INFINITY; dim];
@@ -61,8 +64,8 @@ impl ScalarQuantizer {
         self.mins.len()
     }
 
-    /// f32 → u8 kod. Aralık dışı değerler (kalibrasyon kümesi dışından gelen
-    /// query'lerde olabilir) uçlara kırpılır.
+    /// f32 → u8 code. Out-of-range values (possible for queries outside the
+    /// calibration set) are clamped to the endpoints.
     pub fn encode(&self, v: &[f32], out: &mut Vec<u8>) {
         debug_assert_eq!(v.len(), self.dim());
         out.extend(
@@ -78,19 +81,19 @@ impl ScalarQuantizer {
         );
     }
 
-    /// ADC mesafe: f32 query vs u8 kod, kod elemanları anlık dequantize edilir.
-    /// distance modülündeki "küçük = yakın" sözleşmesine uyar.
+    /// ADC distance: f32 query vs u8 code, with code elements dequantized on
+    /// the fly. Honours the "smaller = closer" contract of the distance module.
     ///
-    /// SIMD: dequantize (min + scale·kod) ve mesafe birikimi f32x8 şeritlerde;
-    /// u8→f32 dönüşümü 8'lik sabit boy diziyle yapılır ki derleyici cvt
-    /// komutlarına indirebilsin.
+    /// SIMD: dequantization (min + scale·code) and distance accumulation happen
+    /// in f32x8 lanes; the u8→f32 conversion goes through a fixed-size array of
+    /// 8 so the compiler can lower it to cvt instructions.
     #[inline]
     pub fn dist(&self, metric: Metric, query: &[f32], code: &[u8]) -> f32 {
         use wide::f32x8;
         debug_assert_eq!(query.len(), code.len());
         #[inline]
         fn f8(chunk: &[f32]) -> f32x8 {
-            f32x8::from(<[f32; 8]>::try_from(chunk).expect("8'lik parça"))
+            f32x8::from(<[f32; 8]>::try_from(chunk).expect("chunk of 8"))
         }
         #[inline]
         fn u8_to_f8(chunk: &[u8]) -> f32x8 {
@@ -131,8 +134,8 @@ impl ScalarQuantizer {
                 sum += q * x;
             }
         }
-        // Cosine sözleşmesi: kodlar normalize edilmiş vektörlerden üretildi,
-        // query'yi çağıran normalize eder → benzerlikler için -dot.
+        // Cosine contract: the codes were produced from normalized vectors and
+        // the caller normalizes the query → -dot for similarities.
         if l2 {
             sum
         } else {
@@ -141,13 +144,13 @@ impl ScalarQuantizer {
     }
 }
 
-/// Donmuş, quantize edilmiş HNSW: graf aynen, vektörler u8.
+/// A frozen, quantized HNSW: the graph unchanged, the vectors as u8.
 pub struct QuantizedHnsw {
     quantizer: ScalarQuantizer,
     metric: Metric,
     dim: usize,
     ef_search: usize,
-    /// Slot-major u8 kodlar (n * dim byte) — f32'nin 1/4'ü.
+    /// Slot-major u8 codes (n * dim bytes) — a quarter of f32.
     codes: Vec<u8>,
     ids: Vec<VectorId>,
     links: Vec<Vec<Vec<usize>>>,
@@ -157,9 +160,9 @@ pub struct QuantizedHnsw {
 }
 
 impl QuantizedHnsw {
-    /// f32 indeksten donmuş quantize kopya üretir. Kaynak indeks bırakılırsa
-    /// (drop) bellekte yalnızca kodlar kalır — "orijinal f32'yi tutma" kuralı
-    /// çağıranın kaynağı düşürmesiyle tamamlanır.
+    /// Produces a frozen quantized copy from an f32 index. If the source index
+    /// is dropped, only the codes remain in memory — the "do not keep the
+    /// original f32" rule is completed by the caller dropping the source.
     pub fn from_hnsw(src: &HnswIndex) -> Self {
         let dim = src.dim();
         let data = src.raw_vectors();
@@ -195,9 +198,10 @@ impl QuantizedHnsw {
         self.quantizer.dist(self.metric, query, self.code_at(slot))
     }
 
-    /// hnsw::search_layer'ın ADC'li ikizi. Bilinçli kopya: donmuş indeksin
-    /// arama yolu f32 indeksten bağımsız evrilebilsin diye (ve HnswIndex'i
-    /// storage üzerinden generic'leştirmenin karmaşıklığına değmediği için).
+    /// The ADC twin of hnsw::search_layer. A deliberate duplicate: so that the
+    /// search path of the frozen index can evolve independently of the f32
+    /// index (and because making HnswIndex generic over its storage was not
+    /// worth the complexity).
     fn search_layer(&self, query: &[f32], entry: usize, ef: usize, level: usize) -> Vec<Cand> {
         let mut visited = vec![false; self.links.len()];
         let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
@@ -258,8 +262,8 @@ impl QuantizedHnsw {
         let top = self.links[entry].len() - 1;
         let mut ep = entry;
         for level in (1..=top).rev() {
-            // inişte ef=1; tombstone'lar waypoint olabilir diye results yerine
-            // en yakın gezilen aday üzerinden ilerliyoruz
+            // ef=1 while descending; since tombstones can act as waypoints we
+            // advance via the nearest visited candidate rather than results
             let step = self.search_layer(query, ep, 1, level);
             if let Some(best) = step.first() {
                 ep = best.slot;
@@ -273,7 +277,7 @@ impl QuantizedHnsw {
             .collect()
     }
 
-    /// (kod belleği, graf belleği) byte.
+    /// (code memory, graph memory) in bytes.
     pub fn memory_bytes(&self) -> (usize, usize) {
         let link_bytes: usize = self
             .links
@@ -293,7 +297,7 @@ impl QuantizedHnsw {
 impl VectorIndex for QuantizedHnsw {
     fn insert(&mut self, _id: VectorId, _vector: &[f32]) -> Result<(), IndexError> {
         Err(IndexError::Unsupported(
-            "quantize indeks donmuştur; yazma segment buffer'ına gider",
+            "a quantized index is frozen; writes go to the segment buffer",
         ))
     }
 
@@ -302,7 +306,7 @@ impl VectorIndex for QuantizedHnsw {
     }
 
     fn delete(&mut self, _id: VectorId) -> Result<(), IndexError> {
-        Err(IndexError::Unsupported("quantize indeks donmuştur"))
+        Err(IndexError::Unsupported("a quantized index is frozen"))
     }
 
     fn len(&self) -> usize {
@@ -323,12 +327,12 @@ mod tests {
         for v in &vecs {
             let mut code = Vec::new();
             quant.encode(v, &mut code);
-            // ADC ile kendine mesafe, adım payından (scale/2)² * dim küçük olmalı
+            // the ADC self-distance must stay below the step margin (scale/2)² * dim
             let d = quant.dist(Metric::L2, v, &code);
             let bound: f32 = quant.scales.iter().map(|s| (s / 2.0) * (s / 2.0)).sum();
             assert!(
                 d <= bound * 1.01,
-                "quantization hatası sınır aşımı: {d} > {bound}"
+                "quantization error exceeds the bound: {d} > {bound}"
             );
         }
     }
@@ -420,7 +424,7 @@ mod tests {
         let q_recall = q_hits as f64 / 500.0;
         assert!(
             f32_recall - q_recall < 0.02,
-            "quantization recall kaybı çok büyük: {f32_recall} -> {q_recall}"
+            "quantization recall loss too large: {f32_recall} -> {q_recall}"
         );
     }
 }
