@@ -1,9 +1,9 @@
 #![deny(unsafe_code)]
-//! Sıfırdan yazılmış bir vektör arama motoru.
+//! A vector search engine written from scratch.
 //!
-//! Modül sınırları bilinçli olarak indekslerden bağımsız tutuldu:
-//! `distance`, `dataset` ve `eval` hem brute-force hem HNSW tarafından
-//! aynen kullanılacak, böylece aşamalar arası ölçümler karşılaştırılabilir kalır.
+//! The module boundaries are deliberately kept independent of the indexes:
+//! `distance`, `dataset` and `eval` are used verbatim by both brute-force and
+//! HNSW, so that measurements stay comparable across phases.
 
 pub mod dataset;
 pub mod distance;

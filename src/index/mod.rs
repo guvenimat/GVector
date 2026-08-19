@@ -1,7 +1,7 @@
-//! `VectorIndex` trait'i ve implementasyonları.
+//! The `VectorIndex` trait and its implementations.
 //!
-//! Aşama 1: `bruteforce` (doğruluk referansı, proje boyunca kalacak).
-//! Aşama 2: `hnsw`.
+//! Phase 1: `bruteforce` (the correctness reference, kept for the whole
+//! project). Phase 2: `hnsw`.
 
 pub mod bruteforce;
 pub mod hnsw;
@@ -14,41 +14,43 @@ use thiserror::Error;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum IndexError {
-    #[error("boyut uyuşmazlığı: indeks {expected} bekliyor, {got} geldi")]
+    #[error("dimension mismatch: index expects {expected}, got {got}")]
     DimensionMismatch { expected: usize, got: usize },
-    #[error("id zaten mevcut: {0:?}")]
+    #[error("id already exists: {0:?}")]
     DuplicateId(VectorId),
-    #[error("id bulunamadı: {0:?}")]
+    #[error("id not found: {0:?}")]
     NotFound(VectorId),
-    #[error("desteklenmiyor: {0}")]
+    #[error("unsupported: {0}")]
     Unsupported(&'static str),
-    /// WAL/disk yazımı başarısız. Write-ahead sırası gereği bu hata
-    /// döndüğünde mutasyon belleğe UYGULANMAMIŞTIR.
-    #[error("kalıcılık hatası: {0}")]
+    /// A WAL/disk write failed. Because of the write-ahead ordering, when this
+    /// error is returned the mutation has NOT been applied to memory.
+    #[error("persistence error: {0}")]
     Storage(String),
 }
 
-/// Tüm indeks implementasyonlarının ortak arayüzü.
+/// The common interface of every index implementation.
 ///
-/// Mutasyon imzaları `&mut self` — gerekçe (özet, tamamı DECISIONS.md'de):
-/// tekil bir indeks yapısı tek-yazar semantiğiyle en basit halinde kalır;
-/// Aşama 5'teki eşzamanlılık trait'e interior mutability gömerek değil,
-/// indeksin ÜSTÜNE bir katman (COW/arc-swap veya segment modeli) sarılarak
-/// eklenecek. Böylece algoritma kodu lock/atomics düşünmeden yazılıp test edilir.
+/// Mutating methods take `&mut self` — rationale (summary; the full version is
+/// in DECISIONS.md): a single index structure stays simplest under
+/// single-writer semantics. The concurrency introduced in phase 5 is not built
+/// by burying interior mutability in the trait, but by wrapping a layer ON TOP
+/// of the index (COW/arc-swap, or the segment model). That way the algorithm
+/// code is written and tested without thinking about locks or atomics.
 pub trait VectorIndex {
-    /// Vektörü verilen id ile ekler. Cosine metrikli indeksler vektörü
-    /// burada normalize etmekle yükümlüdür (bkz. distance modülü sözleşmesi).
+    /// Inserts a vector under the given id. Indexes with the cosine metric are
+    /// responsible for normalizing the vector here (see the contract in the
+    /// distance module).
     fn insert(&mut self, id: VectorId, vector: &[f32]) -> Result<(), IndexError>;
 
-    /// En yakın `k` sonucu artan mesafe sırasıyla döndürür.
-    /// `k > len()` ise mevcut tüm elemanları döndürür (hata değil).
-    /// Boş indekste boş vektör döner.
+    /// Returns the nearest `k` results in ascending distance order.
+    /// If `k > len()`, returns all available elements (not an error).
+    /// Returns an empty vector for an empty index.
     fn search(&self, query: &[f32], k: usize) -> Vec<SearchResult>;
 
-    /// Var olan bir kaydı siler; yoksa `NotFound` döner.
+    /// Deletes an existing record; returns `NotFound` if it does not exist.
     fn delete(&mut self, id: VectorId) -> Result<(), IndexError>;
 
-    /// Aranabilir (silinmemiş) eleman sayısı.
+    /// Number of searchable (non-deleted) elements.
     fn len(&self) -> usize;
 
     fn is_empty(&self) -> bool {

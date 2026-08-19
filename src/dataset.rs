@@ -1,39 +1,39 @@
-//! Veri seti yükleme: fvecs/ivecs (SIFT1M formatı), alt küme çıkarma,
-//! seed'li rastgele veri üretimi.
+//! Dataset loading: fvecs/ivecs (the SIFT1M format), subset extraction, and
+//! seeded random data generation.
 //!
-//! fvecs/ivecs formatı: her vektör `[d: u32 little-endian][d eleman]`
-//! şeklinde art arda dizilir; başka header yoktur. f32 ve i32 elemanlar
-//! da little-endian'dır.
+//! The fvecs/ivecs format: vectors are laid out back to back as
+//! `[d: u32 little-endian][d elements]`; there is no other header. The f32
+//! and i32 elements are little-endian as well.
 
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::io::{self, Read};
 use std::path::Path;
 
-/// Benchmark tekrarlanabilirliği için projedeki varsayılan seed.
+/// The project-wide default seed, for benchmark reproducibility.
 pub const DEFAULT_SEED: u64 = 42;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DatasetError {
-    #[error("io hatası: {0}")]
+    #[error("io error: {0}")]
     Io(#[from] io::Error),
-    #[error("bozuk dosya: {0}")]
+    #[error("malformed file: {0}")]
     Malformed(String),
 }
 
-/// fvecs dosyasını okur. Tüm vektörlerin aynı boyutta olmasını doğrular.
+/// Reads an fvecs file. Verifies that every vector has the same dimension.
 pub fn read_fvecs(path: &Path) -> Result<Vec<Vec<f32>>, DatasetError> {
     let bytes = std::fs::read(path)?;
     parse_fvecs(&bytes)
 }
 
-/// ivecs dosyasını okur (ground truth komşu id listeleri için).
+/// Reads an ivecs file (for ground-truth neighbour id lists).
 pub fn read_ivecs(path: &Path) -> Result<Vec<Vec<i32>>, DatasetError> {
     let bytes = std::fs::read(path)?;
     parse_ivecs(&bytes)
 }
 
-/// Bellekten fvecs ayrıştırma (test edilebilirlik için IO'dan ayrık).
+/// Parses fvecs from memory (kept separate from IO for testability).
 pub fn parse_fvecs(bytes: &[u8]) -> Result<Vec<Vec<f32>>, DatasetError> {
     parse_vecs(bytes, f32::from_le_bytes)
 }
@@ -42,7 +42,8 @@ pub fn parse_ivecs(bytes: &[u8]) -> Result<Vec<Vec<i32>>, DatasetError> {
     parse_vecs(bytes, i32::from_le_bytes)
 }
 
-// Ortak ayrıştırıcı: eleman tipi sadece 4 byte'tan değer üretme şeklinde ayrışır.
+// Shared parser: the element type differs only in how a value is built from
+// 4 bytes.
 fn parse_vecs<T>(
     mut bytes: &[u8],
     from_le: impl Fn([u8; 4]) -> T,
@@ -52,20 +53,20 @@ fn parse_vecs<T>(
     while !bytes.is_empty() {
         if bytes.len() < 4 {
             return Err(DatasetError::Malformed(
-                "boyut alanı için 4 byte kalmadı (kesik dosya)".into(),
+                "no 4 bytes left for the dimension field (truncated file)".into(),
             ));
         }
         let dim = u32::from_le_bytes(bytes[..4].try_into().expect("4 byte")) as usize;
         if dim == 0 || dim > 1 << 20 {
             return Err(DatasetError::Malformed(format!(
-                "mantıksız boyut alanı: {dim}"
+                "implausible dimension field: {dim}"
             )));
         }
         match expected_dim {
             None => expected_dim = Some(dim),
             Some(e) if e != dim => {
                 return Err(DatasetError::Malformed(format!(
-                    "tutarsız boyut: {e} beklenirken {dim} görüldü"
+                    "inconsistent dimension: expected {e}, saw {dim}"
                 )));
             }
             _ => {}
@@ -73,7 +74,7 @@ fn parse_vecs<T>(
         let need = 4 + dim * 4;
         if bytes.len() < need {
             return Err(DatasetError::Malformed(format!(
-                "vektör verisi kesik: {need} byte gerekli, {} kaldı",
+                "vector data truncated: {need} bytes needed, {} left",
                 bytes.len()
             )));
         }
@@ -87,28 +88,29 @@ fn parse_vecs<T>(
     Ok(out)
 }
 
-/// Reader üzerinden ilk `n` vektörü okur — 1M'lik dosyadan 10K/100K alt küme
-/// çıkarırken dosyanın tamamını belleğe almamak için.
+/// Reads the first `n` vectors from a reader — so that extracting a 10K/100K
+/// subset out of the 1M file does not pull the whole file into memory.
 pub fn read_fvecs_subset<R: Read>(reader: &mut R, n: usize) -> Result<Vec<Vec<f32>>, DatasetError> {
     let mut out = Vec::with_capacity(n);
     let mut dim_buf = [0u8; 4];
     for _ in 0..n {
         match reader.read_exact(&mut dim_buf) {
             Ok(()) => {}
-            // dosya n'den önce bitti: elde olanı döndür (alt küme isteği aşkın olabilir)
+            // the file ended before n: return what we have (the requested
+            // subset may be larger than the file)
             Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
         let dim = u32::from_le_bytes(dim_buf) as usize;
         if dim == 0 || dim > 1 << 20 {
             return Err(DatasetError::Malformed(format!(
-                "mantıksız boyut alanı: {dim}"
+                "implausible dimension field: {dim}"
             )));
         }
         let mut data = vec![0u8; dim * 4];
         reader
             .read_exact(&mut data)
-            .map_err(|_| DatasetError::Malformed("vektör verisi kesik (subset okuma)".into()))?;
+            .map_err(|_| DatasetError::Malformed("vector data truncated (subset read)".into()))?;
         out.push(
             data.chunks_exact(4)
                 .map(|c| f32::from_le_bytes(c.try_into().expect("4 byte")))
@@ -118,8 +120,9 @@ pub fn read_fvecs_subset<R: Read>(reader: &mut R, n: usize) -> Result<Vec<Vec<f3
     Ok(out)
 }
 
-/// Seed'li rastgele veri üreteci: `n` adet `dim` boyutlu, [-1, 1) bileşenli vektör.
-/// Aynı seed her zaman aynı veriyi üretir — benchmark tekrarlanabilirliği.
+/// Seeded random data generator: `n` vectors of `dim` dimensions with
+/// components in [-1, 1). The same seed always produces the same data —
+/// benchmark reproducibility.
 pub fn random_vectors(n: usize, dim: usize, seed: u64) -> Vec<Vec<f32>> {
     let mut rng = StdRng::seed_from_u64(seed);
     (0..n)
@@ -179,7 +182,7 @@ mod tests {
         let bytes = encode_fvecs(&vecs);
         let subset = read_fvecs_subset(&mut &bytes[..], 3).unwrap();
         assert_eq!(subset, vecs[..3]);
-        // istenen n eldekinden fazlaysa hepsi döner, hata olmaz
+        // if the requested n exceeds what is available, all are returned, not an error
         let all = read_fvecs_subset(&mut &bytes[..], 100).unwrap();
         assert_eq!(all.len(), 10);
     }

@@ -1,23 +1,23 @@
-//! Projenin ortak temel tipleri.
+//! Common core types of the project.
 
-/// Vektörlerin dıştan verilen kimliği.
+/// Externally supplied identifier of a vector.
 ///
-/// Newtype: çıplak `u64` yerine ayrı tip, id ile graf içi offset'lerin
-/// (ileride `usize` slot indeksleri) karışmasını derleme zamanında engeller.
+/// A newtype rather than a bare `u64`: a separate type prevents ids from being
+/// confused with in-graph offsets (later `usize` slot indexes) at compile time.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
 )]
 pub struct VectorId(pub u64);
 
-/// Sahipli vektör verisi. Boyut kontrolü indeksin sorumluluğunda;
-/// bu tip sadece taşıyıcı.
+/// Owned vector data. Dimension checking is the index's responsibility;
+/// this type is only a carrier.
 pub type Vector = Vec<f32>;
 
-/// Tek bir arama sonucu.
+/// A single search result.
 ///
-/// `distance` her zaman "küçük daha iyi" anlamındadır: L2 için gerçek mesafe,
-/// cosine/dot için negatiflenmiş benzerlik (bkz. `distance` modülü). Böylece
-/// sıralama mantığı metrikten bağımsız tek biçimde yazılır.
+/// `distance` always means "smaller is better": the true distance for L2, the
+/// negated similarity for cosine/dot (see the `distance` module). This keeps
+/// the ordering logic uniform and independent of the metric.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SearchResult {
     pub id: VectorId,
@@ -32,9 +32,10 @@ impl SearchResult {
 
 impl Eq for SearchResult {}
 
-// f32 NaN yüzünden Ord değildir; mesafe fonksiyonlarımız NaN üretmez
-// (sıfır vektör dahil, bkz. distance modülü) — total_cmp ile toplam sıralama
-// tanımlıyoruz ki BinaryHeap'te doğrudan kullanılabilsin.
+// f32 is not Ord because of NaN; our distance functions never produce NaN
+// (including for the zero vector, see the distance module) — so we define a
+// total order via total_cmp, which lets this type be used directly in a
+// BinaryHeap.
 impl PartialOrd for SearchResult {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         Some(self.cmp(other))

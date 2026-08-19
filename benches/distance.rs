@@ -1,5 +1,5 @@
-//! Mesafe fonksiyonları micro-benchmark'ı (criterion).
-//! Sabit seed'le üretilen 128-boyutlu vektörler — SIFT ile aynı boyut.
+//! Micro-benchmark of the distance functions (criterion).
+//! 128-dimensional vectors generated from a fixed seed — same dimension as SIFT.
 
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
 use vector_gvector::dataset::random_vectors;
@@ -20,7 +20,7 @@ fn bench_distances(c: &mut Criterion) {
         bch.iter(|| Metric::Cosine.distance(black_box(&an), black_box(&bn)))
     });
 
-    // ADC (quantize arama yolu) — f32 yollarla karşılaştırmak için
+    // ADC (the quantized search path) — for comparison against the f32 paths
     use vector_gvector::index::quant::ScalarQuantizer;
     let base = random_vectors(100, 128, 43);
     let quant = ScalarQuantizer::fit(base.iter().map(|v| v.as_slice()), 128);

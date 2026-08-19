@@ -1,8 +1,10 @@
-//! Ölçüm altyapısı: exact ground truth üretimi, recall@k, latency percentile'ları.
+//! Measurement infrastructure: exact ground-truth generation, recall@k, and
+//! latency percentiles.
 //!
-//! Buradaki `exact_top_k` bilinçli olarak indekslerden bağımsız, sade bir
-//! doğrusal taramadır: her aşamada indekslerin doğruluğunu sınayacak referans.
-//! (Aşama 1'deki brute-force indeks bunu kullanacak ama trait arkasında.)
+//! `exact_top_k` here is deliberately a plain linear scan, independent of the
+//! indexes: it is the reference against which index correctness is checked at
+//! every phase. (The brute-force index of phase 1 uses it, but behind the
+//! trait.)
 
 use crate::distance::Metric;
 use crate::types::{SearchResult, VectorId};
@@ -10,16 +12,18 @@ use rayon::prelude::*;
 use std::collections::BinaryHeap;
 use std::time::{Duration, Instant};
 
-/// Verilen taban kümede query'nin exact top-k'sını döndürür (artan mesafe).
-/// Cosine sözleşmesi: çağıran hem tabanı hem query'yi önceden normalize eder.
+/// Returns the exact top-k of a query over the given base set (ascending
+/// distance). Cosine contract: the caller normalizes both the base and the
+/// query beforehand.
 pub fn exact_top_k(
     base: &[Vec<f32>],
     query: &[f32],
     k: usize,
     metric: Metric,
 ) -> Vec<SearchResult> {
-    // Max-heap'te en KÖTÜ aday tepede durur; daha iyi bir aday gelince
-    // tepe atılır. Böylece bellek O(k), zaman O(n log k).
+    // In a max-heap the WORST candidate sits on top; when a better candidate
+    // arrives the top is popped. This keeps memory at O(k) and time at
+    // O(n log k).
     let mut heap: BinaryHeap<SearchResult> = BinaryHeap::with_capacity(k + 1);
     for (i, v) in base.iter().enumerate() {
         let d = metric.distance(query, v);
@@ -38,7 +42,7 @@ pub fn exact_top_k(
     out
 }
 
-/// Tüm query'ler için ground truth'u paralel üretir.
+/// Generates the ground truth for all queries in parallel.
 pub fn ground_truth(
     base: &[Vec<f32>],
     queries: &[Vec<f32>],
@@ -56,14 +60,16 @@ pub fn ground_truth(
         .collect()
 }
 
-/// recall@k: sonuçların ground truth ile kesişim oranı, query'ler üzerinden ortalama.
+/// recall@k: the intersection ratio of the results with the ground truth,
+/// averaged over queries.
 ///
-/// Payda `min(k, gt.len())` — küçük indekslerde (eleman sayısı < k) doğru
-/// sonuç dönen bir indeks 1.0 almalı, cezalandırılmamalı.
+/// The denominator is `min(k, gt.len())` — on a small index (fewer elements
+/// than k) an index that returns the correct results must score 1.0 rather
+/// than being penalized.
 pub fn recall_at_k(results: &[Vec<VectorId>], truth: &[Vec<VectorId>], k: usize) -> f64 {
-    assert_eq!(results.len(), truth.len(), "query sayıları uyuşmalı");
+    assert_eq!(results.len(), truth.len(), "query counts must match");
     if results.is_empty() {
-        return 1.0; // boş sorgu kümesinde tanım gereği kusursuz
+        return 1.0; // perfect by definition on an empty query set
     }
     let total: f64 = results
         .iter()
@@ -71,7 +77,7 @@ pub fn recall_at_k(results: &[Vec<VectorId>], truth: &[Vec<VectorId>], k: usize)
         .map(|(res, gt)| {
             let denom = k.min(gt.len());
             if denom == 0 {
-                return 1.0; // boş indeks: dönecek doğru sonuç yok
+                return 1.0; // empty index: there is no correct result to return
             }
             let gt_set: std::collections::HashSet<_> = gt.iter().take(k).collect();
             let hit = res.iter().take(k).filter(|id| gt_set.contains(id)).count();
@@ -81,7 +87,7 @@ pub fn recall_at_k(results: &[Vec<VectorId>], truth: &[Vec<VectorId>], k: usize)
     total / results.len() as f64
 }
 
-/// Latency ölçüm özeti.
+/// Summary of a latency measurement.
 #[derive(Debug, Clone)]
 pub struct LatencyStats {
     pub p50: Duration,
@@ -90,10 +96,10 @@ pub struct LatencyStats {
     pub samples: usize,
 }
 
-/// Bir kapanışı her query için tek tek zamanlayıp percentile hesaplar.
-/// Criterion micro-bench için; bu ise uçtan uca rapor içindir.
+/// Times a closure once per query and computes percentiles.
+/// Criterion is for micro-benchmarks; this one is for end-to-end reports.
 pub fn measure_latency<F: FnMut(&[f32])>(queries: &[Vec<f32>], mut f: F) -> LatencyStats {
-    assert!(!queries.is_empty(), "latency için en az bir query gerekli");
+    assert!(!queries.is_empty(), "latency needs at least one query");
     let mut times: Vec<Duration> = Vec::with_capacity(queries.len());
     for q in queries {
         let t = Instant::now();
@@ -167,7 +173,8 @@ mod tests {
 
     #[test]
     fn recall_small_index_not_penalized() {
-        // indekste 2 eleman varken k=10 istenirse ve ikisi de doğruysa recall 1.0
+        // with 2 elements in the index and k=10 requested, if both are correct
+        // the recall is 1.0
         let truth = vec![vec![VectorId(0), VectorId(1)]];
         let res = vec![vec![VectorId(0), VectorId(1)]];
         assert_eq!(recall_at_k(&res, &truth, 10), 1.0);
