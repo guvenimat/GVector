@@ -1,5 +1,77 @@
 # Benchmark Kayıtları
 
+## Aşama 9c — metadata bellek sıkıştırması (SONUÇLAR) — 2026-08-19
+
+### 9c-0: tahminin RSS ile doğrulanması
+
+Yapılar tek tek bırakılıp RSS farkı ölçüldü (`report -- memverify`).
+`clear()` değil, yapı yenisiyle DEĞİŞTİRİLDİ (clear kapasiteyi tutar).
+
+**Ölçüldü: 1.50M kayıtlı dizinde** (metadata taşıyan kayıt sayısı 1M;
+fazlası `mergewindow` koşularının metadata'sız kayıtları):
+
+| adım | RSS | düşüş | tahmin | tahmin/gerçek |
+|---|---|---|---|---|
+| başlangıç | 3088 MB | — | — | — |
+| −numeric | 2891 MB | 197 MB | 168 MB | 0.85x |
+| −postings | 2321 MB | 570 MB | 371 MB | 0.65x |
+| −metadata | 1822 MB | 499 MB | 441 MB | 0.89x |
+| **toplam** | | **1266 MB** | 980 MB | **0.77x** |
+
+**Gerçek metadata payı %41.0** (eşik %25 → GO ayakta).
+
+Sapma yönü: tahmin gerçeği EKSİK gösteriyor. "İşletim sistemi belleği geri
+vermedi" bunu açıklayamaz — o durumda gerçek düşüş daha KÜÇÜK görünürdü.
+Yani %41 bir ALT sınır ve GO kararı şişirilmiş bir tahmine dayanmıyordu.
+
+### 9c-1: uygulama sonrası
+
+Karşılaştırma AYNI tahmin ediciyle, AYNI 1M metadata kümesinde
+(`fullscale` bölüm 2 — kayıt sayısı normalizasyonu gerekmiyor, çünkü her
+iki koşuda da metadata taşıyan kayıt sayısı tam 1M):
+
+| kalem | önce | sonra | kazanç |
+|---|---|---|---|
+| harita (id→metadata) | 421 MB | **158 MB** | **2.7x** |
+| posting listeleri | 353 MB | **299 MB** | 1.2x |
+| sayısal indeksler | 160 MB | 160 MB | (dokunulmadı) |
+| **metadata toplam** | **934 MB** | **618 MB** | **−%34** |
+| metadata payı | %51.5 | **%45.9** | |
+
+Gerçek RSS (memverify, ölçüldü 1.23M kayıtlı dizinde): **3088 → 2504 MB**,
+gerçek metadata payı **%41.0 → %33.3**.
+
+Posting kazancının küçük kalmasının sebebi: baskın terim `HashSet`'lerin
+içi değil, **ayrı (alan, değer) anahtarı sayısı** — sayısal alanlar çok
+sayıda ayrık değer üretiyor, dış `HashMap`'in kendisi hakim.
+
+### Doğruluk ve maliyet (kabul kriterleri)
+
+| kriter | önce | sonra |
+|---|---|---|
+| kol örtüşmesi (fullscale / rangefilter) | 3/3, 13/13 | **3/3, 13/13 (%100)** |
+| filtre recall (13 hücre) | 1.000 (lv 0.1: 0.999) | **birebir aynı** |
+| 1M recall ef=100 | 0.9970 | **0.9970** (≥0.99 ✓) |
+| 1M inşa (metadata + WAL group:20) | 170.4 s | **120.4 s** |
+| metadata bakım payı (rangefilter 100K) | +%4 (9.9→10.2 s) | +%17 (4.9→5.7 s) |
+
+### Sıralı posting listesinin bilinen maliyeti
+
+`report -- postingcost 200000`: 200K kayıt TEK posting listesine.
+
+| id sırası | süre | kayıt/s |
+|---|---|---|
+| artan | 144.6 ms | 1.383.172 |
+| **rastgele** | **1.266 s** | **157.945** |
+
+Sıralı `Vec`'e ekleme O(n) kaydırma yapar. id'ler artan sırada gelirse
+konum daima sondadır (O(1)); rastgele sırada **8.8x** yavaşlar. 200K'da
+liste 1.6 MB, yani önbelleğe sığıyor ve kaydırma bellek bandı hızında —
+bu yüzden O(n²) büyümesi bu boyutta ısırmıyor. 1M'lik TEK liste kabaca
+30 s eder. Ölçümlerimiz id'leri hep artan sırada ürettiği için bu fark
+daha önce görünmüyordu.
+
+
 ## Aşama 9a-2 — `with_capacity` sonrası kriter 1 (ön-kayıt #61) — 2026-08-19
 
 Yalnız ölçüm sonuçları. `data/fullscale` sıfırdan kuruldu (1M, 8 segment),

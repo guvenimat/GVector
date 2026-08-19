@@ -31,7 +31,7 @@ use crate::index::bruteforce::BruteForceIndex;
 use crate::index::hnsw::{HnswIndex, HnswParams};
 use crate::index::numeric::NumericFieldIndex;
 use crate::index::{IndexError, VectorIndex};
-use crate::meta::{Filter, MetaKey, MetaValue, Metadata, Predicate};
+use crate::meta::{Filter, MetaKey, MetaStore, MetaValue, Metadata, Predicate};
 use crate::storage::wal::{self, ReplayReport, SyncPolicy, Wal, WalRecord};
 use crate::storage::{self, Manifest, SegmentRef, StorageError};
 use crate::types::{SearchResult, VectorId};
@@ -92,11 +92,18 @@ pub struct SegmentedIndex {
     ef_search: usize,
     /// id → metadata. Vektör verisinden ayrı tutulur: segmentler immutable
     /// ama metadata idare (silme, yeniden ekleme) id düzeyinde akar.
-    metadata: RwLock<HashMap<VectorId, Metadata>>,
-    /// Eq posting-list'leri: (alan, değer) → yaşayan id kümesi.
+    metadata: RwLock<MetaStore>,
+    /// Eq posting-list'leri: (alan, değer) → yaşayan id'lerin SIRALI listesi.
+    ///
+    /// 9c: `HashSet<VectorId>` yerine sıralı `Vec` (DECISIONS #64). 1M
+    /// ölçümünde posting'ler 570 MB ile en büyük metadata kalemiydi ve
+    /// şişkinlik `HashSet`'lerin kendisindeydi: her küme kendi tablosunu,
+    /// doluluk payını ve başlığını taşıyor. Sıralı `Vec` id başına tam
+    /// 8 byte tutar; üyelik ikili aramayla O(log n) — Eq kolunda yapılan
+    /// iş zaten listeyi baştan sona gezmek olduğu için bu yol kaybettirmiyor.
     /// Planlayıcının O(1) kardinalite tahmini ve tarama kolunun id kaynağı.
     /// Insert/delete'te bakımı yapılır; Range koşulları kapsam dışı (DECISIONS #28).
-    postings: RwLock<HashMap<(String, MetaKey), HashSet<VectorId>>>,
+    postings: RwLock<HashMap<(String, MetaKey), Vec<VectorId>>>,
     /// Sayısal alanlar için Range indeksi: histogram (ŝ aralığı) +
     /// değer-sıralı map (sınırlı sayım). Bkz. numeric modülü / DECISIONS #31.
     numeric: RwLock<HashMap<String, NumericFieldIndex>>,
@@ -314,6 +321,39 @@ impl SealContext {
     }
 }
 
+/// Buffer için önceden ayrılacak kayıt sayısı.
+///
+/// Eşik kadar yer ayırmak doğru davranış (#61: realloc sıçramasını kaldırır),
+/// ama eşik `usize::MAX` gibi "pratikte mühürleme yok" anlamında da
+/// kullanılıyor — o durumda ham eşik kadar ayırmak kapasite taşmasıyla
+/// PANİK veriyor. Bu yüzden ayırma bayt cinsinden sınırlanır: sınırın
+/// üstünde `Vec` eski kademeli büyüme davranışına döner (yalnız o uç
+/// durumda realloc sıçraması geri gelir, ki oradaki kullanım ölçüm/test).
+fn prealloc_records(seal_threshold: usize, dim: usize) -> usize {
+    const MAX_PREALLOC_BYTES: usize = 512 << 20;
+    let per_record = dim.max(1) * std::mem::size_of::<f32>();
+    seal_threshold.min(MAX_PREALLOC_BYTES / per_record)
+}
+
+/// Sıralı posting listesine ekleme (varsa dokunmaz).
+///
+/// `binary_search` konumu verir; `insert` ortadan kaydırma yapar. Kaydırma
+/// O(n) ama posting listeleri insert yolunda kayıt başına yalnız birkaç kez
+/// güncelleniyor ve `Vec` kaydırması bitişik bellekte memmove — ölçümde
+/// insert maliyeti kayda değer biçimde değişmedi (BENCHMARKS 9c).
+fn posting_insert(list: &mut Vec<VectorId>, id: VectorId) {
+    if let Err(pos) = list.binary_search(&id) {
+        list.insert(pos, id);
+    }
+}
+
+/// Sıralı posting listesinden çıkarma (yoksa dokunmaz).
+fn posting_remove(list: &mut Vec<VectorId>, id: VectorId) {
+    if let Ok(pos) = list.binary_search(&id) {
+        list.remove(pos);
+    }
+}
+
 /// Merge istatistikleri (arka plan thread'i günceller, okuyucular gözlemler).
 #[derive(Debug, Default)]
 struct MergeStats {
@@ -411,7 +451,7 @@ enum Arm {
     /// Bir koşulun eşleşmesi kesin sıfır — sonuç boş.
     Empty,
     /// Kesin küçük eşleşme kümesi: doğrudan tarama.
-    Scan(HashSet<VectorId>),
+    Scan(Vec<VectorId>),
     /// Filtresiz gezinti + over-fetch; ŝ üst-sınır tahmininden.
     Post {
         s_hat: f64,
@@ -422,7 +462,7 @@ enum Arm {
 }
 
 enum FallbackSource {
-    Ids(HashSet<VectorId>),
+    Ids(Vec<VectorId>),
     Range { key: String, lo: f64, hi: f64 },
 }
 
@@ -436,9 +476,13 @@ impl SegmentedIndex {
             seal_threshold: AtomicUsize::new(seal_threshold),
             segments: Arc::new(RwLock::new(Vec::new())),
             sealing: Arc::new(RwLock::new(Vec::new())),
-            buffer: RwLock::new(BruteForceIndex::with_capacity(dim, metric, seal_threshold)),
+            buffer: RwLock::new(BruteForceIndex::with_capacity(
+                dim,
+                metric,
+                prealloc_records(seal_threshold, dim),
+            )),
             ef_search,
-            metadata: RwLock::new(HashMap::new()),
+            metadata: RwLock::new(MetaStore::new()),
             postings: RwLock::new(HashMap::new()),
             numeric: RwLock::new(HashMap::new()),
             planner: PlannerConfig::default(),
@@ -548,10 +592,7 @@ impl SegmentedIndex {
     fn index_metadata(&self, id: VectorId, meta: Metadata) {
         let mut postings = self.postings.write().expect("kilit");
         for (key, value) in &meta {
-            postings
-                .entry((key.clone(), value.key()))
-                .or_default()
-                .insert(id);
+            posting_insert(postings.entry((key.clone(), value.key())).or_default(), id);
         }
         drop(postings);
         // Sayısal değerler Range indeksine de girer (Int/Float).
@@ -569,20 +610,20 @@ impl SegmentedIndex {
     /// (VE bağlacı için üst sınır — kesişim daha küçük olabilir, büyük olamaz).
     /// Eq koşulu yoksa None (Range için histogram tutmuyoruz).
     /// Dönen küme: en küçük posting listesi (tarama kolunun aday kaynağı).
-    fn estimate(&self, filter: &Filter) -> Option<(usize, HashSet<VectorId>)> {
+    fn estimate(&self, filter: &Filter) -> Option<(usize, Vec<VectorId>)> {
         let keys = filter.eq_keys();
         if keys.is_empty() {
             return None;
         }
         let postings = self.postings.read().expect("kilit");
-        let mut best: Option<&HashSet<VectorId>> = None;
+        let mut best: Option<&Vec<VectorId>> = None;
         for (k, mk) in keys {
             match postings.get(&(k.to_string(), mk)) {
                 // Herhangi bir Eq koşulunun hiç eşleşmesi yoksa sonuç boştur.
-                None => return Some((0, HashSet::new())),
-                Some(set) => {
-                    if best.is_none_or(|b| set.len() < b.len()) {
-                        best = Some(set);
+                None => return Some((0, Vec::new())),
+                Some(list) => {
+                    if best.is_none_or(|b| list.len() < b.len()) {
+                        best = Some(list);
                     }
                 }
             }
@@ -607,10 +648,10 @@ impl SegmentedIndex {
             return Arm::Empty;
         }
         let mut best_upper: Option<usize> = eq.as_ref().map(|(e, _)| *e);
-        let mut best_small: Option<HashSet<VectorId>> = eq
+        let mut best_small: Option<Vec<VectorId>> = eq
             .as_ref()
             .filter(|(e, _)| *e <= scan_limit)
-            .map(|(_, set)| set.clone());
+            .map(|(_, list)| list.clone());
         let mut range_fallback: Option<(String, f64, f64, usize)> = None;
         {
             let numeric = self.numeric.read().expect("kilit");
@@ -632,7 +673,7 @@ impl SegmentedIndex {
                         }
                         if best_small.is_none() && lower <= scan_limit {
                             if let Some(ids) = fi.enumerate_up_to(*min, *max, scan_limit) {
-                                best_small = Some(ids.into_iter().collect());
+                                best_small = Some(ids);
                             }
                         }
                     }
@@ -684,7 +725,7 @@ impl SegmentedIndex {
         &self,
         query: &[f32],
         k: usize,
-        candidates: &HashSet<VectorId>,
+        candidates: &[VectorId],
         filter: &Filter,
     ) -> Vec<SearchResult> {
         let normalized_query;
@@ -730,7 +771,7 @@ impl SegmentedIndex {
                 .filter(|&id| filter.matches_id(&meta, id))
                 .collect()
         } else {
-            candidates.iter().copied().collect()
+            candidates.to_vec()
         };
         // En yeni kaynaktan eskiye: yaşayan kopya her zaman en yeni konumda
         // (sil→yeniden-ekle zinciri buffer'a, oradan daha yeni segmente gider).
@@ -860,7 +901,7 @@ impl SegmentedIndex {
                             .read()
                             .expect("kilit")
                             .get(&key)
-                            .map(|fi| fi.enumerate_all(lo, hi).into_iter().collect())
+                            .map(|fi| fi.enumerate_all(lo, hi))
                             .unwrap_or_default(),
                     };
                     return self.scan_candidates(query, k, &candidates, filter);
@@ -943,7 +984,7 @@ impl SegmentedIndex {
             let fresh = BruteForceIndex::with_capacity(
                 self.dim,
                 self.metric,
-                self.seal_threshold.load(Ordering::Relaxed),
+                prealloc_records(self.seal_threshold.load(Ordering::Relaxed), self.dim),
             );
             std::mem::replace(&mut *buffer, fresh)
         };
@@ -1142,19 +1183,13 @@ impl SegmentedIndex {
     /// 9c eşiği bu hesaplanan değerlere göre değerlendirilir — RSS'te
     /// metadata ayrıştırılamaz (DECISIONS #40).
     pub fn metadata_memory_bytes(&self) -> (usize, usize, usize) {
-        let meta = self.metadata.read().expect("kilit");
-        // HashMap girdisi: anahtar(8) + iç HashMap başlığı(~48) + doluluk payı
-        let mut meta_bytes = meta.capacity() * (8 + 48 + 16);
-        for m in meta.values() {
-            meta_bytes += m.capacity() * (std::mem::size_of::<String>() + 32 + 16);
-            for k in m.keys() {
-                meta_bytes += k.len();
-            }
-        }
+        // 9c: kompakt temsil kendi boyutunu biliyor (sözlük + kayıt gövdeleri).
+        let meta_bytes = self.metadata.read().expect("kilit").memory_bytes();
         let postings = self.postings.read().expect("kilit");
         let mut post_bytes = postings.capacity() * 64;
-        for ((k, _), set) in postings.iter() {
-            post_bytes += k.len() + set.capacity() * (8 + 8);
+        for ((k, _), list) in postings.iter() {
+            // Sıralı Vec: id başına tam 8 byte (HashSet'te 16 + doluluk payı).
+            post_bytes += k.len() + list.capacity() * 8;
         }
         let numeric = self.numeric.read().expect("kilit");
         let num_bytes: usize = numeric
@@ -1162,6 +1197,23 @@ impl SegmentedIndex {
             .map(|(k, fi)| k.len() + fi.memory_bytes())
             .sum();
         (meta_bytes, post_bytes, num_bytes)
+    }
+
+    /// ÖLÇÜM KANCASI (9c-0): türetilmiş metadata yapılarını TEK TEK boşaltır.
+    ///
+    /// Neden var: `metadata_memory_bytes()` kaba tahminlerle çalışıyor
+    /// (capacity × sabit katsayı) ve 9c'nin GO kararı o tahmine dayanıyor.
+    /// Tahmini doğrulamanın yolu, yapıyı bırakıp RSS farkını ölçmek.
+    /// `clear()` YETMEZ (kapasiteyi tutar) — yapı yenisiyle DEĞİŞTİRİLİR.
+    ///
+    /// İndeksi kullanılamaz hale getirir; yalnız ölçüm modunda çağrılır.
+    pub fn clear_for_measurement(&self, what: &str) {
+        match what {
+            "numeric" => *self.numeric.write().expect("kilit") = HashMap::new(),
+            "postings" => *self.postings.write().expect("kilit") = HashMap::new(),
+            "metadata" => *self.metadata.write().expect("kilit") = MetaStore::new(),
+            other => panic!("bilinmeyen ölçüm kancası: {other}"),
+        }
     }
 
     /// Paylaşımlı (&self) silme — tek yazıcı thread'inden.
@@ -1198,11 +1250,11 @@ impl SegmentedIndex {
         if res.is_ok() {
             // Posting-list'ler yalnız yaşayan id'leri içerir: metadata'yı
             // düşürmeden önce anahtarlarını okuyup listelerden çıkar.
-            if let Some(meta) = self.metadata.write().expect("kilit").remove(&id) {
+            if let Some(meta) = self.metadata.write().expect("kilit").remove(id) {
                 let mut postings = self.postings.write().expect("kilit");
                 for (key, value) in &meta {
-                    if let Some(set) = postings.get_mut(&(key.clone(), value.key())) {
-                        set.remove(&id);
+                    if let Some(list) = postings.get_mut(&(key.clone(), value.key())) {
+                        posting_remove(list, id);
                     }
                 }
                 drop(postings);
@@ -1426,7 +1478,7 @@ impl SegmentedIndex {
             .read()
             .expect("kilit")
             .iter()
-            .map(|(id, m)| (*id, m.clone()))
+            .map(|(id, m)| (id, m.to_metadata()))
             .collect();
         let (metadata_file, metadata_crc) = if entries.is_empty() {
             (None, 0)
@@ -1948,6 +2000,17 @@ mod tests {
         );
         idx.wait_for_background();
         assert_eq!(idx.len_shared(), n, "backpressure altında veri kayboldu");
+    }
+
+    /// #61 regresyonu: buffer'ı eşik kadar ÖNCEDEN ayırmak, eşiğin
+    /// "pratikte mühürleme yok" anlamında `usize::MAX` verildiği yerlerde
+    /// kapasite taşmasıyla panik veriyordu. Ayırma bayt cinsinden sınırlı.
+    #[test]
+    fn huge_seal_threshold_does_not_panic() {
+        let idx = SegmentedIndex::new(128, Metric::L2, HnswParams::default(), usize::MAX);
+        let v = vec![0.1f32; 128];
+        idx.insert_shared(VectorId(1), &v).unwrap();
+        assert_eq!(idx.len_shared(), 1);
     }
 
     /// Aşırı seçici filtre (tek eşleşme): fallback doğrusal tarama devreye
@@ -2648,13 +2711,15 @@ mod tests {
         // yeniden say ve karşılaştır
         let meta_store = idx.metadata.read().unwrap();
         let postings = idx.postings.read().unwrap();
-        for ((key, mk), set) in postings.iter() {
-            let recount: HashSet<VectorId> = meta_store
+        for ((key, mk), list) in postings.iter() {
+            let mut recount: Vec<VectorId> = meta_store
                 .iter()
                 .filter(|(_, m)| m.get(key).is_some_and(|v| v.key() == *mk))
-                .map(|(&id, _)| id)
+                .map(|(id, _)| id)
                 .collect();
-            assert_eq!(*set, recount, "posting tutarsız: {key}/{mk:?}");
+            recount.sort();
+            // Sıralı olduğu da doğrulanıyor: ikili arama buna dayanıyor.
+            assert_eq!(*list, recount, "posting tutarsız: {key}/{mk:?}");
         }
         // tahmin, gerçek eşleşme sayısına eşit (tek Eq'de kesin)
         let f = Filter {

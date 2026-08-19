@@ -111,14 +111,13 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
 
     // Planlama maliyeti: O(n) metadata taraması bir sorgu planlayıcısına ne
     // kadar pahalı olurdu? Gerçekçi bir metadata haritası kurup tam sayım süresi.
-    let meta_store: std::collections::HashMap<VectorId, Metadata> = (0..n)
-        .map(|i| {
-            (
-                VectorId(i as u64),
-                [("b".to_string(), MetaValue::Int(i as i64))].into(),
-            )
-        })
-        .collect();
+    let mut meta_store = vector_gvector::meta::MetaStore::new();
+    for i in 0..n {
+        meta_store.insert(
+            VectorId(i as u64),
+            [("b".to_string(), MetaValue::Int(i as i64))].into(),
+        );
+    }
     let probe = Filter {
         must: vec![Predicate::Range {
             key: "b".into(),
@@ -303,6 +302,24 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
 
 /// Aşama 8: 1M uçtan uca gerçeklik ölçümü (tam sistem — segmented +
 /// planlayıcı + filtreler + WAL). Ön-kayıtlı eşikler: DECISIONS #40/#41.
+/// Süreç RSS'i (byte). Yeni bağımlılık eklemeden: PowerShell'den
+/// `WorkingSet64` okunur. Ölçüm adımları arasında birkaç kez çağrılıyor,
+/// ~200 ms'lik süreç başlatma maliyeti ölçümü etkilemiyor.
+fn rss_bytes() -> u64 {
+    let pid = std::process::id();
+    std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-Command",
+            &format!("(Get-Process -Id {pid}).WorkingSet64"),
+        ])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or(0)
+}
+
 fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric) {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -758,7 +775,8 @@ fn main() {
     let (base, queries, label) = match mode {
         "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter"
         | "segcurve" | "mergecost" | "rangefilter" | "durability" | "wal" | "fullscale"
-        | "int8scale" | "coldprofile" | "mergewindow" | "accumulation" => {
+        | "int8scale" | "coldprofile" | "mergewindow" | "accumulation" | "memverify"
+        | "postingcost" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -795,6 +813,110 @@ fn main() {
 
     if mode == "filter" {
         filter_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "postingcost" {
+        // 9c riski: sıralı Vec'e ekleme O(n) kaydırma yapar. id'ler ARTAN
+        // sırada gelirse ekleme daima sona düşer (O(1)); RASTGELE sırada
+        // gelirse O(n²)'ye döner. Ölçümlerimiz id'leri hep artan sırada
+        // ürettiği için bu fark görünmüyordu — burada kasten kırılıyor.
+        use rand::seq::SliceRandom;
+        use rand::SeedableRng;
+        use vector_gvector::index::segmented::SegmentedIndex;
+        use vector_gvector::meta::{MetaValue, Metadata};
+
+        let n = base.len().min(200_000);
+        println!("tek posting listesine {n} kayıt (hepsi aynı Eq değeri)");
+        println!();
+        println!("| id sırası | süre | kayıt/s |");
+        println!("|-----------|------|---------|");
+        for label in ["artan", "rastgele"] {
+            let mut ids: Vec<u64> = (0..n as u64).collect();
+            if label == "rastgele" {
+                let mut rng = rand::rngs::StdRng::seed_from_u64(DEFAULT_SEED);
+                ids.shuffle(&mut rng);
+            }
+            // Mühürleme kapalı: ölçülen şey posting bakımı, HNSW inşası değil.
+            let idx = SegmentedIndex::new(dim, metric, HnswParams::default(), usize::MAX);
+            let t = Instant::now();
+            for (i, id) in ids.iter().enumerate() {
+                let meta: Metadata = [("sabit".to_string(), MetaValue::Int(1))].into();
+                idx.insert_with_meta(VectorId(*id), &base[i % base.len()], meta)
+                    .expect("insert");
+            }
+            let el = t.elapsed();
+            println!("| {label} | {el:?} | {:.0} |", n as f64 / el.as_secs_f64());
+        }
+        return;
+    }
+
+    if mode == "memverify" {
+        // 9c-0: metadata bellek TAHMİNİNİ gerçek RSS ile doğrula.
+        //
+        // Yapılar sırayla bırakılır ve her adımda RSS ölçülür. Tahmin
+        // (capacity × sabit katsayı) ile gerçek fark karşılaştırılır.
+        // 9c'nin GO kararı (%51.5 pay) tahmine dayanıyor; tahmin büyük
+        // ölçüde saparsa 9c'nin kapsamı yeniden çizilmeli.
+        use vector_gvector::index::segmented::SegmentedIndex;
+        use vector_gvector::storage::wal::SyncPolicy;
+
+        let dir = std::path::PathBuf::from("data/fullscale");
+        if !dir.join("MANIFEST").exists() {
+            eprintln!("data/fullscale yok — önce `report -- fullscale 1000000 99` koş");
+            return;
+        }
+        let idx = SegmentedIndex::open_durable(
+            dir,
+            dim,
+            metric,
+            HnswParams::default(),
+            125_000,
+            SyncPolicy::None,
+        )
+        .expect("aç");
+        // Isınma: yapılara dokunulsun (lazy sayfa yüklemesi bitsin).
+        let _ = idx.search_shared(&queries[0], k);
+        let (m_est, p_est, n_est) = idx.metadata_memory_bytes();
+        let mb = |b: usize| b as f64 / 1e6;
+        let rss_mb = |b: u64| b as f64 / 1e6;
+        println!("kayıt: {}", idx.len_shared());
+        println!();
+        println!("| adım | RSS | düşüş | tahmin | tahmin/gerçek |");
+        println!("|------|-----|-------|--------|----------------|");
+        let r0 = rss_bytes();
+        println!("| başlangıç | {:.0} MB | — | — | — |", rss_mb(r0));
+        let mut prev = r0;
+        for (what, est) in [("numeric", n_est), ("postings", p_est), ("metadata", m_est)] {
+            idx.clear_for_measurement(what);
+            let now = rss_bytes();
+            let drop_b = prev.saturating_sub(now);
+            println!(
+                "| −{what} | {:.0} MB | **{:.0} MB** | {:.0} MB | {:.2}x |",
+                rss_mb(now),
+                rss_mb(drop_b),
+                mb(est),
+                est as f64 / (drop_b as f64).max(1.0)
+            );
+            prev = now;
+        }
+        let total_est = m_est + p_est + n_est;
+        let total_real = r0.saturating_sub(prev);
+        println!();
+        println!(
+            "TOPLAM: tahmin {:.0} MB, gerçek düşüş {:.0} MB → tahmin/gerçek {:.2}x",
+            mb(total_est),
+            rss_mb(total_real),
+            total_est as f64 / (total_real as f64).max(1.0)
+        );
+        println!(
+            "metadata payı (gerçek): {:.1}% (RSS {:.0} MB üzerinden)",
+            total_real as f64 / r0 as f64 * 100.0,
+            rss_mb(r0)
+        );
+        println!();
+        println!("NOT: serbest bırakılan bellek işletim sistemine hemen dönmeyebilir;");
+        println!("bu durumda gerçek düşüş OLDUĞUNDAN AZ görünür (tahmin lehine sapma).");
         return;
     }
 
