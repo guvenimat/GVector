@@ -814,8 +814,10 @@ fn main() {
 
         // WAL KAPALI: birikme ölçümü yazma yolunun İÇ dinamiğini ölçüyor;
         // WAL açıkken ilk denemede 120 s'de 4.3 GB log yazıldı ve disk/bellek
-        // ölçümü boğdu. Süre 60 s: birikme eğilimi ilk saniyelerde görünüyor.
-        let secs: u64 = 60;
+        // ölçümü boğdu. Süre ön-kayıt #59: 10 dakika. 2 dakikalık pencere
+        // segment sayısının merge tavanına ULAŞMASINA yetmiyordu, bu yüzden
+        // "tavana yaklaşma" eğrisi "monoton büyüme" olarak yanlış okundu.
+        let secs: u64 = 600;
         let seal = 125_000usize;
         let dir = std::path::PathBuf::from("data/accum");
         let _ = std::fs::remove_dir_all(&dir);
@@ -838,6 +840,9 @@ fn main() {
         let stop = AtomicBool::new(false);
         let written = AtomicUsize::new(0);
         let mut samples: Vec<usize> = Vec::new();
+        // #59: birincil kriter KUYRUK, segment ayrı kalem olarak izlenir.
+        let mut queue_samples: Vec<usize> = Vec::new();
+        let mut seg_samples: Vec<usize> = Vec::new();
         std::thread::scope(|sc| {
             let w = &written;
             let st = &stop;
@@ -861,7 +866,9 @@ fn main() {
                 let (segs, buf) = idx.shape();
                 let sealing = idx.sealing_count();
                 let total = written.load(Ordering::Relaxed);
-                samples.push(segs + sealing); // birikme = segment + mühürlenen
+                samples.push(segs + sealing); // ön-kayıt #49'un (kusurlu) metriği
+                queue_samples.push(sealing); // #59 birincil
+                seg_samples.push(segs); // #59 ikincil (merge tavanının testi)
                 println!(
                     "| {} | {segs} | {sealing} | {buf} | {} | {:.0} |",
                     t * 5,
@@ -897,9 +904,40 @@ fn main() {
             if peak <= 12 { "OK" } else { "AŞILDI" }
         );
         let verdict = growth <= 20.0 && peak <= 12;
+        // #59 BİRİNCİL: kuyruk sabit bir üst sınırda dengeleniyor mu?
+        let q_first = avg(&queue_samples[..third]);
+        let q_last = avg(&queue_samples[queue_samples.len() - third..]);
+        let q_peak = *queue_samples.iter().max().unwrap_or(&0);
+        let q_growth = if q_first > 0.0 {
+            (q_last / q_first - 1.0) * 100.0
+        } else {
+            0.0
+        };
+        let seg_peak = *seg_samples.iter().max().unwrap_or(&0);
+        println!();
+        println!("| #59 kalem | değer | eşik | sonuç |");
+        println!("|-----------|-------|------|-------|");
+        println!(
+            "| BİRİNCİL kuyruk: ilk 1/3 → son 1/3 | {q_first:.1} → {q_last:.1} ({q_growth:+.0}%) | dengelenir (monoton büyümez) | {} |",
+            if q_growth <= 20.0 { "OK" } else { "AŞILDI" }
+        );
+        println!("| BİRİNCİL kuyruk zirvesi | {q_peak} | sabit üst sınır | — |");
+        println!(
+            "| İKİNCİL segment (merge tavanının testi) | zirve {seg_peak} | ≤ 12 | {} |",
+            if seg_peak <= 12 { "OK" } else { "AŞILDI" }
+        );
         println!();
         println!(
-            "KRİTER 2 SONUCU: {}",
+            "#59 BİRİNCİL KRİTER: {}",
+            if q_growth <= 20.0 {
+                "KUYRUK DENGELENİYOR → 9a-2 bu kalemden geçti"
+            } else {
+                "KUYRUK BÜYÜYOR → karşılanmadı"
+            }
+        );
+        println!();
+        println!(
+            "(referans) ön-kayıt #49'un kusurlu metriği: {}",
             if verdict {
                 "DENGELENIYOR → 9a-2 backpressure'sız kabul edilebilir"
             } else {
@@ -910,6 +948,11 @@ fn main() {
         // ölçümün kendisinden kat kat uzun sürer (ilk denemede süreç yarım
         // saatlik kuyrukla asıldı) — ve zaten sorulan soru "birikiyor mu",
         // cevabı kuyruğun büyüklüğü.
+        let (stalls, stall_us) = idx.stall_stats();
+        println!(
+            "backpressure (#53): {stalls} insert bekletildi, toplam {:.1} s",
+            stall_us as f64 / 1e6
+        );
         println!(
             "ölçüm sonu: {} segment + {} mühürlenen (kuyruk boşaltılmadı)",
             idx.shape().0,
@@ -940,9 +983,20 @@ fn main() {
             metric,
             HnswParams::default(),
             125_000,
-            SyncPolicy::Group { window_ms: 20 },
+            // Ön-kayıtlı koşul: group:20 (Aşama 8 ile aynı). GVDB_DIAG_NOWAL=1
+            // yalnız TEŞHİS içindir: 6-10 ms'lik sıçramaların kaynağı fsync mi,
+            // yoksa yazma yolunun kendisi mi? Kabul kararı DAİMA ön-kayıtlı
+            // koşulun sonucuna göre verilir.
+            if std::env::var("GVDB_DIAG_NOWAL").is_ok() {
+                SyncPolicy::None
+            } else {
+                SyncPolicy::Group { window_ms: 20 }
+            },
         )
         .expect("aç");
+        if std::env::var("GVDB_DIAG_NOWAL").is_ok() {
+            println!("** TEŞHİS KOŞUSU: WAL sync kapalı — ön-kayıtlı koşul DEĞİL **");
+        }
         let (seg0, buf0) = idx.shape();
         println!(
             "başlangıç: {seg0} segment + {buf0} buffer, {} kayıt, tavan 8",
@@ -950,9 +1004,19 @@ fn main() {
         );
 
         // Warmup: birkaç bin yazma (taban p99'un ısınmış ölçülmesi için).
-        // Id tabanı mevcut kayıt sayısına göre kayar: dizin kalıcı olduğu
-        // için sabit taban ikinci koşuda DuplicateId panic'i veriyordu.
-        let base_id = 100_000_000u64 + idx.len_shared() as u64 * 4;
+        //
+        // Id tabanı: `data/fullscale` KALICI bir dizin, her koşu ona yazıyor.
+        // Taban kayıt sayısından türetilirse (önceki hali) koşular birikince
+        // aralıklar üst üste biner ve ölçüm DuplicateId ile patlar — nitekim
+        // patladı. Saat tabanlı taban her koşuya çakışmayan bir bölge verir.
+        // Determinizm zedelenmiyor: id'ler yalnız etiket, ölçülen büyüklükler
+        // (latency, pencere) id değerine bağlı değil; vektör verisi ve seed
+        // sabit kalıyor.
+        let base_id = 1_000_000_000u64
+            + std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64 % 500_000_000)
+                .unwrap_or(0);
         for i in 0..5_000usize {
             idx.insert_with_meta(
                 VectorId(base_id + i as u64),
@@ -975,6 +1039,19 @@ fn main() {
             lats.push(t.elapsed());
         }
         let wall = t_all.elapsed();
+        // 6 ms'lik sıçramanın KAYNAĞINI bulmak için: en yavaş 5 yazmanın
+        // sıra numarası, mühürlemenin düştüğü sıra numarasıyla karşılaştırılır.
+        // (Eşik değişmiyor; bu yalnız teşhis.) Mühürleme buffer eşiğine
+        // varınca olur, yani sıra numarası önceden hesaplanabilir.
+        let mut slowest: Vec<(usize, std::time::Duration)> =
+            lats.iter().copied().enumerate().collect();
+        slowest.sort_by(|a, b| b.1.cmp(&a.1));
+        let seal_at = idx.seal_threshold().saturating_sub(buf0);
+        println!();
+        println!("teşhis: mühürleme ~{seal_at}. yazmada; en yavaş 5 yazma:");
+        for (i, d) in slowest.iter().take(5) {
+            println!("  #{i} → {d:?}");
+        }
         idx.commit_wal().expect("commit");
 
         let mut sorted = lats.clone();

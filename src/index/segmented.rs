@@ -128,6 +128,10 @@ pub struct SegmentedIndex {
     /// Mühürleme istatistikleri (9a-2: arka planda) + devam eden sayısı.
     seal_stats: Arc<MergeStats>,
     seal_in_flight: Arc<AtomicUsize>,
+    /// Backpressure sayaçları (#53): kaç insert bekletildi ve toplam kaç µs.
+    /// Gözlem için: stall "sessiz" bir yavaşlama, ölçülemezse teşhis edilemez.
+    stall_count: AtomicU64,
+    stall_us: AtomicU64,
     /// Aynı anda en fazla bir merge; tavan yeniden aşılırsa worker döngüsü
     /// devam eder (sıraya alma) — yeni thread doğurulmaz.
     merge_in_flight: Arc<AtomicBool>,
@@ -213,6 +217,100 @@ impl MergeContext {
                 break;
             }
         });
+    }
+}
+
+/// Mühürleme worker'ının taşınabilir bağlamı (#53).
+///
+/// NEDEN TEK WORKER: ilk 9a-2 tasarımında `seal()` her çağrıda
+/// `thread::spawn` yapıyordu. 1M birikme ölçümünde 60 saniyede 35 mühürleme
+/// aynı anda koştu, 8 çekirdeği paylaştıkları için HİÇBİRİ bitemedi
+/// (segment sayısı 0'da kaldı), bellek 2.3 GB'a çıktı ve yazma hızı
+/// 273K → 11.7K op/s'ye çöktü (BENCHMARKS 9a-2, DECISIONS #52).
+/// Eşzamanlı inşa toplam işi azaltmıyor, yalnız hepsini yavaşlatıyor;
+/// sıralı tek worker aynı işi aynı sürede yapar ama her mühürleme SIRAYLA
+/// biter, yani kuyruk tüketilir ve bellek geri verilir.
+///
+/// `sealing` listesi kuyruğun kendisidir: worker daima BAŞTAKİ (en eski)
+/// elemanı işler — sıra korunur ve arama/delete yolları listeyi zaten
+/// gezdiği için ayrı bir kuyruk yapısına gerek yok.
+#[derive(Clone)]
+struct SealContext {
+    segments: Arc<RwLock<Vec<Arc<Segment>>>>,
+    sealing: Arc<RwLock<Vec<Arc<Sealing>>>>,
+    stats: Arc<MergeStats>,
+    in_flight: Arc<AtomicUsize>,
+    dim: usize,
+    metric: Metric,
+    params: HnswParams,
+    merge: MergeContext,
+}
+
+impl SealContext {
+    /// Worker çalışmıyorsa başlatır. Çalışıyorsa hiçbir şey yapmaz: worker
+    /// döngüsü kuyruk boşalana kadar devam eder (merge'deki kalıp).
+    fn spawn_if_needed(&self) {
+        if self.in_flight.swap(1, Ordering::SeqCst) == 1 {
+            return; // çalışan worker yeni elemanı görecek
+        }
+        let ctx = self.clone();
+        std::thread::spawn(move || loop {
+            // KİLİT ÖMRÜ: sıradaki eleman kendi ifadesinde alınır, guard
+            // o satırın sonunda düşer. `while let Some(x) = sealing.read()
+            // ...first().cloned()` YAZILMAZ: `while let`, `loop { match EXPR
+            // { ... } }` olarak desugar edilir ve match scrutinee'sinin
+            // geçicileri GÖVDE dahil tüm blok boyunca yaşar — yani read
+            // kilidi tutulurken `build_one` write kilidi ister ve worker
+            // kendini kilitler. (Rust 2024 bunu `if let` için düzeltti,
+            // `while let` hâlâ eski davranışta; edition yükseltmek kurtarmaz.)
+            // Düz `while COND` güvenlidir: koşulun geçicileri koşul
+            // değerlendirmesi biterken düşer — merge worker'ı bu yüzden sağlam.
+            loop {
+                let next = ctx.sealing.read().expect("kilit").first().cloned();
+                let Some(next) = next else { break };
+                ctx.build_one(&next);
+            }
+            ctx.in_flight.store(0, Ordering::SeqCst);
+            // Bayrağı bırakırken yeni mühürleme kuyruğa girmiş olabilir.
+            if ctx.sealing.read().expect("kilit").is_empty()
+                || ctx.in_flight.swap(1, Ordering::SeqCst) == 1
+            {
+                break;
+            }
+        });
+    }
+
+    /// Tek bir mühürlemeyi tamamlar: HNSW'yi KİLİTSİZ kurar, sonra tek write
+    /// kilidi altında segmentlere taşır ve inşa sırasında düşen tombstone'ları
+    /// diff-replay ile birleşiğe aktarır.
+    fn build_one(&self, sealing: &Arc<Sealing>) {
+        let t = std::time::Instant::now();
+        let mut p = self.params.clone();
+        p.seed = p.seed.wrapping_add(sealing.data.len() as u64);
+        let mut hnsw = HnswIndex::new(self.dim, self.metric, p);
+        for (id, v) in sealing.data.entries() {
+            hnsw.insert(id, v)
+                .expect("mühürleme insert'i başarısız olamaz");
+        }
+        let built = Arc::new(Segment {
+            index: hnsw,
+            tombstones: RwLock::new(HashSet::new()),
+            stored: RwLock::new(None),
+        });
+        {
+            let mut segs = self.segments.write().expect("kilit");
+            let mut seal_list = self.sealing.write().expect("kilit");
+            let carried = sealing.tombstones.read().expect("kilit").clone();
+            *built.tombstones.write().expect("kilit") = carried;
+            segs.push(Arc::clone(&built));
+            seal_list.retain(|s| !Arc::ptr_eq(s, sealing));
+        }
+        self.stats
+            .last_us
+            .store(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        self.stats.count.fetch_add(1, Ordering::Relaxed);
+        // Tavan bekçisi: yeni segment eklendi, gerekiyorsa merge tetikle.
+        self.merge.spawn_if_needed();
     }
 }
 
@@ -353,6 +451,8 @@ impl SegmentedIndex {
             merge_stats: Arc::new(MergeStats::default()),
             seal_stats: Arc::new(MergeStats::default()),
             seal_in_flight: Arc::new(AtomicUsize::new(0)),
+            stall_count: AtomicU64::new(0),
+            stall_us: AtomicU64::new(0),
             merge_in_flight: Arc::new(AtomicBool::new(false)),
             replay_report: RwLock::new(ReplayReport::default()),
         }
@@ -406,6 +506,10 @@ impl SegmentedIndex {
         }
         if should_seal {
             self.seal(); // tavan bekçisi seal'ın içinde
+                         // Mühürleme kuyruğu birikiyorsa yazıcıyı burada yavaşlat (#53).
+                         // Mühürlemeden SONRA: bekleme yalnız kuyruğun uzadığı anlarda
+                         // devreye girer, her insert'te değil.
+            self.apply_backpressure();
         }
         Ok(())
     }
@@ -849,50 +953,70 @@ impl SegmentedIndex {
         self.last_seal_us
             .store(t_seal.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-        // 3. HNSW inşasını arka plana ver.
-        let segments = Arc::clone(&self.segments);
-        let sealing_list = Arc::clone(&self.sealing);
-        let stats = Arc::clone(&self.seal_stats);
-        let in_flight = Arc::clone(&self.seal_in_flight);
-        let merge_ctx = self.merge_context();
-        let (dim, metric) = (self.dim, self.metric);
-        let params = self.hnsw_params.clone();
-        in_flight.fetch_add(1, Ordering::SeqCst);
-        std::thread::spawn(move || {
-            let t = std::time::Instant::now();
-            let mut p = params.clone();
-            p.seed = p.seed.wrapping_add(sealing.data.len() as u64);
-            let mut hnsw = HnswIndex::new(dim, metric, p);
-            // Snapshot anındaki tombstone'lar (mühürleme başlarken boştu ama
-            // inşa sırasında düşenler için aşağıda diff-replay var).
-            for (id, v) in sealing.data.entries() {
-                hnsw.insert(id, v)
-                    .expect("mühürleme insert'i başarısız olamaz");
+        // 3. Kuyruğu TEK worker tüketir (#53). Burada yeni thread
+        //    doğurulmaz: sınırsız spawn, 35 eşzamanlı mühürlemenin hiçbirinin
+        //    bitememesine yol açıyordu (#52).
+        self.seal_context().spawn_if_needed();
+    }
+
+    /// Mühürleme worker'ının taşınabilir bağlamı.
+    fn seal_context(&self) -> SealContext {
+        SealContext {
+            segments: Arc::clone(&self.segments),
+            sealing: Arc::clone(&self.sealing),
+            stats: Arc::clone(&self.seal_stats),
+            in_flight: Arc::clone(&self.seal_in_flight),
+            dim: self.dim,
+            metric: self.metric,
+            params: self.hnsw_params.clone(),
+            merge: self.merge_context(),
+        }
+    }
+
+    /// Backpressure (#53, ön-kayıt #49'un öngördüğü biçim).
+    ///
+    /// Yazma REDDEDİLMEZ, yavaşlatılır (Lucene `IndexWriter` stall'ü): kuyruk
+    /// eşiği aşınca yazıcı 1 ms'lik uykularla bekler. Tek yazar sözleşmesi
+    /// korunur; bekleme hiçbir kilit tutmadan yapılır, okuyucular etkilenmez.
+    ///
+    /// SİNYAL NEDEN YALNIZ KUYRUK (ilk deneme yanlıştı, #56): eşik önce
+    /// "mühürlenen + segment > 2×tavan" olarak yazılmıştı. Ama bir mühürleme
+    /// BİTTİĞİNDE bu toplam düşmez — eleman kuyruktan segmentlere taşınır,
+    /// toplam sabit kalır. Toplamı ancak merge düşürür, o da yalnız segment
+    /// sayısı tavanı aşınca çalışır. Sonuç: 1M ölçümünde yazıcı 110 saniye
+    /// boyunca 0 op/s'ye düştü ve 60 s'lik güvenlik sınırına dayandı.
+    /// Sınırlanması gereken boyut segment sayısı değil (onu merge tavanı
+    /// zaten bağlıyor), **sınırsız büyüyen kuyruğun kendisi**.
+    ///
+    /// Eşik 2: biri inşa edilirken bir tanesi sırada bekleyebilir. Bellek
+    /// böylece ~2 buffer ile sınırlı kalır ve sürdürülebilir yazma hızı
+    /// mühürleme hızına eşitlenir — asıl istenen davranış bu.
+    fn apply_backpressure(&self) {
+        const QUEUE_LIMIT: usize = 2;
+        let queued = |s: &Self| s.sealing.read().expect("kilit").len();
+        if queued(self) <= QUEUE_LIMIT {
+            return;
+        }
+        let t = std::time::Instant::now();
+        while queued(self) > QUEUE_LIMIT {
+            // Güvenlik valfi: worker beklenmedik şekilde ilerlemezse yazıcı
+            // sonsuza kadar beklemesin.
+            if t.elapsed() > std::time::Duration::from_secs(60) {
+                break;
             }
-            let built = Arc::new(Segment {
-                index: hnsw,
-                tombstones: RwLock::new(HashSet::new()),
-                stored: RwLock::new(None),
-            });
-            // Takas: TEK write kilidi altında (önce segments, sonra sealing)
-            // ve inşa sırasında düşen tombstone'lar birleşiğe taşınır.
-            {
-                let mut segs = segments.write().expect("kilit");
-                let mut seal_list = sealing_list.write().expect("kilit");
-                // Diff-replay: inşa sırasında bu buffer'a düşen silmeler.
-                let carried = sealing.tombstones.read().expect("kilit").clone();
-                *built.tombstones.write().expect("kilit") = carried;
-                segs.push(Arc::clone(&built));
-                seal_list.retain(|s| !Arc::ptr_eq(s, &sealing));
-            }
-            stats
-                .last_us
-                .store(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-            stats.count.fetch_add(1, Ordering::Relaxed);
-            in_flight.fetch_sub(1, Ordering::SeqCst);
-            // Tavan bekçisi: yeni segment eklendi, gerekiyorsa merge tetikle.
-            merge_ctx.spawn_if_needed();
-        });
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        self.stall_count.fetch_add(1, Ordering::Relaxed);
+        self.stall_us
+            .fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// Backpressure gözlemi: kaç insert bekletildi, toplam kaç µs.
+    pub fn stall_stats(&self) -> (u64, u64) {
+        (
+            self.stall_count.load(Ordering::Relaxed),
+            self.stall_us.load(Ordering::Relaxed),
+        )
     }
 
     /// Tavan aşıldıysa arka planda merge başlatır. Zaten bir merge
@@ -941,8 +1065,12 @@ impl SegmentedIndex {
     }
 
     /// Devam eden tüm mühürlemeler bitene kadar bekler.
+    /// Tek worker olduğu için "devam eden" = worker aktif VEYA kuyruk dolu;
+    /// ikisi de sıfırlanmadan beklemeyi bitirmek erken dönmek olurdu.
     pub fn wait_for_seal(&self) {
-        while self.seal_in_flight.load(Ordering::SeqCst) > 0 {
+        while self.seal_in_flight.load(Ordering::SeqCst) > 0
+            || !self.sealing.read().expect("kilit").is_empty()
+        {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
@@ -952,7 +1080,10 @@ impl SegmentedIndex {
         loop {
             self.wait_for_seal();
             self.wait_for_merge();
-            if self.seal_in_flight.load(Ordering::SeqCst) == 0 && !self.merge_in_flight() {
+            if self.seal_in_flight.load(Ordering::SeqCst) == 0
+                && self.sealing.read().expect("kilit").is_empty()
+                && !self.merge_in_flight()
+            {
                 break;
             }
         }
@@ -1751,6 +1882,65 @@ mod tests {
             hits as f64 / 200.0 >= 0.95,
             "filtreli recall düşük: {hits}/200"
         );
+    }
+
+    /// #53: mühürleme TEK worker'la yapılır ve kuyruk tüketilir.
+    ///
+    /// İki şeyi birden ölçer: (a) hiçbir anda birden fazla mühürleme
+    /// çalışmıyor — eski tasarımda 35 tanesi aynı anda koşuyordu (#52);
+    /// (b) kuyruk gerçekten oluştu (yoksa test hiçbir şey kanıtlamaz) ve
+    /// sonunda boşaldı, veri kaybı olmadan.
+    #[test]
+    fn sealing_worker_is_single_and_queue_drains() {
+        let n = 8_000;
+        let vecs = random_vectors(n, 16, 42);
+        let mut idx = SegmentedIndex::new(16, Metric::L2, HnswParams::default(), 200);
+        idx.set_max_segments(2);
+        let mut max_in_flight = 0;
+        let mut max_queue = 0;
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert_shared(VectorId(i as u64), v).unwrap();
+            max_in_flight = max_in_flight.max(idx.seal_in_flight());
+            max_queue = max_queue.max(idx.sealing_count());
+        }
+        assert!(
+            max_in_flight <= 1,
+            "birden fazla mühürleme worker'ı: {max_in_flight}"
+        );
+        assert!(max_queue > 0, "mühürleme kuyruğu hiç oluşmadı: test zayıf");
+        idx.wait_for_background();
+        assert_eq!(idx.sealing_count(), 0, "kuyruk boşalmadı");
+        assert_eq!(idx.len_shared(), n, "mühürlemede veri kayboldu");
+    }
+
+    /// #53: backpressure kuyruğu sınırlar — yazma reddedilmez, yavaşlar.
+    ///
+    /// Eşik 2×tavan. Test hem sınırın tutulduğunu hem de stall'ün GERÇEKTEN
+    /// tetiklendiğini doğrular; tetiklenmezse sınır kendiliğinden tutmuş olur
+    /// ve test sessizce hiçbir şey ölçmez.
+    #[test]
+    fn backpressure_bounds_the_sealing_queue() {
+        let n = 8_000;
+        let vecs = random_vectors(n, 16, 7);
+        let mut idx = SegmentedIndex::new(16, Metric::L2, HnswParams::default(), 100);
+        idx.set_max_segments(2);
+        let limit = 2; // kuyruk eşiği (#56: sinyal segment sayısı DEĞİL)
+        let mut max_queue = 0;
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert_shared(VectorId(i as u64), v).unwrap();
+            max_queue = max_queue.max(idx.sealing_count());
+        }
+        let (stalls, stall_us) = idx.stall_stats();
+        assert!(stalls > 0, "backpressure hiç devreye girmedi: test zayıf");
+        assert!(stall_us > 0, "stall süresi ölçülmedi");
+        // Bekleme mühürlemeden SONRA yapıldığı için sınır bir eleman aşılabilir.
+        assert!(
+            max_queue <= limit + 1,
+            "kuyruk sınırı aşıldı: {max_queue} > {}",
+            limit + 1
+        );
+        idx.wait_for_background();
+        assert_eq!(idx.len_shared(), n, "backpressure altında veri kayboldu");
     }
 
     /// Aşırı seçici filtre (tek eşleşme): fallback doğrusal tarama devreye

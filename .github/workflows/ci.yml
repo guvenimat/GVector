@@ -6,6 +6,9 @@ on:
 jobs:
   check:
     runs-on: ubuntu-latest
+    # Eşzamanlılık kodu olan bir projede deadlock'un belirtisi ASILMAKTIR.
+    # Timeout olmazsa CI varsayılan 6 saat bekler ve neden belirsiz kalır.
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -17,4 +20,5 @@ jobs:
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
       - name: test
+        timeout-minutes: 10
         run: cargo test

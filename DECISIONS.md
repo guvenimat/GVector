@@ -1,5 +1,107 @@
 # Mimari Kararlar
 
+## Aşama 9a-2 — kriter 2 ikinci ölçüm + yeni ön-kayıt — 2026-08-19
+
+### 56. Backpressure sinyali yanlış seçildi: "yavaşlat" tasarlayıp "durdur" elde etmek
+İlk backpressure eşiği **mühürlenen + segment > 2×tavan** idi. Bu sinyal
+yanlıştır: bir mühürleme BİTTİĞİNDE toplam düşmez — eleman kuyruktan
+segmentlere taşınır, toplam sabit kalır. Toplamı ancak merge düşürür, o da
+yalnız segment sayısı tavanı aşınca çalışır. 1M ölçümünde sonuç: yazıcı
+120 saniyenin **110'unda 0 op/s**, iki insert 60 s'lik güvenlik sınırına
+dayandı. O sınır olmasa üretimde sonsuza kadar asılırdı.
+
+**Genel kural (bu projeden çıkan ders):** bir kontrol döngüsünün sinyali,
+o döngünün ETKİLEYEBİLDİĞİ bir büyüklük olmalı. Toplam sayı yazıcının
+yavaşlamasıyla düşmüyordu — yani geri besleme yoktu, yalnızca bir duvar
+vardı. "Yavaşlat" tasarlayıp "durdur" elde etmek dağıtık sistemlerde
+klasik bir hata sınıfıdır.
+
+**Düzeltme:** sinyal yalnız **kuyruk uzunluğu**, eşik 2 (biri inşa
+edilirken biri sırada). Segment sayısını merge tavanı zaten bağlıyor;
+sınırsız büyüyen boyut kuyruktu. Sonuç: kuyruk 3'te sabit, yazma hızı
+sıfıra çökmek yerine mühürleme hızında (~5K op/s) dengelendi.
+
+### 57. Kabul kriterleri ÖLÇEKTE ölçülür — bunu test değil ölçüm yakaladı
+#56'daki kusuru birim testleri yakalayamadı: küçük ölçekte merge hızlı
+dönüyor, toplam gerçekten düşüyor ve denge kuruluyor. 1M'de mühürleme
+~20 s sürünce denge bozuluyor. Testler yeşildi, sistem çalışmıyordu.
+Bu, "geliştirme 10K'da, kabul 100K/1M'de" kuralının en iyi örneğidir.
+
+### 58. Ön-kayıt #49'un metrik kusuru — SONUÇ YİNE "KARŞILANMADI"
+İkinci ölçümde (düzeltilmiş sinyal, 2 dk, 1M): kuyruk **3'te sabit**,
+zirve 9 ≤ 12 (**OK**), ama ilk 1/3 → son 1/3 ortalaması 3.8 → 7.9
+(**+%110**, eşik +%20) → **AŞILDI**. Sonuç #40'ta olduğu gibi
+"karşılanmadı" olarak DURUR; eşik yeniden yorumlanmadı.
+
+**Kusur analizi (kullanıcı, eşiği yazan kişi):** `segment + mühürlenen`
+toplamı iki FARKLI REJİMDEKİ sayıyı topluyor — segment sayısı zaten merge
+tavanıyla bağlı, kuyruk ise (o tarihte) sınırsızdı. Ölçmek istenen şey
+"sınırsız büyüyen boyut var mı", ölçülen şey ise ikisinin toplamı oldu.
+Bu kayıt eşiği DEĞİŞTİRMEZ; eşiğin ölçmek istediği şeyle ölçtüğü şey
+arasındaki farkı belgeler.
+
+### 59. YENİ ÖN-KAYIT — 9a-2 kriter 2, ikinci sürüm (ölçüm KOŞULMADAN önce yazıldı)
+**Şeffaflık notu:** hem bu ön-kayıt hem de sürenin uzatılması kararı,
+2 dakikalık ölçümün sonucu GÖRÜLDÜKTEN SONRA alındı. Gerekçe: 2 dakikalık
+pencere segment sayısının merge tavanına ulaşmasına yetmediği için eğri
+yanlış okundu (büyüme, tavana yaklaşma olarak değil monoton artış olarak
+göründü). Okuyucu bu bilgiyle kendi indirimini yapsın.
+
+- **Birincil kriter (9a-2'nin kendisi):** 10 dakikalık sürekli tam hız
+  yazma altında **kuyruk uzunluğu** sabit bir üst sınırda dengelenir
+  (gözlenen sınır: 3). Monoton büyürse → karşılanmadı.
+- **İkincil kalem (9a-2'nin DEĞİL, merge tavanının testi):** segment
+  sayısı merge tavanı + tolerans (8+4=12) içinde kalır. Ayrı kalem olarak
+  kaydedilir; 9a-2'nin kabulünü belirlemez.
+- **Süre 10 dakika**, çünkü segment sayısının tavana varıp merge'in
+  devreye girmesi gerekiyor.
+- Kriter 1 (latency, #40) değişmedi ve ayrıca ölçülür. 9a-2 ancak
+  birincil kriter + kriter 1 birlikte geçerse kabul edilir.
+
+
+## Aşama 9a-2 — tek worker + backpressure — 2026-08-19
+
+### 53. Mühürleme TEK worker + kuyruk; yazma yolunda backpressure
+#52'deki kusurun düzeltmesi. `seal()` artık thread doğurmuyor; `SealContext`
+(merge'deki `MergeContext` kalıbının ikizi: CAS bayrağı + kuyruk boşalana
+kadar dönen tek döngü + bayrağı bırakırken çift kontrol) `sealing` listesini
+FIFO tüketiyor. Eşzamanlı inşa toplam işi azaltmıyordu, yalnız hepsini
+yavaşlatıyordu; sıralı worker aynı işi yapar ama her mühürleme SIRAYLA biter,
+kuyruk tüketilir, bellek geri verilir.
+
+**Backpressure:** kuyruk + segment sayısı 2×tavanı aşınca yazma yolunda
+1 ms'lik uykularla bekleme (Lucene `IndexWriter` stall'ü). Yazma reddedilmez,
+yavaşlatılır; tek yazar sözleşmesi korunur; bekleme hiçbir kilit tutmadan
+yapılır, okuyucular etkilenmez. Üst sınır 60 s (worker beklenmedik şekilde
+ilerlemezse yazıcı sonsuza kadar beklemesin). Gözlem: `stall_stats()`.
+
+### 54. KİLİT SIRASI (global kural): segments → sealing → buffer
+Bu düzeltmeyi yazarken İKİ deadlock üretildi, ikisi de testte **asılma**
+olarak ortaya çıktı (panik değil, sessiz asılma):
+
+1. `sealing.read().len() + segments.read().len()` — tek ifadedeki geçiciler
+   satır sonuna kadar yaşar, yani iki kilit İÇ İÇE alınır ve sıra worker'ın
+   tersidir. **Kural: iki kilidi asla tek ifadede alma**; ayrı satırlarda
+   ara değişkene al, guard'lar hemen düşsün.
+2. `while let Some(x) = sealing.read()...first().cloned()` — `while let`,
+   `loop { match EXPR {...} }` olarak desugar edilir ve match
+   scrutinee'sinin geçicileri **gövde dahil** yaşar; read kilidi tutulurken
+   `build_one` write kilidi ister. Düz `while COND` güvenlidir (koşulun
+   geçicileri koşul biterken düşer) — merge worker'ı bu yüzden sağlamdı.
+   Rust 2024 bunu `if let` için düzeltti, `while let` hâlâ eski davranışta.
+   **Kural: kilit alan scrutinee'yi kendi satırında al, `let ... else` ile
+   ayır.**
+
+Dördüncü bir kilit eklendiğinde aynı hatayı tekrarlamamak için sıra burada
+sabitleniyor: **segments → sealing → buffer**. Birden fazlası gerekiyorsa
+bu sırayla alınır; mümkünse hiç iç içe alınmaz.
+
+### 55. CI'ya timeout eklendi
+Deadlock'un belirtisi asılmadır; timeout'suz CI varsayılan 6 saat bekler ve
+neden belirsiz kalır. Job 15 dk, test adımı 10 dk. Eşzamanlılık kodu ekleyen
+bir projede ucuz sigorta (kullanıcı önerisi).
+
+
 ## Aşama 9a-2 — KABUL EDİLMEDİ (kriter 2) — 2026-08-19
 
 ### 51. Mühürleme arka plana alındı ama 9a-2 henüz KABUL EDİLMEDİ

@@ -1,5 +1,124 @@
 # Benchmark Kayıtları
 
+## Aşama 9a-2 — ön-kayıtlı iki kriterin ölçümü (SONUÇLAR) — 2026-08-19
+
+Bu bölüm YALNIZ ölçüm sonuçlarıdır. Sonuçlardan çıkarılan kararlar ve
+eşik kusurlarının analizi DECISIONS'ta ayrı kayıtlardır (bilerek ayrı
+commit'lerde: "karar sonucu mu şekillendirdi" sorusu bulanıklaşmasın).
+
+### Kriter 2 — birikme, 10 dakika (ön-kayıt #59)
+
+1M SIFT, 600 s kesintisiz tam hız yazma, seal=125K, tavan=8, WAL kapalı,
+5 s'de bir örnekleme. Toplam 2.875M kayıt yazıldı (~4.8K op/s sürdürülen).
+
+| t (s) | segment | mühürlenen (kuyruk) |
+|---|---|---|
+| 5 | 0 | 3 |
+| 110 | 5 | 3 |
+| 200 | 9 | 3 |
+| 320 | 12 | 3 |
+| 440 | 13 | 3 |
+| 530 | 16 | 3 |
+| 600 | 16 | 3 |
+
+| #59 kalem | değer | eşik | sonuç |
+|---|---|---|---|
+| **BİRİNCİL** kuyruk: ilk 1/3 → son 1/3 | 3.0 → 3.0 (**−%2**) | dengelenir | **OK** |
+| BİRİNCİL kuyruk zirvesi | **3** | sabit üst sınır | — |
+| İKİNCİL segment zirvesi (merge tavanının testi) | **16** | ≤ 12 | **AŞILDI** |
+| (referans) #49'un kusurlu metriği: segment+mühürlenen | 7.7 → 17.7 | ≤ +%20 | AŞILDI |
+
+Backpressure: 21 insert bekletildi, toplam 594.4 s.
+
+### Kriter 1 — latency (ön-kayıt #40)
+
+Ölçüm koşulu Aşama 8 / 9a-1 ile aynı: `data/fullscale` SIFTEN YENİDEN
+KURULDU (1M, 8 segment — önceki koşular dizini 1.64M/10 segmente
+büyütmüştü), WAL group:20, döngü içinde commit yok, izole süreç, warmup
+5.000 yazma, 130.000 yazma ölçüldü.
+
+| ölçüm | koşu 1 | koşu 2 |
+|---|---|---|
+| taban p50 | 1 µs | 1 µs |
+| taban p99 | 9.9 µs | 10.6 µs |
+| **en uzun tek yazma** | **6.031 ms** | **9.996 ms** |
+| **mühürlemenin yazıcıyı bloke ettiği süre** | **2 µs** | **0 ns** |
+| merge sayısı (arka plan) | 0 | 0 |
+| oran (en uzun / taban p99) | **609x** | **943x** |
+| ön-kayıtlı eşik 50x | **GEÇMEDİ** | **GEÇMEDİ** |
+
+**Yazıcıyı bloke eden pencerenin seyri (asıl bulgu):**
+
+| | Aşama 8 | 9a-1 | 9a-2 |
+|---|---|---|---|
+| yazıcının bloke olduğu en uzun pencere | 80.5 s | 28.5–30.6 s | **0 ns – 2 µs** |
+| bileşeni | mühürleme 20.8 s + merge 59.7 s | mühürleme 28.5 s | — |
+
+### Teşhis: 6–10 ms'lik sıçramalar nereden geliyor?
+
+En yavaş 5 yazmanın sıra numarası, mühürlemenin düştüğü sıra numarasıyla
+karşılaştırıldı (mühürleme ~#11266):
+
+```
+#5444 → 9.9959ms   #71802 → 5.6031ms   #70092 → 4.155ms
+#115892 → 4.1223ms #38739 → 4.0845ms
+```
+
+Sıçramalar 130.000 yazmaya DAĞILMIŞ ve mühürleme noktasıyla ilgisiz.
+
+WAL sync kapalı teşhis koşusu (ön-kayıtlı koşul DEĞİL, `GVDB_DIAG_NOWAL=1`):
+sıçramalar 6–10 ms'den 1.8–4.4 ms'ye indi ama KAYBOLMADI → fsync katkının
+bir kısmı, tamamı değil. Kalan hipotez: yazma buffer'ının kapasite
+büyütmesi (125K × 128 float ≈ 64 MB realloc). Hipotez henüz kanıtlanmadı.
+
+**Teşhis koşusunun beklenmedik sonucu:** WAL kapalıyken yazıcı hızlanınca
+kuyruk eşiği aşıldı ve **backpressure devreye girdi** — en uzun yazma
+**24.9 s** oldu (#121265). Bu bir kusur değil, #53'ün tasarlanmış
+davranışı: kriter 2'yi geçiren mekanizmanın kendisi.
+
+
+## Aşama 9a-2 — tek worker + backpressure, kriter 2 ikinci ölçüm — 2026-08-19
+
+1M SIFT, 120 s kesintisiz tam hız yazma, seal=125K, tavan=8, WAL kapalı.
+
+**(a) İlk backpressure sinyali (mühürlenen+segment > 16) — YANLIŞ (#56):**
+
+| t (s) | segment | mühürlenen | yazma op/s |
+|---|---|---|---|
+| 5 | 0 | 10 | 271.293 |
+| 10 | 0 | 17 | 153.707 |
+| 15–65 | 0→3 | 17→14 | **0** |
+| 120 | 6 | 12 | **0** |
+
+Yazıcı 110 saniye boyunca tamamen durdu; 2 insert 60 s güvenlik sınırına
+dayandı. Toplam sayı mühürleme bitince düşmediği için geri besleme yok.
+
+**(b) Düzeltilmiş sinyal (yalnız kuyruk, eşik 2):**
+
+| t (s) | segment | mühürlenen | yazma op/s |
+|---|---|---|---|
+| 5 | 0 | 3 | 75.000 |
+| 40 | 2 | 3 | 25.000 |
+| 80 | 4 | 3 | 25.000 |
+| 120 | 6 | 3 | 7.595 |
+
+| kriter | değer | eşik | sonuç |
+|---|---|---|---|
+| ilk 1/3 → son 1/3 ort. (segment+mühürlenen) | 3.8 → 7.9 (**+%110**) | ≤ +%20 | **AŞILDI** |
+| zirve (segment+mühürlenen) | 9 | ≤ 12 | OK |
+| kuyruk uzunluğu | **3'te sabit** | (ön-kayıtta yok) | — |
+
+**KRİTER 2 SONUCU: KARŞILANMADI** (eşik yeniden yorumlanmadı, #58).
+Kuyruk düz; büyüyen kısım segment sayısı (0→6), yani merge tavanına
+yaklaşma. 2 dakikalık pencere tavana ulaşmadan bitti → yeni ön-kayıt #59
+ile 10 dakikaya çıkarıldı (karar sonuç görüldükten sonra alındı).
+
+Karşılaştırma — önceki tasarım (sınırsız thread, #52): kuyruk 60 s'de
+0→35, segment 0'da kaldı, yazma 273K→11.7K, bellek ~2.3 GB.
+Yeni tasarımda kuyruk 3, segment düzenli üretiliyor, yazma mühürleme
+hızında dengeleniyor (~5K op/s), bellek ~2 buffer.
+
+
 ## Aşama 9a-2 — birikme ölçümü (ön-kayıt #49, KRİTER 2) — 2026-08-19
 
 60 s kesintisiz TAM HIZ yazma; seal=125K, tavan=8, WAL kapalı (ilk deneme
