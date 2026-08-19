@@ -1,30 +1,34 @@
-//! Segment tabanlı eşzamanlı indeks (Aşama 5) — Lucene/Qdrant modeli.
+//! Segment-based concurrent index (phase 5) — the Lucene/Qdrant model.
 //!
-//! Yapı:
-//! - **Mühürlü segmentler**: salt-okunur HNSW indeksleri (`Arc<Segment>`).
-//!   İçerikleri asla değişmez; silmeler segment-yerel tombstone kümesine yazılır.
-//! - **Yazma buffer'ı**: küçük bir brute-force indeks. Insert'ler buraya gider;
-//!   eşik aşılınca buffer HNSW'ye "mühürlenir" ve segment listesine eklenir.
-//! - Arama tüm segmentleri + buffer'ı gezip sonuçları id bazında birleştirir.
+//! Structure:
+//! - **Sealed segments**: read-only HNSW indexes (`Arc<Segment>`). Their
+//!   contents never change; deletions are written to a segment-local tombstone
+//!   set.
+//! - **Write buffer**: a small brute-force index. Inserts go here; once the
+//!   threshold is crossed the buffer is "sealed" into an HNSW and appended to
+//!   the segment list.
+//! - A search walks every segment plus the buffer and merges the results by id.
 //!
 //! Kilit disiplini (neden aramalar pratikte bloklanmaz):
-//! - Okuyucu, segment listesinin read kilidini yalnızca `Vec<Arc<Segment>>`
-//!   klonlayacak kadar tutar (birkaç pointer kopyası) ve HNSW aramasını
-//!   kilitsiz yapar — Arc içeriği immutable.
-//! - Buffer araması read kilidi altındadır ama buffer küçüktür (< eşik) ve
-//!   brute-force taraması mikrosaniyeler sürer; yazıcının buffer write kilidi
-//!   de O(1) append kadar kısadır. Pahalı iş olan HNSW inşası (mühürleme)
-//!   HİÇBİR kilit tutulmadan yapılır; sadece sonucun listeye eklenmesi kilitli.
-//! - Mühürleme sırası: önce segment eklenir, SONRA buffer boşaltılır. Aradaki
-//!   anda bir okuyucu aynı id'yi iki kaynaktan görebilir; birleştirme id
-//!   bazında tekilleştirdiği için bu güvenlidir (kayıp yerine kopya tercih edildi).
+//! - A reader holds the read lock on the segment list only long enough to clone
+//!   the `Vec<Arc<Segment>>` (a few pointer copies) and then performs the HNSW
+//!   search lock-free — the contents behind an Arc are immutable.
+//! - The buffer search runs under a read lock, but the buffer is small
+//!   (< threshold) and a brute-force scan takes microseconds; the writer's
+//!   buffer write lock is as short as an O(1) append. The expensive work — HNSW
+//!   construction (sealing) — is done holding NO lock at all; only appending the
+//!   result to the list is locked.
+//! - Sealing order: the segment is appended FIRST, the buffer is drained after.
+//!   In between, a reader can see the same id from two sources; because merging
+//!   deduplicates by id this is safe (a duplicate was preferred over a loss).
 //!
-//! Tek-yazar varsayımı: `insert`/`delete` `&mut self` ister (VectorIndex
-//! sözleşmesi zaten böyle). Okuyucular `&self` ile herhangi bir thread'den
-//! arayabilir; `SegmentedIndex: Sync` olduğundan `Arc<RwLock<...>>` yerine
-//! doğrudan `Arc<SegmentedIndex>` + tek yazıcı thread'i yeterlidir... yazıcı
-//! da `&self` üzerinden çalışabilsin diye mutasyonlar iç kilitlerle yazıldı ve
-//! `insert_shared`/`delete_shared` olarak da açıldı (stres testi bunu kullanır).
+//! The single-writer assumption: `insert`/`delete` take `&mut self` (that is
+//! the VectorIndex contract anyway). Readers can search from any thread via
+//! `&self`; since `SegmentedIndex: Sync`, an `Arc<SegmentedIndex>` plus one
+//! writer thread suffices instead of `Arc<RwLock<...>>`. So that the writer can
+//! work through `&self` as well, the mutations were written with internal locks
+//! and are also exposed as `insert_shared`/`delete_shared` (the stress test uses
+//! them).
 
 use crate::distance::Metric;
 use crate::index::bruteforce::BruteForceIndex;
@@ -40,25 +44,25 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
-/// Segmentin diskteki karşılığı. Dosya adı yazıldığı generation'ı taşır ve
-/// DEĞİŞMEZ: bir segment bir kez yazılır, sonraki checkpoint'ler onu yalnız
-/// manifest'ten referanslar (bkz. storage modülü başlığı).
+/// A segment's on-disk counterpart. The file name carries the generation it was
+/// written in and is IMMUTABLE: a segment is written once, and later checkpoints
+/// merely reference it from the manifest (see the storage module header).
 #[derive(Debug, Clone)]
 struct StoredFile {
     name: String,
     crc32: u32,
 }
 
-/// Mühürlü, immutable HNSW + kendi tombstone kümesi.
+/// A sealed, immutable HNSW plus its own tombstone set.
 ///
-/// Tombstone'lar segment-YEREL: bir id silinip yeniden eklendiğinde eski
-/// kopya kendi segmentinde sonsuza dek gölgede kalır, yeni kopya buffer'da
-/// (sonra başka segmentte) yaşar — global bir silinmiş-küme olsaydı yeniden
-/// ekleme eski kopyayı hortlatırdı.
-/// Mühürlenmekte OLAN buffer (9a-2). Snapshot alınmış, değişmez brute-force
-/// verisi + kendi tombstone kümesi — yani `Segment`'in HNSW'siz kardeşi.
-/// HNSW inşası arka planda sürerken arama, delete ve duplicate-id kontrolü
-/// bu kaynağı da gezmek zorundadır (DECISIONS #50).
+/// Tombstones are segment-LOCAL: when an id is deleted and re-inserted, the old
+/// copy stays shadowed in its own segment forever while the new copy lives in
+/// the buffer (and later in another segment) — with a global deleted-set, a
+/// re-insertion would resurrect the old copy.
+/// A buffer that is BEING sealed (9a-2). A snapshotted, immutable brute-force
+/// dataset plus its own tombstone set — that is, `Segment`'s sibling without the
+/// HNSW. While the HNSW is built in the background, search, delete and the
+/// duplicate-id check must all walk this source too (DECISIONS #50).
 struct Sealing {
     data: BruteForceIndex,
     tombstones: RwLock<HashSet<VectorId>>,
@@ -67,7 +71,7 @@ struct Sealing {
 struct Segment {
     index: HnswIndex,
     tombstones: RwLock<HashSet<VectorId>>,
-    /// Diske yazılmışsa dosya adı + CRC; yeni mühürlenen ve merge çıktısı
+    /// File name + CRC if written to disk; None for a freshly sealed segment or
     /// segmentlerde None (bir sonraki checkpoint yazar).
     stored: RwLock<Option<StoredFile>>,
 }
@@ -75,100 +79,114 @@ struct Segment {
 pub struct SegmentedIndex {
     dim: usize,
     metric: Metric,
-    /// Mühürlenen segmentlerin HNSW parametreleri.
+    /// HNSW parameters for sealed segments.
     hnsw_params: HnswParams,
-    /// Buffer bu boyuta ulaşınca mühürlenir. Atomik: ölçümde mühürlemeyi
-    /// geçici olarak devre dışı bırakmak gerekiyor (aksi halde "fsync
-    /// politikası" ölçümü sessizce "HNSW inşası" ölçümüne dönüşür).
+    /// The buffer is sealed once it reaches this size. Atomic because
+    /// measurements need to disable sealing temporarily (otherwise an "fsync
+    /// policy" measurement silently turns into an "HNSW construction"
+    /// measurement).
     seal_threshold: AtomicUsize,
-    /// `Arc` — merge arka plan thread'ine klonlanabilmesi için (9a-1).
-    /// Auto-deref sayesinde `self.segments.read()` çağrıları değişmedi.
+    /// `Arc` so it can be cloned into the background merge thread (9a-1).
+    /// Thanks to auto-deref, existing `self.segments.read()` calls were
+    /// unaffected.
     segments: Arc<RwLock<Vec<Arc<Segment>>>>,
-    /// Mühürlenmekte olan buffer'lar (9a-2). Genelde 0 ya da 1 elemanlı;
-    /// yazma hızı mühürlemeyi aşarsa birikir (ön-kayıt #49 bunu ölçüyor).
+    /// Buffers currently being sealed (9a-2). Normally 0 or 1 elements; if the
+    /// write rate outruns sealing they accumulate (pre-registration #49 measures
+    /// exactly this).
     sealing: Arc<RwLock<Vec<Arc<Sealing>>>>,
     buffer: RwLock<BruteForceIndex>,
-    /// Sorgu genişliği (mühürlü segmentlerde).
+    /// Query width (on sealed segments).
     ef_search: usize,
-    /// id → metadata. Vektör verisinden ayrı tutulur: segmentler immutable
-    /// ama metadata idare (silme, yeniden ekleme) id düzeyinde akar.
+    /// id → metadata. Kept apart from the vector data: segments are immutable,
+    /// but metadata administration (deletion, re-insertion) flows at the id
+    /// level.
     metadata: RwLock<MetaStore>,
-    /// Eq posting-list'leri: (alan, değer) → yaşayan id'lerin SIRALI listesi.
+    /// Eq posting lists: (field, value) → a SORTED list of live ids.
     ///
-    /// 9c: `HashSet<VectorId>` yerine sıralı `Vec` (DECISIONS #64). 1M
-    /// ölçümünde posting'ler 570 MB ile en büyük metadata kalemiydi ve
-    /// şişkinlik `HashSet`'lerin kendisindeydi: her küme kendi tablosunu,
-    /// doluluk payını ve başlığını taşıyor. Sıralı `Vec` id başına tam
-    /// 8 byte tutar; üyelik ikili aramayla O(log n) — Eq kolunda yapılan
-    /// iş zaten listeyi baştan sona gezmek olduğu için bu yol kaybettirmiyor.
-    /// Planlayıcının O(1) kardinalite tahmini ve tarama kolunun id kaynağı.
-    /// Insert/delete'te bakımı yapılır; Range koşulları kapsam dışı (DECISIONS #28).
+    /// 9c: a sorted `Vec` instead of `HashSet<VectorId>` (DECISIONS #64). In the
+    /// 1M measurement, postings were the largest metadata item at 570 MB, and
+    /// the bloat was in the `HashSet`s themselves: each set carries its own
+    /// table, load-factor slack and header. A sorted `Vec` holds exactly 8 bytes
+    /// per id; membership is O(log n) via binary search — and since the work in
+    /// the Eq arm is walking the list end to end anyway, this loses nothing.
+    /// The planner's O(1) cardinality estimate and the scan arm's id source.
+    /// Maintained on insert/delete; Range predicates are out of scope
+    /// (DECISIONS #28).
     postings: RwLock<HashMap<(String, MetaKey), Vec<VectorId>>>,
-    /// Sayısal alanlar için Range indeksi: histogram (ŝ aralığı) +
-    /// değer-sıralı map (sınırlı sayım). Bkz. numeric modülü / DECISIONS #31.
+    /// The Range index for numeric fields: a histogram (the ŝ interval) plus a
+    /// value-ordered map (bounded counting). See the numeric module /
+    /// DECISIONS #31.
     numeric: RwLock<HashMap<String, NumericFieldIndex>>,
-    /// Planlayıcı eşikleri (sorgu planlama parametreleri; graf parametresi değil).
-    /// Değerler seçicilik ölçümünden (BENCHMARKS, filtre süpürmesi) türetildi.
+    /// Planner thresholds (query-planning parameters, not graph parameters).
+    /// The values were derived from the selectivity measurements (BENCHMARKS,
+    /// the filter sweep).
     planner: PlannerConfig,
-    /// Tavan bekçisi: mühürleme sonrası segment sayısı bunu aşarsa en KÜÇÜK
-    /// iki segment birleştirilir. Gerekçe latency kazancı değil (eşit-recall
-    /// karşılaştırmasında tam merge ~%20 — BENCHMARKS segcurve), sınırsız
-    /// büyümeyi kesmek: eğri doğrusal (~+45µs/segment), 40 segment = ~1.8ms.
-    /// En küçük iki: yeniden inşa maliyeti n'e bağlı — en ucuz birleştirme,
-    /// ve boyutlar dengelenir (en-eski politikası dev segmenti boşuna
+    /// The ceiling guard: if the segment count exceeds this after sealing, the
+    /// two SMALLEST segments are merged. The rationale is not a latency win (at
+    /// equal recall a full merge buys ~20% — BENCHMARKS segcurve) but cutting
+    /// off unbounded growth: the curve is linear (~+45µs/segment), so 40
+    /// segments would be ~1.8ms. The two smallest: rebuild cost scales with n,
+    /// so this is the cheapest merge, and sizes stay balanced (an oldest-first
+    /// policy would pointlessly rebuild
     /// yeniden kurabilirdi).
     max_segments: usize,
-    /// Kalıcılık dizini (bağlıysa). Bellek-içi kullanımda None.
+    /// The persistence directory (if attached). None for in-memory use.
     storage_dir: RwLock<Option<PathBuf>>,
-    /// Monoton checkpoint sayacı; dosya adlarının benzersizliği buna dayanır.
+    /// A monotonic checkpoint counter; file-name uniqueness rests on it.
     generation: AtomicU64,
-    /// Son başarılı checkpoint'in unix zamanı (0 = hiç yapılmadı).
+    /// Unix time of the last successful checkpoint (0 = never).
     last_checkpoint: AtomicU64,
-    /// Sıcak kalıcılık (Aşama 7b). None = yalnız checkpoint dayanıklılığı.
+    /// Hot durability (phase 7b). None = checkpoint durability only.
     wal: RwLock<Option<Wal>>,
-    /// Son mühürleme ve son merge süreleri (µs) + merge sayısı. 9a ölçümü
-    /// için: merge ayrı task'e alınsa bile MÜHÜRLEME yazıcıda kalır, yani
-    /// iki pencere ayrı ayrı bilinmeli (birini diğerine yazmamak için).
+    /// Duration of the last sealing and the last merge (µs) plus the merge
+    /// count. For the 9a measurement: even once merging moves to its own task,
+    /// SEALING stays on the writer, so the two windows must be known separately
+    /// (to avoid charging one to the other).
     last_seal_us: AtomicU64,
-    /// Merge istatistikleri arka plan thread'inden güncellendiği için Arc.
+    /// An Arc because the merge statistics are updated from the background
+    /// thread.
     merge_stats: Arc<MergeStats>,
-    /// Mühürleme istatistikleri (9a-2: arka planda) + devam eden sayısı.
+    /// Sealing statistics (9a-2: in the background) plus the in-flight count.
     seal_stats: Arc<MergeStats>,
     seal_in_flight: Arc<AtomicUsize>,
-    /// Backpressure sayaçları (#53): kaç insert bekletildi ve toplam kaç µs.
-    /// Gözlem için: stall "sessiz" bir yavaşlama, ölçülemezse teşhis edilemez.
+    /// Backpressure counters (#53): how many inserts were stalled and for how
+    /// many µs in total. For observability: a stall is a "silent" slowdown, and
+    /// what cannot be measured cannot be diagnosed.
     stall_count: AtomicU64,
     stall_us: AtomicU64,
-    /// Aynı anda en fazla bir merge; tavan yeniden aşılırsa worker döngüsü
-    /// devam eder (sıraya alma) — yeni thread doğurulmaz.
+    /// At most one merge at a time; if the ceiling is exceeded again the worker
+    /// loop continues (queueing) — no new thread is spawned.
     merge_in_flight: Arc<AtomicBool>,
-    /// Açılışta yapılan WAL replay'inin raporu (gözlem / /stats).
+    /// Report of the WAL replay performed at startup (observability / /stats).
     replay_report: RwLock<ReplayReport>,
 }
 
-/// Planlayıcı yapılandırması. Değerler 10K + 100K seçicilik süpürmelerinden
-/// (BENCHMARKS) türetildi.
+/// Planner configuration. The values were derived from the 10K + 100K
+/// selectivity sweeps (BENCHMARKS).
 ///
-/// Neden gezinti-içi filtre üretim yolundan çıktı: 100K ölçümü, kümelenmiş
-/// eşleşme + uzak sorguda gezinti-içi filtrenin grafın tamamına yayıldığını
-/// (35ms'e kadar) VE ölçekle sessiz recall düşüşü başladığını (0.948) gösterdi.
-/// Filtresiz gezinti bu patolojiye yapısal olarak bağışık: gezinti filtreye
-/// hiç bakmaz, aynı ~µs yolunu yürür; filtre sonuçlara over-fetch ile uygulanır.
+/// Why in-traversal filtering left the production path: the 100K measurement
+/// showed that with clustered matches and a distant query, in-traversal
+/// filtering spreads across the entire graph (up to 35ms) AND that a silent
+/// recall decline sets in with scale (0.948). Unfiltered traversal is
+/// structurally immune to that pathology: the traversal never looks at the
+/// filter and walks the same ~µs path; the filter is applied to the results via
+/// over-fetch.
 #[derive(Debug, Clone)]
 pub struct PlannerConfig {
-    /// est ≤ scan_factor·k → tarama kolu (küçük mutlak eşleşme).
+    /// est ≤ scan_factor·k → the scan arm (a small absolute match count).
     pub scan_factor: usize,
-    /// est ≤ scan_fraction·n → tarama kolu. 0.05: bu bandın altında
-    /// over-fetch'in beklenen eşleşmesi k'yı garanti edemiyor; taramanın
-    /// maliyeti est ile sınırlı ve her sorgu konumunda öngörülebilir.
+    /// est ≤ scan_fraction·n → the scan arm. 0.05: below this band the expected
+    /// match count of over-fetch cannot guarantee k, whereas the cost of a scan
+    /// is bounded by est and predictable at every query position.
     pub scan_fraction: f64,
-    /// Post-filter kolunda over-fetch: ef'' = overfetch_beta·k/ŝ.
-    /// β=5: beklenen eşleşme 5k. β=3 ile sonuç SAYISI yetiyordu ama orta-band
-    /// kümelenmiş sorguda gerçek top-k'nın bir kısmı pencere dışında kalıp
-    /// recall 0.979'a düşüyordu (10K ölçümü); β=5 pencereyi kalite için genişletir.
+    /// Over-fetch in the post-filter arm: ef'' = overfetch_beta·k/ŝ.
+    /// β=5: the expected match count is 5k. With β=3 the NUMBER of results was
+    /// sufficient, but for a mid-band clustered query part of the true top-k
+    /// fell outside the window and recall dropped to 0.979 (the 10K
+    /// measurement); β=5 widens the window for quality.
     pub overfetch_beta: f64,
-    /// ef'' üst tavanı = overfetch_cap_factor·ef (tahmin hatası ef''e çarpan
-    /// olarak girer; tavan bunu sınırlar — kullanıcı geri bildirimi).
+    /// Upper cap on ef'' = overfetch_cap_factor·ef (estimation error enters
+    /// ef'' as a multiplier; the cap bounds it — from user feedback).
     pub overfetch_cap_factor: usize,
 }
 
@@ -183,8 +201,8 @@ impl Default for PlannerConfig {
     }
 }
 
-/// Merge tetikleyicisinin thread'e taşınabilir hali: mühürleme worker'ı
-/// bitince tavan bekçisini buradan çalıştırır (`&self` taşınamaz).
+/// The thread-movable form of the merge trigger: when the sealing worker
+/// finishes it runs the ceiling guard through this (`&self` cannot be moved).
 #[derive(Clone)]
 struct MergeContext {
     segments: Arc<RwLock<Vec<Arc<Segment>>>>,
@@ -197,14 +215,14 @@ struct MergeContext {
 }
 
 impl MergeContext {
-    /// Tavan aşıldıysa arka planda merge başlatır. Aynı anda en fazla bir
-    /// merge; tavan yeniden aşılırsa worker döngüsü devam eder.
+    /// Starts a background merge if the ceiling is exceeded. At most one merge
+    /// at a time; if the ceiling is exceeded again the worker loop continues.
     fn spawn_if_needed(&self) {
         if self.segments.read().expect("kilit").len() <= self.max_segments {
             return;
         }
         if self.in_flight.swap(true, Ordering::SeqCst) {
-            return; // çalışan worker yeni durumu görecek
+            return; // the running worker will see the new state
         }
         let ctx = self.clone();
         std::thread::spawn(move || loop {
@@ -217,7 +235,8 @@ impl MergeContext {
                 ctx.stats.count.fetch_add(1, Ordering::Relaxed);
             }
             ctx.in_flight.store(false, Ordering::SeqCst);
-            // Bayrağı bırakırken yeni segment eklenmiş olabilir: çift kontrol.
+            // A new segment may have been added while releasing the flag:
+            // double-check.
             if ctx.segments.read().expect("kilit").len() <= ctx.max_segments
                 || ctx.in_flight.swap(true, Ordering::SeqCst)
             {
@@ -227,20 +246,21 @@ impl MergeContext {
     }
 }
 
-/// Mühürleme worker'ının taşınabilir bağlamı (#53).
+/// The movable context of the sealing worker (#53).
 ///
-/// NEDEN TEK WORKER: ilk 9a-2 tasarımında `seal()` her çağrıda
-/// `thread::spawn` yapıyordu. 1M birikme ölçümünde 60 saniyede 35 mühürleme
-/// aynı anda koştu, 8 çekirdeği paylaştıkları için HİÇBİRİ bitemedi
-/// (segment sayısı 0'da kaldı), bellek 2.3 GB'a çıktı ve yazma hızı
-/// 273K → 11.7K op/s'ye çöktü (BENCHMARKS 9a-2, DECISIONS #52).
-/// Eşzamanlı inşa toplam işi azaltmıyor, yalnız hepsini yavaşlatıyor;
-/// sıralı tek worker aynı işi aynı sürede yapar ama her mühürleme SIRAYLA
-/// biter, yani kuyruk tüketilir ve bellek geri verilir.
+/// WHY A SINGLE WORKER: in the first 9a-2 design, `seal()` called
+/// `thread::spawn` on every invocation. In the 1M accumulation measurement, 35
+/// sealings ran concurrently within 60 seconds and, sharing 8 cores, NONE of
+/// them could finish (the segment count stayed at 0), memory rose to 2.3 GB and
+/// the write rate collapsed from 273K to 11.7K op/s (BENCHMARKS 9a-2,
+/// DECISIONS #52). Concurrent construction does not reduce the total work, it
+/// only slows all of it down; a sequential single worker does the same work in
+/// the same time, but each sealing finishes IN TURN, so the queue is drained and
+/// memory is returned.
 ///
-/// `sealing` listesi kuyruğun kendisidir: worker daima BAŞTAKİ (en eski)
-/// elemanı işler — sıra korunur ve arama/delete yolları listeyi zaten
-/// gezdiği için ayrı bir kuyruk yapısına gerek yok.
+/// The `sealing` list is the queue itself: the worker always processes the FIRST
+/// (oldest) element — order is preserved, and since the search/delete paths
+/// already walk that list, no separate queue structure is needed.
 #[derive(Clone)]
 struct SealContext {
     segments: Arc<RwLock<Vec<Arc<Segment>>>>,
@@ -254,31 +274,34 @@ struct SealContext {
 }
 
 impl SealContext {
-    /// Worker çalışmıyorsa başlatır. Çalışıyorsa hiçbir şey yapmaz: worker
-    /// döngüsü kuyruk boşalana kadar devam eder (merge'deki kalıp).
+    /// Starts the worker if it is not running. Does nothing if it is: the worker
+    /// loop continues until the queue drains (the pattern used for merging).
     fn spawn_if_needed(&self) {
         if self.in_flight.swap(1, Ordering::SeqCst) == 1 {
-            return; // çalışan worker yeni elemanı görecek
+            return; // the running worker will see the new element
         }
         let ctx = self.clone();
         std::thread::spawn(move || loop {
-            // KİLİT ÖMRÜ: sıradaki eleman kendi ifadesinde alınır, guard
-            // o satırın sonunda düşer. `while let Some(x) = sealing.read()
+            // LOCK LIFETIME: the next element is taken in its own expression so
+            // the guard drops at the end of that line. `while let Some(x) =
+            // sealing.read()
             // ...first().cloned()` YAZILMAZ: `while let`, `loop { match EXPR
             // { ... } }` olarak desugar edilir ve match scrutinee'sinin
-            // geçicileri GÖVDE dahil tüm blok boyunca yaşar — yani read
+            // temporaries live for the whole block INCLUDING THE BODY — so the
+            // read
             // kilidi tutulurken `build_one` write kilidi ister ve worker
-            // kendini kilitler. (Rust 2024 bunu `if let` için düzeltti,
-            // `while let` hâlâ eski davranışta; edition yükseltmek kurtarmaz.)
-            // Düz `while COND` güvenlidir: koşulun geçicileri koşul
-            // değerlendirmesi biterken düşer — merge worker'ı bu yüzden sağlam.
+            // deadlocks itself. (Rust 2024 fixed this for `if let`, but
+            // `while let` still has the old behaviour; upgrading the edition
+            // does not save you.) A plain `while COND` is safe: the condition's
+            // temporaries drop as soon as it is evaluated — which is why the
+            // merge worker was sound.
             loop {
                 let next = ctx.sealing.read().expect("kilit").first().cloned();
                 let Some(next) = next else { break };
                 ctx.build_one(&next);
             }
             ctx.in_flight.store(0, Ordering::SeqCst);
-            // Bayrağı bırakırken yeni mühürleme kuyruğa girmiş olabilir.
+            // A new sealing may have entered the queue while releasing the flag.
             if ctx.sealing.read().expect("kilit").is_empty()
                 || ctx.in_flight.swap(1, Ordering::SeqCst) == 1
             {
@@ -287,17 +310,16 @@ impl SealContext {
         });
     }
 
-    /// Tek bir mühürlemeyi tamamlar: HNSW'yi KİLİTSİZ kurar, sonra tek write
-    /// kilidi altında segmentlere taşır ve inşa sırasında düşen tombstone'ları
-    /// diff-replay ile birleşiğe aktarır.
+    /// Completes one sealing: builds the HNSW WITHOUT HOLDING A LOCK, then moves
+    /// it into the segments under a single write lock and carries over, via
+    /// diff-replay, the tombstones that landed during construction.
     fn build_one(&self, sealing: &Arc<Sealing>) {
         let t = std::time::Instant::now();
         let mut p = self.params.clone();
         p.seed = p.seed.wrapping_add(sealing.data.len() as u64);
         let mut hnsw = HnswIndex::new(self.dim, self.metric, p);
         for (id, v) in sealing.data.entries() {
-            hnsw.insert(id, v)
-                .expect("mühürleme insert'i başarısız olamaz");
+            hnsw.insert(id, v).expect("a sealing insert cannot fail");
         }
         let built = Arc::new(Segment {
             index: hnsw,
@@ -316,66 +338,69 @@ impl SealContext {
             .last_us
             .store(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         self.stats.count.fetch_add(1, Ordering::Relaxed);
-        // Tavan bekçisi: yeni segment eklendi, gerekiyorsa merge tetikle.
+        // Ceiling guard: a new segment was added, trigger a merge if needed.
         self.merge.spawn_if_needed();
     }
 }
 
-/// Buffer için önceden ayrılacak kayıt sayısı.
+/// The number of records to pre-allocate for the buffer.
 ///
-/// Eşik kadar yer ayırmak doğru davranış (#61: realloc sıçramasını kaldırır),
-/// ama eşik `usize::MAX` gibi "pratikte mühürleme yok" anlamında da
-/// kullanılıyor — o durumda ham eşik kadar ayırmak kapasite taşmasıyla
-/// PANİK veriyor. Bu yüzden ayırma bayt cinsinden sınırlanır: sınırın
-/// üstünde `Vec` eski kademeli büyüme davranışına döner (yalnız o uç
-/// durumda realloc sıçraması geri gelir, ki oradaki kullanım ölçüm/test).
+/// Allocating up to the threshold is the right behaviour (#61: it removes the
+/// realloc spike), but the threshold is also used as `usize::MAX` to mean "no
+/// sealing in practice" — and allocating the raw threshold in that case PANICS
+/// with a capacity overflow. So the allocation is bounded in bytes: above that
+/// bound `Vec` falls back to its old incremental growth (the realloc spike
+/// returns only in that extreme case, which is measurement/test usage).
 fn prealloc_records(seal_threshold: usize, dim: usize) -> usize {
     const MAX_PREALLOC_BYTES: usize = 512 << 20;
     let per_record = dim.max(1) * std::mem::size_of::<f32>();
     seal_threshold.min(MAX_PREALLOC_BYTES / per_record)
 }
 
-/// Sıralı posting listesine ekleme (varsa dokunmaz).
+/// Inserts into a sorted posting list (a no-op if already present).
 ///
-/// `binary_search` konumu verir; `insert` ortadan kaydırma yapar. Kaydırma
-/// O(n) ama posting listeleri insert yolunda kayıt başına yalnız birkaç kez
-/// güncelleniyor ve `Vec` kaydırması bitişik bellekte memmove — ölçümde
-/// insert maliyeti kayda değer biçimde değişmedi (BENCHMARKS 9c).
+/// `binary_search` gives the position and `insert` shifts from there. The shift
+/// is O(n), but posting lists are updated only a few times per record on the
+/// insert path and a `Vec` shift is a memmove over contiguous memory — in the
+/// measurements the insert cost did not change appreciably (BENCHMARKS 9c).
 fn posting_insert(list: &mut Vec<VectorId>, id: VectorId) {
     if let Err(pos) = list.binary_search(&id) {
         list.insert(pos, id);
     }
 }
 
-/// Sıralı posting listesinden çıkarma (yoksa dokunmaz).
+/// Removes from a sorted posting list (a no-op if absent).
 fn posting_remove(list: &mut Vec<VectorId>, id: VectorId) {
     if let Ok(pos) = list.binary_search(&id) {
         list.remove(pos);
     }
 }
 
-/// Merge istatistikleri (arka plan thread'i günceller, okuyucular gözlemler).
+/// Merge statistics (updated by the background thread, observed by readers).
 #[derive(Debug, Default)]
 struct MergeStats {
     last_us: AtomicU64,
     count: AtomicU64,
 }
 
-/// En küçük (canlı sayıya göre) iki segmenti tek segmentte yeniden inşa eder.
-/// **Arka plan thread'inde** koşar (9a-1) — `&self` yerine paylaşılan segment
-/// listesini alır, böylece yazıcı task'i bloke olmaz.
+/// Rebuilds the two smallest segments (by live count) into a single segment.
+/// Runs **on a background thread** (9a-1) — it takes the shared segment list
+/// rather than `&self`, so the writer task is never blocked.
 ///
-/// KRİTİK YARIŞ (bu fonksiyonun asıl zorluğu): mühürlü segment insert almaz
-/// ama **delete alır**. İnşa saniyeler sürerken kaynak segmentlere yeni
-/// tombstone düşebilir; inşa onları görmediği için o kayıtlar birleşiğe CANLI
-/// olarak kopyalanır. Takas anında, write kilidi altında, kaynakların GÜNCEL
-/// tombstone'ları ile inşa başındaki snapshot'ın FARKI birleşiğe uygulanır
-/// (diff-replay). Bu adım atlanırsa silinmiş kayıtlar sessizce geri gelir ve
-/// hiçbir latency ölçümü bunu yakalamaz.
+/// THE CRITICAL RACE (the real difficulty of this function): a sealed segment
+/// accepts no inserts but it does accept **deletes**. While the rebuild runs for
+/// seconds, new tombstones can land on the source segments; because the rebuild
+/// does not see them, those records would be copied into the merged segment as
+/// LIVE. At swap time, under the write lock, the DIFFERENCE between the sources'
+/// CURRENT tombstones and the snapshot taken at the start of the rebuild is
+/// applied to the merged segment (diff-replay). Skip this step and deleted
+/// records silently come back — and no latency measurement would ever catch
+/// it.
 ///
 /// Kilit disiplini: `delete_vector_only` tombstone'u `segments` READ kilidini
-/// tutarken yazar; takas `segments` WRITE kilidi alır. İkisi karşılıklı
-/// dışlamalı olduğu için "diff'i okudum, sonra yeni tombstone geldi, sonra
+/// while holding it; the swap takes the `segments` WRITE lock. Because the two
+/// are mutually exclusive, the interleaving "I read the diff, then a new
+/// tombstone arrived, then
 /// takas ettim" penceresi YOKTUR.
 fn merge_smallest_pair_bg(
     segments: &Arc<RwLock<Vec<Arc<Segment>>>>,
@@ -383,7 +408,8 @@ fn merge_smallest_pair_bg(
     metric: Metric,
     hnsw_params: &HnswParams,
 ) {
-    // 1. Kurbanları seç + tombstone SNAPSHOT'ını al (read kilidi kısa).
+    // 1. Pick the victims and take a SNAPSHOT of their tombstones (short read
+    //    lock).
     let (a, b, a_snap, b_snap) = {
         let segs = segments.read().expect("kilit");
         if segs.len() < 2 {
@@ -399,8 +425,8 @@ fn merge_smallest_pair_bg(
         (a, b, a_snap, b_snap)
     };
 
-    // 2. Kilitsiz yeniden inşa (asıl maliyet; okuyucular ve yazıcı çalışmaya
-    //    devam eder). Snapshot'taki tombstone'lular taşınmaz.
+    // 2. Lock-free rebuild (the real cost; readers and the writer keep running).
+    //    Records tombstoned in the snapshot are not carried over.
     let mut params = hnsw_params.clone();
     let total = a.index.len() + b.index.len();
     params.seed = params.seed.wrapping_add(total as u64).wrapping_add(1);
@@ -408,20 +434,19 @@ fn merge_smallest_pair_bg(
     for (seg, snap) in [(&a, &a_snap), (&b, &b_snap)] {
         for (id, v) in seg.index.live_entries() {
             if !snap.contains(&id) {
-                merged
-                    .insert(id, v)
-                    .expect("merge insert'i başarısız olamaz");
+                merged.insert(id, v).expect("a merge insert cannot fail");
             }
         }
     }
 
-    // 3. Atomik takas + diff-replay, TEK write kilidi altında.
+    // 3. Atomic swap + diff-replay, under a SINGLE write lock.
     let mut segs = segments.write().expect("kilit");
-    // Kaynaklar hâlâ listede mi? (Başka bir merge onları almış olabilir.)
+    // Are the sources still in the list? (Another merge may have taken them.)
     if !segs.iter().any(|s| Arc::ptr_eq(s, &a)) || !segs.iter().any(|s| Arc::ptr_eq(s, &b)) {
-        return; // takas iptal: inşa boşa gitti ama tutarlılık korundu
+        return; // swap cancelled: the rebuild was wasted but consistency holds
     }
-    // İnşa sırasında düşen YENİ tombstone'lar birleşiğe taşınır.
+    // NEW tombstones that landed during the rebuild are carried to the merged
+    // segment.
     let mut carried: HashSet<VectorId> = HashSet::new();
     for (seg, snap) in [(&a, &a_snap), (&b, &b_snap)] {
         let now = seg.tombstones.read().expect("kilit");
@@ -430,13 +455,13 @@ fn merge_smallest_pair_bg(
     let merged = Arc::new(Segment {
         index: merged,
         tombstones: RwLock::new(carried),
-        stored: RwLock::new(None), // birleşik yeni dosyaya yazılacak
+        stored: RwLock::new(None), // the merged segment will go to a new file
     });
     segs.retain(|s| !Arc::ptr_eq(s, &a) && !Arc::ptr_eq(s, &b));
     segs.push(merged);
 }
 
-/// MetaValue'nun sayısal izdüşümü (Range indeksine girenler).
+/// The numeric projection of a MetaValue (those that enter the Range index).
 fn numeric_value(v: &MetaValue) -> Option<f64> {
     match v {
         MetaValue::Int(i) => Some(*i as f64),
@@ -445,19 +470,20 @@ fn numeric_value(v: &MetaValue) -> Option<f64> {
     }
 }
 
-/// Planlayıcının kol kararı. `Scan` id'leri yanında taşır (bedava çıktılar);
-/// `Post` fallback kaynağını taşır ki <2k durumunda exact sayım yapılabilsin.
+/// The planner's arm decision. `Scan` carries the ids along (they come out for
+/// free); `Post` carries its fallback source so an exact count can be done in
+/// the <2k case.
 enum Arm {
-    /// Bir koşulun eşleşmesi kesin sıfır — sonuç boş.
+    /// One predicate matches exactly zero — the result is empty.
     Empty,
-    /// Kesin küçük eşleşme kümesi: doğrudan tarama.
+    /// A definitively small match set: scan directly.
     Scan(Vec<VectorId>),
-    /// Filtresiz gezinti + over-fetch; ŝ üst-sınır tahmininden.
+    /// Unfiltered traversal + over-fetch; ŝ from the upper-bound estimate.
     Post {
         s_hat: f64,
         fallback: FallbackSource,
     },
-    /// Tahmin yok (Eq'suz ve sayısal-indekssiz): gezinti-içi filtre.
+    /// No estimate (no Eq and no numeric index): in-traversal filtering.
     Legacy,
 }
 
@@ -502,14 +528,14 @@ impl SegmentedIndex {
         }
     }
 
-    /// Segment tavanını değiştir (test/deney için).
+    /// Changes the segment ceiling (for tests/experiments).
     pub fn set_max_segments(&mut self, max: usize) {
         self.max_segments = max.max(2);
     }
 
-    /// Mühürleme eşiğini değiştirir. Ölçümde mühürlemeyi devre dışı bırakmak
-    /// için (usize::MAX): aksi halde "fsync politikası" ölçümü araya giren
-    /// HNSW inşası yüzünden sessizce başka bir şeyi ölçer.
+    /// Changes the sealing threshold. Used to disable sealing during
+    /// measurements (usize::MAX): otherwise an "fsync policy" measurement
+    /// silently measures something else because an HNSW build cuts in.
     pub fn set_seal_threshold(&self, n: usize) {
         self.seal_threshold.store(n.max(1), Ordering::Relaxed);
     }
@@ -518,17 +544,19 @@ impl SegmentedIndex {
         self.seal_threshold.load(Ordering::Relaxed)
     }
 
-    /// Metadata'lı insert. Metadata'sız `insert_shared` boş geçer.
+    /// Insert with metadata. The metadata-free `insert_shared` passes an empty
+    /// map.
     pub fn insert_with_meta(
         &self,
         id: VectorId,
         vector: &[f32],
         meta: Metadata,
     ) -> Result<(), IndexError> {
-        // Write-ahead sırası (DECISIONS #36): (1) validasyon — mutasyon yok,
-        // (2) WAL append + politikaya göre fsync, (3) belleğe uygula.
-        // Ters sırada "istemciye hata döndük ama kayıt bellekte kaldı ve
-        // sonraki checkpoint onu kalıcılaştırdı" durumu oluşurdu.
+        // Write-ahead ordering (DECISIONS #36): (1) validation — no mutation,
+        // (2) WAL append + fsync per the policy, (3) apply to memory. In the
+        // reverse order you would get "we returned an error to the client but
+        // the record stayed in memory and the next checkpoint made it
+        // permanent".
         self.validate_insert(id, vector)?;
         if let Some(w) = self.wal.write().expect("kilit").as_mut() {
             w.append(&WalRecord::insert(id, vector, &meta))
@@ -537,29 +565,29 @@ impl SegmentedIndex {
         self.apply_insert(id, vector, meta)
     }
 
-    /// Insert'in bellek tarafı (WAL'sız). Replay bu yolu kullanır — replay
-    /// sırasında WAL bağlı olmadığı için kayıtlar ikiye katlanmaz.
+    /// The in-memory side of an insert (no WAL). Replay uses this path — since
+    /// the WAL is not attached during replay, records are not duplicated.
     fn apply_insert(&self, id: VectorId, vector: &[f32], meta: Metadata) -> Result<(), IndexError> {
         let should_seal = {
             let mut buffer = self.buffer.write().expect("kilit");
             buffer.insert(id, vector)?;
             buffer.len() >= self.seal_threshold.load(Ordering::Relaxed)
-        }; // write kilidi düşer; mühürleme kilitsiz çalışacak
+        }; // the write lock drops; sealing will run lock-free
         if !meta.is_empty() {
             self.index_metadata(id, meta);
         }
         if should_seal {
-            self.seal(); // tavan bekçisi seal'ın içinde
-                         // Mühürleme kuyruğu birikiyorsa yazıcıyı burada yavaşlat (#53).
-                         // Mühürlemeden SONRA: bekleme yalnız kuyruğun uzadığı anlarda
-                         // devreye girer, her insert'te değil.
+            self.seal(); // the ceiling guard lives inside seal()
+                         // If the sealing queue is accumulating, slow the writer
+                         // down here (#53). AFTER sealing: the wait only kicks in
+                         // when the queue grows, not on every insert.
             self.apply_backpressure();
         }
         Ok(())
     }
 
-    /// Insert doğrulaması: boyut ve id çakışması. Hiçbir şeyi değiştirmez —
-    /// WAL'a yazmadan önce çağrılabilsin diye ayrı.
+    /// Insert validation: dimension and id collision. Mutates nothing — kept
+    /// separate so it can be called before writing to the WAL.
     fn validate_insert(&self, id: VectorId, vector: &[f32]) -> Result<(), IndexError> {
         if vector.len() != self.dim {
             return Err(IndexError::DimensionMismatch {
@@ -570,10 +598,11 @@ impl SegmentedIndex {
         if self.buffer.read().expect("kilit").contains(id) {
             return Err(IndexError::DuplicateId(id));
         }
-        // 9a-2 "iki buffer" riski (DECISIONS #50): mühürlenmekte olan
-        // buffer'daki bir id yeni buffer'a ikinci kez eklenirse, çakışma
-        // ancak mühürleme bitince ortaya çıkardı — o noktada iki kopya da
-        // kalıcı olurdu. Bu yüzden duplicate kontrolü ORAYI DA gezer.
+        // The 9a-2 "two buffers" risk (DECISIONS #50): if an id living in the
+        // buffer being sealed were inserted a second time into the new buffer,
+        // the collision would only surface once sealing finished — and by then
+        // both copies would be permanent. That is why the duplicate check walks
+        // THAT source too.
         if self.sealing_contains_live(id) {
             return Err(IndexError::DuplicateId(id));
         }
@@ -586,16 +615,17 @@ impl SegmentedIndex {
         Ok(())
     }
 
-    /// Metadata'yı depoya + türetilmiş indekslere (posting-list'ler, sayısal
-    /// alanlar) işler. Insert yolu ile snapshot'tan yeniden kurma yolu bunu
-    /// paylaşır: türetilmiş yapılar diske yazılmadığı için tek kaynak burası.
+    /// Applies metadata to the store and to the derived indexes (posting lists,
+    /// numeric fields). The insert path and the rebuild-from-snapshot path share
+    /// this: since derived structures are never written to disk, this is their
+    /// single source.
     fn index_metadata(&self, id: VectorId, meta: Metadata) {
         let mut postings = self.postings.write().expect("kilit");
         for (key, value) in &meta {
             posting_insert(postings.entry((key.clone(), value.key())).or_default(), id);
         }
         drop(postings);
-        // Sayısal değerler Range indeksine de girer (Int/Float).
+        // Numeric values also enter the Range index (Int/Float).
         let mut numeric = self.numeric.write().expect("kilit");
         for (key, value) in &meta {
             if let Some(v) = numeric_value(value) {
@@ -606,10 +636,12 @@ impl SegmentedIndex {
         self.metadata.write().expect("kilit").insert(id, meta);
     }
 
-    /// Kardinalite tahmini: Eq koşullarının posting sayılarının minimumu
-    /// (VE bağlacı için üst sınır — kesişim daha küçük olabilir, büyük olamaz).
-    /// Eq koşulu yoksa None (Range için histogram tutmuyoruz).
-    /// Dönen küme: en küçük posting listesi (tarama kolunun aday kaynağı).
+    /// Cardinality estimate: the minimum of the posting counts of the Eq
+    /// predicates (an upper bound for an AND conjunction — the intersection can
+    /// be smaller, never larger). None when there is no Eq predicate (we keep no
+    /// histogram for Range here).
+    /// The returned set: the smallest posting list (the candidate source of the
+    /// scan arm).
     fn estimate(&self, filter: &Filter) -> Option<(usize, Vec<VectorId>)> {
         let keys = filter.eq_keys();
         if keys.is_empty() {
@@ -619,7 +651,7 @@ impl SegmentedIndex {
         let mut best: Option<&Vec<VectorId>> = None;
         for (k, mk) in keys {
             match postings.get(&(k.to_string(), mk)) {
-                // Herhangi bir Eq koşulunun hiç eşleşmesi yoksa sonuç boştur.
+                // If any Eq predicate has no matches at all, the result is empty.
                 None => return Some((0, Vec::new())),
                 Some(list) => {
                     if best.is_none_or(|b| list.len() < b.len()) {
@@ -631,14 +663,17 @@ impl SegmentedIndex {
         best.map(|s| (s.len(), s.clone()))
     }
 
-    /// Kol kararı (DECISIONS #29 + #31). Aralık tahmini muhafazakâr kullanılır:
-    /// - Küçük kol kararı asla tahminle verilmez: Eq'te sayım zaten kesin,
-    ///   Range'de sınırlı sayım (`enumerate_up_to`) kesinleştirir. Sınırlı
-    ///   sayım yalnız alt sınır ≤ limit iken denenir (alt sınır bile büyükse
-    ///   kesin büyüktür, sayım israf olur).
-    /// - Büyük kolun ŝ'ı ÜST sınırların minimumu (VE bağlacı Fréchet üst
-    ///   sınırı). Üst sınır küçük ŝ → büyük ef'' yönünde hata yapar; yanlışsa
-    ///   bedeli recall değil latency (ve <2k fallback'i zaten var).
+    /// The arm decision (DECISIONS #29 + #31). The interval estimate is used
+    /// conservatively:
+    /// - The small-arm decision is never made from an estimate: for Eq the count
+    ///   is already exact, and for Range a bounded count (`enumerate_up_to`)
+    ///   makes it exact. The bounded count is only attempted while the lower
+    ///   bound ≤ limit (if even the lower bound is large, the truth is certainly
+    ///   large and counting would be wasted).
+    /// - ŝ for the large arm is the minimum of the UPPER bounds (the Fréchet
+    ///   upper bound for an AND conjunction). An upper bound errs toward a small
+    ///   ŝ and hence a large ef''; when wrong, the price is latency rather than
+    ///   recall (and the <2k fallback exists anyway).
     fn plan(&self, filter: &Filter, k: usize) -> Arm {
         let n = self.len_shared().max(1);
         let scan_limit =
@@ -690,7 +725,7 @@ impl SegmentedIndex {
                     Some((_, set)) => FallbackSource::Ids(set),
                     None => {
                         let (key, lo, hi, _) =
-                            range_fallback.expect("upper varsa range kaynağı var");
+                            range_fallback.expect("if upper exists so does the range source");
                         FallbackSource::Range { key, lo, hi }
                     }
                 },
@@ -699,7 +734,7 @@ impl SegmentedIndex {
         }
     }
 
-    /// Ölçüm/test için: planlayıcının seçtiği kolun adı.
+    /// For measurement/tests: the name of the arm the planner chose.
     pub fn debug_plan_arm(&self, filter: &Filter, k: usize) -> &'static str {
         match self.plan(filter, k) {
             Arm::Empty => "empty",
@@ -709,7 +744,8 @@ impl SegmentedIndex {
         }
     }
 
-    /// Ölçüm için: bir sayısal alanın [lo, hi] kardinalite aralığı tahmini.
+    /// For measurement: the estimated cardinality interval of a numeric field
+    /// over [lo, hi].
     pub fn debug_range_estimate(&self, key: &str, lo: f64, hi: f64) -> (usize, usize) {
         self.numeric
             .read()
@@ -719,8 +755,9 @@ impl SegmentedIndex {
             .unwrap_or((0, 0))
     }
 
-    /// Tarama kolu: aday id'ler (en küçük posting listesi) üzerinde tam filtre
-    /// + doğrudan mesafe. Exact — graf hiç açılmaz.
+    /// The scan arm: the full filter plus direct distance computation over the
+    /// candidate ids (the smallest posting list). Exact — the graph is never
+    /// opened.
     fn scan_candidates(
         &self,
         query: &[f32],
@@ -744,13 +781,14 @@ impl SegmentedIndex {
             .iter()
             .cloned()
             .collect();
-        // Maliyet notları (ilk sürüm brute-force taramanın ~4 katıydı):
-        // - Tek Eq'li filtrede posting listesi ZATEN kesin eşleşme kümesi:
-        //   id başına metadata haritası sorgusu atlanır.
-        // - Kaynak-dışı döngü: id başına "tüm kaynakları dene" yerine kaynak
-        //   başına kalan id'ler elenir — aynı haritaya ardışık erişim,
+        // Cost notes (the first version was ~4x a brute-force scan):
+        // - For a single-Eq filter the posting list is ALREADY the exact match
+        //   set: the per-id metadata map lookup is skipped.
+        // - Source-outer loop: instead of "try every source" per id, the
+        //   remaining ids are eliminated per source — sequential access to the
+        //   same map,
         //   bulunan id bir daha denenmez.
-        // - Top-k heap: O(est·log k), tüm listeyi sıralamak yerine.
+        // - A top-k heap: O(est·log k), rather than sorting the whole list.
         let mut heap: std::collections::BinaryHeap<SearchResult> =
             std::collections::BinaryHeap::with_capacity(k + 1);
         let push = |id: VectorId, d: f32, heap: &mut std::collections::BinaryHeap<SearchResult>| {
@@ -773,7 +811,7 @@ impl SegmentedIndex {
         } else {
             candidates.to_vec()
         };
-        // En yeni kaynaktan eskiye: yaşayan kopya her zaman en yeni konumda
+        // Newest source to oldest: the live copy is always in the newest place
         // (sil→yeniden-ekle zinciri buffer'a, oradan daha yeni segmente gider).
         remaining.retain(|&id| {
             if let Some(v) = buffer.vector_of(id) {
@@ -783,7 +821,7 @@ impl SegmentedIndex {
                 true
             }
         });
-        // 9a-2: mühürlenmekte olan buffer'lar (yeniden eskiye)
+        // 9a-2: the buffers being sealed (newest to oldest)
         for sl in self.sealing_snapshot().iter().rev() {
             if remaining.is_empty() {
                 break;
@@ -810,7 +848,7 @@ impl SegmentedIndex {
                     if !tombs.contains(&id) {
                         push(id, self.metric.distance(query, v), &mut heap);
                     }
-                    false // bu segmentte bulundu (canlı ya da gölge) — arama biter
+                    false // found in this segment (live or shadowed) — search ends
                 } else {
                     true
                 }
@@ -821,16 +859,18 @@ impl SegmentedIndex {
         out
     }
 
-    /// Filtreli arama — üç kollu planlayıcı (gerekçe: BENCHMARKS filtre
-    /// süpürmesi; DECISIONS #28–29):
-    /// 1. Eq tahmini küçükse (≤ max(scan_factor·k, scan_fraction·n)):
-    ///    grafı açmadan posting listesinde doğrudan tarama — exact ve ucuz.
-    /// 2. Aksi halde FİLTRESİZ gezinti + over-fetch (ef'' = β·k/ŝ, tavanlı),
-    ///    filtre sonuçlara uygulanır; sonuç < 2k kalırsa exact taramaya düşer.
-    ///    Filtresiz gezinti, gezinti-içi filtrenin kümelenmiş-eşleşme
-    ///    patolojisine (grafın tamamını gezme) yapısal olarak bağışıktır.
-    /// 3. Eq koşulu yoksa (tahmin yok) gezinti-içi filtre + found<k güvenlik
-    ///    ağı — tek seçenek.
+    /// Filtered search — a three-arm planner (rationale: the BENCHMARKS filter
+    /// sweep; DECISIONS #28–29):
+    /// 1. If the Eq estimate is small (≤ max(scan_factor·k, scan_fraction·n)):
+    ///    scan the posting list directly without opening the graph — exact and
+    ///    cheap.
+    /// 2. Otherwise UNFILTERED traversal + over-fetch (ef'' = β·k/ŝ, capped),
+    ///    with the filter applied to the results; if fewer than 2k remain it
+    ///    falls back to an exact scan. Unfiltered traversal is structurally
+    ///    immune to the clustered-match pathology of in-traversal filtering
+    ///    (walking the entire graph).
+    /// 3. If there is no Eq predicate (no estimate), in-traversal filtering plus
+    ///    the found<k safety net — the only option.
     pub fn search_filtered(&self, query: &[f32], k: usize, filter: &Filter) -> Vec<SearchResult> {
         if filter.must.is_empty() {
             return self.search_shared(query, k);
@@ -838,8 +878,9 @@ impl SegmentedIndex {
         if k == 0 {
             return Vec::new();
         }
-        // Kısayol: tek Eq ve her yaşayan kayıt eşleşiyor → filtre davranışsal
-        // boş; filtresiz yol birebir eşdeğer (UI'dan varsayılan filtre durumu).
+        // Shortcut: a single Eq that every live record matches → the filter is
+        // behaviourally empty and the unfiltered path is exactly equivalent (the
+        // default-filter case coming from a UI).
         if filter.must.len() == 1 {
             if let Some((est, _)) = self.estimate(filter) {
                 if est >= self.len_shared().max(1) {
@@ -851,9 +892,10 @@ impl SegmentedIndex {
             Arm::Empty => Vec::new(),
             Arm::Scan(candidates) => self.scan_candidates(query, k, &candidates, filter),
             Arm::Post { s_hat, fallback } => {
-                // Post-filter kolu: FİLTRESİZ gezinti (patolojiye bağışık) +
-                // over-fetch + sonuçta filtre. ŝ üst sınır; gerçek seçicilik
-                // küçükse sonuç 2k'nın altında kalır ve exact fallback koşar.
+                // The post-filter arm: UNFILTERED traversal (immune to the
+                // pathology) + over-fetch + filtering of the results. ŝ is an
+                // upper bound; if the true selectivity is small, fewer than 2k
+                // results remain and the exact fallback runs.
                 let ef_over = ((self.planner.overfetch_beta * k as f64 / s_hat) as usize).clamp(
                     self.ef_search.max(2 * k),
                     (self.planner.overfetch_cap_factor * self.ef_search).max(4 * k),
@@ -877,7 +919,7 @@ impl SegmentedIndex {
                                 .filter(|r| !tombs.contains(&r.id) && allow(r.id)),
                         );
                     }
-                    // 9a-2: mühürlenmekte olan buffer'lar
+                    // 9a-2: the buffers being sealed
                     for sl in self.sealing_snapshot() {
                         let tombs = sl.tombstones.read().expect("kilit");
                         let allow_live = |id: VectorId| !tombs.contains(&id) && allow(id);
@@ -885,15 +927,16 @@ impl SegmentedIndex {
                     }
                     let buffer = self.buffer.read().expect("kilit");
                     all.extend(buffer.search_filtered(query, k, &allow));
-                } // kilitler düşer — fallback scan_candidates yeniden alacak
+                } // the locks drop — the fallback scan_candidates re-acquires them
                 all.sort();
                 let mut seen = HashSet::with_capacity(all.len());
                 all.retain(|r| seen.insert(r.id));
                 if all.len() < 2 * k {
-                    // Over-fetch penceresi eşleşme bölgesini ıskaladı (sorgu
-                    // eşleşmelerden uzak) ya da üst-sınır tahmini şişkindi
-                    // (VE korelasyonu): exact taramaya düş. Fallback adayları
-                    // kaynaktan gelir — Eq posting'i ya da Range tam sayımı.
+                    // Either the over-fetch window missed the match region (the
+                    // query is far from the matches) or the upper-bound estimate
+                    // was inflated (AND correlation): fall back to an exact scan.
+                    // The fallback candidates come from the source — an Eq
+                    // posting list or a full Range enumeration.
                     let candidates = match fallback {
                         FallbackSource::Ids(ids) => ids,
                         FallbackSource::Range { key, lo, hi } => self
@@ -909,8 +952,9 @@ impl SegmentedIndex {
                 all.truncate(k);
                 all
             }
-            // Tahmin yok (Eq'suz ve sayısal-indekssiz Range): gezinti-içi
-            // filtre + found<k güvenlik ağı tek seçenek.
+            // No estimate (no Eq, and a Range without a numeric index):
+            // in-traversal filtering plus the found<k safety net is the only
+            // option.
             Arm::Legacy => {
                 let meta = self.metadata.read().expect("kilit");
                 let allow = |id: VectorId| filter.matches_id(&meta, id);
@@ -951,36 +995,38 @@ impl SegmentedIndex {
         }
     }
 
-    /// Paylaşımlı (&self) insert — tek yazıcı thread'inden çağrılmalı.
-    /// Birden çok yazıcı data race üretmez (her şey kilitli) ama duplicate id
-    /// kontrolü iki yazıcı arasında yarışabilir; sözleşme tek yazıcıdır.
+    /// Shared (&self) insert — must be called from the single writer thread.
+    /// Multiple writers would not cause a data race (everything is locked), but
+    /// the duplicate-id check could race between two writers; the contract is a
+    /// single writer.
     pub fn insert_shared(&self, id: VectorId, vector: &[f32]) -> Result<(), IndexError> {
         self.insert_with_meta(id, vector, Metadata::new())
     }
 
-    /// Buffer'ı HNSW segmentine dönüştürür. Pahalı inşa kilitsiz yapılır;
-    /// okuyucular bu süre boyunca eski segmentler + dolu buffer'ı görmeye
-    /// devam eder (hiçbir vektör görünmez olmaz).
-    /// Mühürleme (9a-2: arka planda).
+    /// Sealing (9a-2: in the background).
     ///
-    /// Yazıcı task'inde SADECE şu yapılır: buffer'ı yeni boş bir buffer'la
+    /// Converts the buffer into an HNSW segment. The expensive build runs
+    /// lock-free; throughout it readers keep seeing the old segments plus the
+    /// full buffer (no vector ever becomes invisible).
+    ///
+    /// ONLY this happens on the writer task: swap the buffer with a new empty
     /// takas et ve eskisini `sealing` listesine koy (mikrosaniyeler).
-    /// Pahalı olan HNSW inşası arka plan thread'ine gider.
+    /// The expensive part, the HNSW build, goes to a background thread.
     ///
-    /// Bu andan itibaren "iki buffer" durumu doğar: mühürlenmekte olan
-    /// snapshot + yeni yazma buffer'ı. Arama, delete ve duplicate-id
-    /// kontrolü üç kaynağı da gezer (DECISIONS #50).
+    /// From this moment the "two buffers" state exists: the snapshot being
+    /// sealed plus the new write buffer. Search, delete and the duplicate-id
+    /// check all walk the three sources (DECISIONS #50).
     fn seal(&self) {
         let t_seal = std::time::Instant::now();
-        // 1. Atomik takas: buffer'ı al, yerine boş koy. Tek yazıcı
-        //    sözleşmesi gereği bu sırada başka insert olamaz.
+        // 1. Atomic swap: take the buffer, put an empty one in its place. Under
+        //    the single-writer contract no other insert can happen meanwhile.
         let sealed_data = {
             let mut buffer = self.buffer.write().expect("kilit");
             if buffer.is_empty() {
                 return;
             }
-            // Yeni buffer da kapasiteli: aksi halde her mühürlemeden sonra
-            // realloc merdiveni baştan başlar (#61).
+            // The new buffer is pre-sized too: otherwise the realloc ladder
+            // would start over after every sealing (#61).
             let fresh = BruteForceIndex::with_capacity(
                 self.dim,
                 self.metric,
@@ -992,7 +1038,8 @@ impl SegmentedIndex {
             data: sealed_data,
             tombstones: RwLock::new(HashSet::new()),
         });
-        // 2. Yayınla: arama artık bu kaynağı da gezecek, veri hiç görünmez
+        // 2. Publish: search will now walk this source too, so the data is never
+        //    invisible
         //    olmuyor.
         self.sealing
             .write()
@@ -1001,13 +1048,13 @@ impl SegmentedIndex {
         self.last_seal_us
             .store(t_seal.elapsed().as_micros() as u64, Ordering::Relaxed);
 
-        // 3. Kuyruğu TEK worker tüketir (#53). Burada yeni thread
-        //    doğurulmaz: sınırsız spawn, 35 eşzamanlı mühürlemenin hiçbirinin
-        //    bitememesine yol açıyordu (#52).
+        // 3. A SINGLE worker drains the queue (#53). No new thread is spawned
+        //    here: unbounded spawning was what left 35 concurrent sealings none
+        //    of which could finish (#52).
         self.seal_context().spawn_if_needed();
     }
 
-    /// Mühürleme worker'ının taşınabilir bağlamı.
+    /// The movable context of the sealing worker.
     fn seal_context(&self) -> SealContext {
         SealContext {
             segments: Arc::clone(&self.segments),
@@ -1021,24 +1068,26 @@ impl SegmentedIndex {
         }
     }
 
-    /// Backpressure (#53, ön-kayıt #49'un öngördüğü biçim).
+    /// Backpressure (#53, in the form pre-registration #49 anticipated).
     ///
-    /// Yazma REDDEDİLMEZ, yavaşlatılır (Lucene `IndexWriter` stall'ü): kuyruk
-    /// eşiği aşınca yazıcı 1 ms'lik uykularla bekler. Tek yazar sözleşmesi
-    /// korunur; bekleme hiçbir kilit tutmadan yapılır, okuyucular etkilenmez.
+    /// Writes are NOT REJECTED, they are slowed down (Lucene's `IndexWriter`
+    /// stall): once the queue threshold is crossed, the writer waits in 1 ms
+    /// sleeps. The single-writer contract is preserved; the wait holds no lock,
+    /// so readers are unaffected.
     ///
-    /// SİNYAL NEDEN YALNIZ KUYRUK (ilk deneme yanlıştı, #56): eşik önce
-    /// "mühürlenen + segment > 2×tavan" olarak yazılmıştı. Ama bir mühürleme
-    /// BİTTİĞİNDE bu toplam düşmez — eleman kuyruktan segmentlere taşınır,
-    /// toplam sabit kalır. Toplamı ancak merge düşürür, o da yalnız segment
-    /// sayısı tavanı aşınca çalışır. Sonuç: 1M ölçümünde yazıcı 110 saniye
-    /// boyunca 0 op/s'ye düştü ve 60 s'lik güvenlik sınırına dayandı.
-    /// Sınırlanması gereken boyut segment sayısı değil (onu merge tavanı
-    /// zaten bağlıyor), **sınırsız büyüyen kuyruğun kendisi**.
+    /// WHY THE SIGNAL IS THE QUEUE ALONE (the first attempt was wrong, #56): the
+    /// threshold was originally written as "sealing + segments > 2×ceiling". But
+    /// that sum does not drop when a sealing FINISHES — the element merely moves
+    /// from the queue into the segments and the sum stays constant. Only a merge
+    /// lowers it, and a merge runs only once the segment count exceeds the
+    /// ceiling. The result: in the 1M measurement the writer fell to 0 op/s for
+    /// 110 seconds and hit the 60 s safety limit. The dimension that needs
+    /// bounding is not the segment count (the merge ceiling already bounds that)
+    /// but **the queue itself, which grows without bound**.
     ///
-    /// Eşik 2: biri inşa edilirken bir tanesi sırada bekleyebilir. Bellek
-    /// böylece ~2 buffer ile sınırlı kalır ve sürdürülebilir yazma hızı
-    /// mühürleme hızına eşitlenir — asıl istenen davranış bu.
+    /// Threshold 2: one can wait in line while another is being built. Memory
+    /// thus stays bounded at ~2 buffers and the sustainable write rate settles
+    /// at the sealing rate — which is exactly the desired behaviour.
     fn apply_backpressure(&self) {
         const QUEUE_LIMIT: usize = 2;
         let queued = |s: &Self| s.sealing.read().expect("kilit").len();
@@ -1047,7 +1096,8 @@ impl SegmentedIndex {
         }
         let t = std::time::Instant::now();
         while queued(self) > QUEUE_LIMIT {
-            // Güvenlik valfi: worker beklenmedik şekilde ilerlemezse yazıcı
+            // Safety valve: if the worker unexpectedly fails to progress, the
+            // writer
             // sonsuza kadar beklemesin.
             if t.elapsed() > std::time::Duration::from_secs(60) {
                 break;
@@ -1059,7 +1109,7 @@ impl SegmentedIndex {
             .fetch_add(t.elapsed().as_micros() as u64, Ordering::Relaxed);
     }
 
-    /// Backpressure gözlemi: kaç insert bekletildi, toplam kaç µs.
+    /// Backpressure observability: how many inserts were stalled, for how many µs.
     pub fn stall_stats(&self) -> (u64, u64) {
         (
             self.stall_count.load(Ordering::Relaxed),
@@ -1067,10 +1117,7 @@ impl SegmentedIndex {
         )
     }
 
-    /// Tavan aşıldıysa arka planda merge başlatır. Zaten bir merge
-    /// çalışıyorsa yeni thread doğurulmaz: worker döngüsü tavana inene kadar
-    /// devam eder, yani yeni tetikler doğal olarak sıraya alınır.
-    /// Mühürlenmekte olan buffer'ların anlık listesi (9a-2).
+    /// A snapshot list of the buffers currently being sealed (9a-2).
     fn sealing_snapshot(&self) -> Vec<Arc<Sealing>> {
         self.sealing
             .read()
@@ -1080,7 +1127,7 @@ impl SegmentedIndex {
             .collect()
     }
 
-    /// Bir id mühürlenmekte olan buffer'larda YAŞIYOR mu?
+    /// Is an id LIVE in one of the buffers being sealed?
     fn sealing_contains_live(&self, id: VectorId) -> bool {
         self.sealing
             .read()
@@ -1089,7 +1136,7 @@ impl SegmentedIndex {
             .any(|s| s.data.contains(id) && !s.tombstones.read().expect("kilit").contains(&id))
     }
 
-    /// Merge tetikleyicisinin taşınabilir bağlamı.
+    /// The movable context of the merge trigger.
     fn merge_context(&self) -> MergeContext {
         MergeContext {
             segments: Arc::clone(&self.segments),
@@ -1102,19 +1149,20 @@ impl SegmentedIndex {
         }
     }
 
-    /// Mühürleme arka planda mı? (9a-2)
+    /// Is a sealing running in the background? (9a-2)
     pub fn seal_in_flight(&self) -> usize {
         self.seal_in_flight.load(Ordering::SeqCst)
     }
 
-    /// Son mühürleme süresi (µs) — 9a-2'den sonra ARKA PLANDA geçen süre.
+    /// Duration of the last sealing (µs) — after 9a-2 this is time spent IN THE
+    /// BACKGROUND.
     pub fn last_seal_build_us(&self) -> u64 {
         self.seal_stats.last_us.load(Ordering::Relaxed)
     }
 
-    /// Devam eden tüm mühürlemeler bitene kadar bekler.
-    /// Tek worker olduğu için "devam eden" = worker aktif VEYA kuyruk dolu;
-    /// ikisi de sıfırlanmadan beklemeyi bitirmek erken dönmek olurdu.
+    /// Waits until every in-flight sealing has finished.
+    /// With a single worker, "in flight" means the worker is active OR the queue
+    /// is non-empty; ending the wait before both are clear would return early.
     pub fn wait_for_seal(&self) {
         while self.seal_in_flight.load(Ordering::SeqCst) > 0
             || !self.sealing.read().expect("kilit").is_empty()
@@ -1123,7 +1171,7 @@ impl SegmentedIndex {
         }
     }
 
-    /// Mühürleme + merge işlerinin tamamı bitene kadar bekler.
+    /// Waits until all sealing and merge work has finished.
     pub fn wait_for_background(&self) {
         loop {
             self.wait_for_seal();
@@ -1137,25 +1185,26 @@ impl SegmentedIndex {
         }
     }
 
-    /// Arka planda merge var mı?
+    /// Is a merge running in the background?
     pub fn merge_in_flight(&self) -> bool {
         self.merge_in_flight.load(Ordering::SeqCst)
     }
 
-    /// Testler/ölçüm için: arka plan merge'i bitene kadar bekler.
+    /// For tests/measurements: waits until the background merge finishes.
     pub fn wait_for_merge(&self) {
         while self.merge_in_flight.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
 
-    /// Son mühürleme süresi (µs) — yazıcıyı bloke eden pencere.
+    /// Duration of the last sealing (µs) — the window that blocks the writer.
     pub fn last_seal_us(&self) -> u64 {
         self.last_seal_us.load(Ordering::Relaxed)
     }
 
-    /// Son merge süresi (µs) ve toplam merge sayısı. 9a-1'den sonra bu süre
-    /// ARKA PLAN thread'inde geçen süredir — yazıcı o sırada bloke değildir.
+    /// Duration of the last merge (µs) and the total merge count. After 9a-1
+    /// this is time spent on the BACKGROUND thread — the writer is not blocked
+    /// during it.
     pub fn last_merge_us(&self) -> u64 {
         self.merge_stats.last_us.load(Ordering::Relaxed)
     }
@@ -1164,8 +1213,8 @@ impl SegmentedIndex {
         self.merge_stats.count.load(Ordering::Relaxed)
     }
 
-    /// WAL politikasını değiştirir (aynı dosyaya devam eder). Ölçümde üç
-    /// politikayı tek indeks üzerinde karşılaştırmak için.
+    /// Changes the WAL policy (continuing with the same file). Used by
+    /// measurements to compare all three policies on a single index.
     pub fn set_wal_policy(&self, policy: SyncPolicy) -> Result<(), IndexError> {
         let mut guard = self.wal.write().expect("kilit");
         if let Some(old) = guard.take() {
@@ -1178,17 +1227,18 @@ impl SegmentedIndex {
         Ok(())
     }
 
-    /// Metadata yapılarının hesaplanan bellek maliyeti (byte):
-    /// (metadata haritası, Eq posting-list'leri, sayısal alan indeksleri).
-    /// 9c eşiği bu hesaplanan değerlere göre değerlendirilir — RSS'te
-    /// metadata ayrıştırılamaz (DECISIONS #40).
+    /// Computed memory cost of the metadata structures (bytes):
+    /// (the metadata map, the Eq posting lists, the numeric field indexes).
+    /// The 9c threshold is evaluated against these computed values — metadata
+    /// cannot be isolated within RSS (DECISIONS #40).
     pub fn metadata_memory_bytes(&self) -> (usize, usize, usize) {
-        // 9c: kompakt temsil kendi boyutunu biliyor (sözlük + kayıt gövdeleri).
+        // 9c: the compact representation knows its own size (dictionary + record
+        // bodies).
         let meta_bytes = self.metadata.read().expect("kilit").memory_bytes();
         let postings = self.postings.read().expect("kilit");
         let mut post_bytes = postings.capacity() * 64;
         for ((k, _), list) in postings.iter() {
-            // Sıralı Vec: id başına tam 8 byte (HashSet'te 16 + doluluk payı).
+            // A sorted Vec: exactly 8 bytes per id (16 plus slack in a HashSet).
             post_bytes += k.len() + list.capacity() * 8;
         }
         let numeric = self.numeric.read().expect("kilit");
@@ -1199,28 +1249,32 @@ impl SegmentedIndex {
         (meta_bytes, post_bytes, num_bytes)
     }
 
-    /// ÖLÇÜM KANCASI (9c-0): türetilmiş metadata yapılarını TEK TEK boşaltır.
+    /// A MEASUREMENT HOOK (9c-0): empties the derived metadata structures ONE BY
+    /// ONE.
     ///
-    /// Neden var: `metadata_memory_bytes()` kaba tahminlerle çalışıyor
-    /// (capacity × sabit katsayı) ve 9c'nin GO kararı o tahmine dayanıyor.
-    /// Tahmini doğrulamanın yolu, yapıyı bırakıp RSS farkını ölçmek.
-    /// `clear()` YETMEZ (kapasiteyi tutar) — yapı yenisiyle DEĞİŞTİRİLİR.
+    /// Why it exists: `metadata_memory_bytes()` works from rough estimates
+    /// (capacity × a fixed factor) and 9c's GO decision rests on that estimate.
+    /// The way to validate an estimate is to drop the structure and measure the
+    /// RSS delta. `clear()` is NOT ENOUGH (it keeps the capacity) — the structure
+    /// is REPLACED with a new one.
     ///
-    /// İndeksi kullanılamaz hale getirir; yalnız ölçüm modunda çağrılır.
+    /// This renders the index unusable; it is only called from measurement
+    /// modes.
     pub fn clear_for_measurement(&self, what: &str) {
         match what {
             "numeric" => *self.numeric.write().expect("kilit") = HashMap::new(),
             "postings" => *self.postings.write().expect("kilit") = HashMap::new(),
             "metadata" => *self.metadata.write().expect("kilit") = MetaStore::new(),
-            other => panic!("bilinmeyen ölçüm kancası: {other}"),
+            other => panic!("unknown measurement hook: {other}"),
         }
     }
 
-    /// Paylaşımlı (&self) silme — tek yazıcı thread'inden.
-    /// Metadata da düşürülür (yeniden eklemede eski metadata sızmasın).
+    /// Shared (&self) deletion — from the single writer thread.
+    /// The metadata is dropped too (so old metadata cannot leak into a
+    /// re-insertion).
     pub fn delete_shared(&self, id: VectorId) -> Result<(), IndexError> {
-        // Write-ahead: önce "bu id yaşıyor mu" (mutasyonsuz kontrol), sonra
-        // WAL, sonra gerçek silme.
+        // Write-ahead: first "is this id live" (a mutation-free check), then the
+        // WAL, then the actual deletion.
         if !self.contains_live(id) {
             return Err(IndexError::NotFound(id));
         }
@@ -1231,7 +1285,8 @@ impl SegmentedIndex {
         self.apply_delete(id)
     }
 
-    /// id yaşayan bir kayda mı ait? (buffer ya da tombstone'suz segment)
+    /// Does this id belong to a live record? (the buffer, or a segment without
+    /// a tombstone for it)
     fn contains_live(&self, id: VectorId) -> bool {
         if self.buffer.read().expect("kilit").contains(id) {
             return true;
@@ -1244,12 +1299,12 @@ impl SegmentedIndex {
         })
     }
 
-    /// Silmenin bellek tarafı (WAL'sız); replay bu yolu kullanır.
+    /// The in-memory side of a deletion (no WAL); replay uses this path.
     fn apply_delete(&self, id: VectorId) -> Result<(), IndexError> {
         let res = self.delete_vector_only(id);
         if res.is_ok() {
-            // Posting-list'ler yalnız yaşayan id'leri içerir: metadata'yı
-            // düşürmeden önce anahtarlarını okuyup listelerden çıkar.
+            // Posting lists contain only live ids: read the record's keys before
+            // dropping its metadata, and remove it from those lists.
             if let Some(meta) = self.metadata.write().expect("kilit").remove(id) {
                 let mut postings = self.postings.write().expect("kilit");
                 for (key, value) in &meta {
@@ -1272,7 +1327,8 @@ impl SegmentedIndex {
     }
 
     fn delete_vector_only(&self, id: VectorId) -> Result<(), IndexError> {
-        // Önce buffer: oradaysa gerçek silme (brute-force swap-remove).
+        // The buffer first: if it is there, a real deletion (brute-force
+        // swap-remove).
         {
             let mut buffer = self.buffer.write().expect("kilit");
             match buffer.delete(id) {
@@ -1281,9 +1337,9 @@ impl SegmentedIndex {
                 Err(e) => return Err(e),
             }
         }
-        // 9a-2: sonra mühürlenmekte olan buffer'lar (yeniden eskiye).
-        // Snapshot değişmez olduğu için silme burada da TOMBSTONE'dur;
-        // inşa biterken diff-replay onu birleşiğe taşır.
+        // 9a-2: then the buffers being sealed (newest to oldest). Because the
+        // snapshot is immutable, a deletion here is a TOMBSTONE as well; when the
+        // build finishes, diff-replay carries it into the merged segment.
         {
             let sealing = self.sealing.read().expect("kilit");
             for sl in sealing.iter().rev() {
@@ -1297,8 +1353,9 @@ impl SegmentedIndex {
                 }
             }
         }
-        // Sonra segmentler (yeniden ekleme zincirinde yaşayan kopya en yenidedir,
-        // yeniden ekleme buffer'a gittiği için segmentlerde en fazla bir canlı kopya olur).
+        // Then the segments (in a re-insertion chain the live copy is the newest
+        // one; since re-insertions go to the buffer, at most one live copy can
+        // exist across the segments).
         let segments = self.segments.read().expect("kilit");
         for seg in segments.iter().rev() {
             if seg.index.contains(id) {
@@ -1307,21 +1364,23 @@ impl SegmentedIndex {
                     return Ok(());
                 }
                 // zaten tombstone'luysa daha eski segmentlere bakmaya gerek yok:
-                // canlı kopya olsaydı bu tombstone atılırken silinmiş olurdu
+                // if there were a live copy it would have been removed when this
+                // tombstone was written
                 return Err(IndexError::NotFound(id));
             }
         }
         Err(IndexError::NotFound(id))
     }
 
-    /// Kilitsiz-esaslı arama: segment listesi klonlanır, HNSW aramaları
-    /// hiçbir kilit tutulmadan koşar; buffer araması kısa read kilidiyle.
+    /// Essentially lock-free search: the segment list is cloned, the HNSW
+    /// searches run holding no lock, and the buffer search takes a short read
+    /// lock.
     pub fn search_shared(&self, query: &[f32], k: usize) -> Vec<SearchResult> {
         self.search_shared_with_ef(query, k, self.ef_search)
     }
 
-    /// `search_shared`'ın ef parametreli hali (parametre süpürmesi ve
-    /// ölçüm için; grafı etkilemez, yalnız sorgu genişliğini değiştirir).
+    /// The ef-parameterized form of `search_shared` (for parameter sweeps and
+    /// measurements; it does not affect the graph, only the query width).
     pub fn search_shared_with_ef(&self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult> {
         if k == 0 {
             return Vec::new();
@@ -1337,14 +1396,15 @@ impl SegmentedIndex {
         let mut all: Vec<SearchResult> = Vec::new();
         for seg in &segments {
             let tombs = seg.tombstones.read().expect("kilit");
-            // Tombstone'lar sonuçları eleyebileceği için fazladan aday iste;
-            // tombstone sayısı k'yı aşarsa bile ef zaten üst sınırı belirler.
+            // Ask for extra candidates since tombstones can eliminate results;
+            // even if the tombstone count exceeds k, ef already sets the upper
+            // bound.
             let want = k + tombs.len().min(k);
             let res = seg.index.search_with_ef(query, want, ef.max(want));
             all.extend(res.into_iter().filter(|r| !tombs.contains(&r.id)));
         }
-        // 9a-2: mühürlenmekte olan buffer'lar da gezilir — aksi halde
-        // mühürleme süresince o veri GÖRÜNMEZ olurdu.
+        // 9a-2: the buffers being sealed are walked too — otherwise that data
+        // would be INVISIBLE for the duration of the sealing.
         for sealing in self.sealing_snapshot() {
             let tombs = sealing.tombstones.read().expect("kilit");
             all.extend(
@@ -1359,8 +1419,9 @@ impl SegmentedIndex {
             let buffer = self.buffer.read().expect("kilit");
             all.extend(buffer.search(query, k));
         }
-        // id bazında tekilleştir (mühürleme penceresindeki kopyalar için):
-        // aynı id'nin kopyaları aynı vektördür, hangisi kalırsa kalsın.
+        // Deduplicate by id (for the duplicates that exist during the sealing
+        // window): copies of the same id hold the same vector, so it does not
+        // matter which one survives.
         all.sort();
         let mut seen = HashSet::with_capacity(all.len());
         all.retain(|r| seen.insert(r.id));
@@ -1374,7 +1435,7 @@ impl SegmentedIndex {
             .iter()
             .map(|s| s.index.len() - s.tombstones.read().expect("kilit").len())
             .sum();
-        // 9a-2: mühürlenmekte olan buffer'lar da canlı kayıt taşır.
+        // 9a-2: the buffers being sealed carry live records too.
         let sealing_live: usize = self
             .sealing
             .read()
@@ -1385,9 +1446,10 @@ impl SegmentedIndex {
         seg_live + sealing_live + self.buffer.read().expect("kilit").len()
     }
 
-    // ---- Kalıcılık: soğuk yol (Aşama 7a) ----
+    // ---- Persistence: the cold path (phase 7a) ----
 
-    /// Kalıcılık dizinini bağlar (bellek-içi indeksi kalıcı hale getirir).
+    /// Attaches a persistence directory (turning an in-memory index into a
+    /// persistent one).
     pub fn attach_storage(&self, dir: PathBuf) {
         *self.storage_dir.write().expect("kilit") = Some(dir);
     }
@@ -1400,36 +1462,37 @@ impl SegmentedIndex {
         self.generation.load(Ordering::Relaxed)
     }
 
-    /// Son başarılı checkpoint'in unix zamanı; 0 = henüz yok.
+    /// Unix time of the last successful checkpoint; 0 = none yet.
     pub fn last_checkpoint_unix(&self) -> u64 {
         self.last_checkpoint.load(Ordering::Relaxed)
     }
 
-    /// Checkpoint: buffer'ı mühürle → yeni segmentleri yaz → metadata
-    /// snapshot'ı yaz → manifest'i atomik takas et → referanssızları temizle.
+    /// Checkpoint: seal the buffer → write the new segments → write the metadata
+    /// snapshot → swap the manifest atomically → clean up unreferenced files.
     ///
-    /// Yazma sırası kritik: manifest EN SON yazılır, GC ondan SONRA çalışır.
-    /// Böylece her an diskteki manifest, referansladığı tüm dosyalar var
-    /// olacak şekilde tutarlıdır; kesinti hangi adımda olursa olsun eski
-    /// manifest geçerli kalır (yeni dosyalar yetim kalır, sonraki GC toplar).
+    /// The write order is critical: the manifest is written LAST and GC runs
+    /// AFTER it. That way the manifest on disk is at every instant consistent
+    /// with all the files it references; whichever step is interrupted, the old
+    /// manifest stays valid (new files are orphaned and a later GC collects
+    /// them).
     ///
-    /// Tek yazar sözleşmesi gereği yazıcı task'inden çağrılır.
+    /// Called from the writer task, per the single-writer contract.
     pub fn checkpoint(&self) -> Result<u64, StorageError> {
         let dir = self.storage_dir().ok_or_else(|| {
             StorageError::Io(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "kalıcılık dizini bağlı değil (attach_storage/open_or_create)",
+                "no persistence directory attached (attach_storage/open_or_create)",
             ))
         })?;
         std::fs::create_dir_all(&dir)?;
-        // Buffer'ı mühürle: checkpoint sonrası tüm veri segmentlerde olsun ki
-        // WAL rotasyonu (7b) hiçbir kaydı sahipsiz bırakmasın.
+        // Seal the buffer so that after the checkpoint all data lives in
+        // segments and the WAL rotation (7b) orphans no record.
         //
-        // 9a-2: mühürleme artık ASENKRON. Beklemezsek `sealing` listesindeki
-        // veri hiçbir segmentte olmaz, manifest onu göremez ve WAL rotasyonu
-        // onu sahipsiz bırakır → VERİ KAYBI. Checkpoint bu yüzden mühürleme
-        // ve merge işlerinin bitmesini bekler (nadir ve öngörülebilir bir
-        // duraklama; yazma yolundaki pencere değil).
+        // 9a-2: sealing is now ASYNCHRONOUS. Without waiting, the data in the
+        // `sealing` list would be in no segment, the manifest would not see it,
+        // and the WAL rotation would orphan it → DATA LOSS. So a checkpoint waits
+        // for the sealing and merge work to finish (a rare and predictable pause,
+        // not a window on the write path).
         self.seal();
         self.wait_for_background();
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
@@ -1445,7 +1508,7 @@ impl SegmentedIndex {
         for (i, seg) in segments.iter().enumerate() {
             let existing = seg.stored.read().expect("kilit").clone();
             let stored = match existing {
-                // Değişmez: bir kez yazılan segment bir daha yazılmaz.
+                // Immutable: a segment written once is never written again.
                 Some(s) => s,
                 None => {
                     let bytes = seg.index.to_bytes()?;
@@ -1489,10 +1552,11 @@ impl SegmentedIndex {
             (Some(name), storage::crc32(&bytes))
         };
 
-        // WAL rotasyonu: buffer mühürlendiği için eski WAL'ın TÜM kayıtları
-        // artık segmentlerde. Yeni (boş) dosyayı manifest yazılmadan ÖNCE
-        // açarız; manifest yeni adı işaret eder, GC eskisini siler. Kesinti
-        // olursa eski manifest hâlâ eski WAL'ı işaret eder — tutarlı.
+        // WAL rotation: because the buffer was sealed, ALL records of the old
+        // WAL now live in segments. The new (empty) file is opened BEFORE the
+        // manifest is written; the manifest points at the new name and GC deletes
+        // the old one. On an interruption the old manifest still points at the
+        // old WAL — consistent.
         let wal_file = {
             let mut guard = self.wal.write().expect("kilit");
             match guard.as_ref() {
@@ -1526,8 +1590,8 @@ impl SegmentedIndex {
         Ok(generation)
     }
 
-    /// WAL'ı zorla fsync'ler (grup penceresini kapatır). Graceful shutdown ve
-    /// yazıcı task'inin batch sonu bunu çağırır.
+    /// Forces an fsync of the WAL (closing the group window). Called by graceful
+    /// shutdown and at the end of the writer task's batch.
     pub fn flush_wal(&self) -> Result<(), IndexError> {
         if let Some(w) = self.wal.write().expect("kilit").as_mut() {
             w.sync().map_err(|e| IndexError::Storage(e.to_string()))?;
@@ -1535,7 +1599,7 @@ impl SegmentedIndex {
         Ok(())
     }
 
-    /// Grup penceresi dolduysa fsync'ler; batch sonunda ucuz çağrı.
+    /// fsyncs if the group window has elapsed; a cheap call at the end of a batch.
     pub fn sync_wal_if_due(&self) -> Result<bool, IndexError> {
         if let Some(w) = self.wal.write().expect("kilit").as_mut() {
             return w
@@ -1545,10 +1609,10 @@ impl SegmentedIndex {
         Ok(false)
     }
 
-    /// Batch sonu commit: politikanın vaat ettiği dayanıklılığı sağlar
-    /// (None → yalnız OS'e teslim, diğerleri → fsync). Yazıcı task'i HTTP
-    /// yanıtlarını göndermeden ÖNCE çağırır; group commit'in
-    /// "200 = fsync'lendi" sözleşmesi buna dayanır.
+    /// End-of-batch commit: provides the durability the policy promises (None →
+    /// hand to the OS only, the others → fsync). The writer task calls it BEFORE
+    /// sending HTTP responses; group commit's "200 = fsynced" contract rests on
+    /// it.
     pub fn commit_wal(&self) -> Result<(), IndexError> {
         if let Some(w) = self.wal.write().expect("kilit").as_mut() {
             w.commit().map_err(|e| IndexError::Storage(e.to_string()))?;
@@ -1556,7 +1620,7 @@ impl SegmentedIndex {
         Ok(())
     }
 
-    /// Aktif WAL'ın bayt boyutu (0 = WAL yok).
+    /// Size of the active WAL in bytes (0 = no WAL).
     pub fn wal_len_bytes(&self) -> u64 {
         self.wal
             .read()
@@ -1574,16 +1638,18 @@ impl SegmentedIndex {
             .map(|w| w.policy().label())
     }
 
-    /// Açılışta yapılan WAL replay'inin raporu.
+    /// Report of the WAL replay performed at startup.
     pub fn replay_report(&self) -> ReplayReport {
         self.replay_report.read().expect("kilit").clone()
     }
 
-    /// Dizinde manifest varsa oradan kurar, yoksa verilen parametrelerle boş
-    /// indeks açar. Her iki durumda da dizin bağlanır.
+    /// Builds from the manifest if the directory has one; otherwise opens an
+    /// empty index with the given parameters. Either way the directory is
+    /// attached.
     ///
-    /// Manifest varsa dim/metric/params/eşikler ONDAN gelir: diskteki gerçek,
-    /// çağıranın varsayımını ezer (yanlış dim ile açıp veriyi bozmak yerine).
+    /// When a manifest exists, dim/metric/params/thresholds come FROM IT: the
+    /// truth on disk overrides the caller's assumption (rather than opening with
+    /// the wrong dim and corrupting the data).
     pub fn open_or_create(
         dir: PathBuf,
         dim: usize,
@@ -1594,10 +1660,10 @@ impl SegmentedIndex {
         Self::open_inner(dir, dim, metric, hnsw_params, seal_threshold, None)
     }
 
-    /// WAL'lı açılış: manifest + segmentler yüklenir, ardından WAL replay
-    /// edilir ve log append modunda bağlanır. Kurtarma her zaman WAL'la
-    /// tamamlanır — manifest tek başına yeterli sayılmaz (DECISIONS #33'teki
-    /// Windows dizin-fsync boşluğu).
+    /// Opening with a WAL: the manifest and segments are loaded, then the WAL is
+    /// replayed and attached in append mode. Recovery is always completed with
+    /// the WAL — the manifest alone is not considered sufficient (the Windows
+    /// directory-fsync gap in DECISIONS #33).
     pub fn open_durable(
         dir: PathBuf,
         dim: usize,
@@ -1622,8 +1688,9 @@ impl SegmentedIndex {
             let idx = Self::new(dim, metric, hnsw_params, seal_threshold);
             idx.attach_storage(dir.clone());
             if let Some(policy) = wal_policy {
-                // Manifest yok ama WAL olabilir: önceki koşu checkpoint'e
-                // ulaşamadan çöktüyse tüm veri oradadır.
+                // There is no manifest but there may be a WAL: if the previous
+                // run crashed before reaching a checkpoint, all the data is
+                // there.
                 let name = Manifest::wal_file_name(0);
                 idx.recover_wal(&dir, &name, policy)?;
             }
@@ -1656,7 +1723,7 @@ impl SegmentedIndex {
 
         if let Some(file) = &manifest.metadata_file {
             let bytes = storage::read_verified(&dir, file, manifest.metadata_crc)?;
-            // Türetilmiş yapılar (posting-list'ler, sayısal indeksler) burada
+            // The derived structures (posting lists, numeric indexes) are
             // yeniden kurulur — diske yazılmadılar, tek kaynak metadata.
             for (id, meta) in storage::decode_metadata(&bytes, &dir.join(file))? {
                 idx.index_metadata(id, meta);
