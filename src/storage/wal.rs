@@ -374,7 +374,10 @@ mod tests {
         for cut in [good.len() - 1, good.len() - 5, good.len() / 2] {
             std::fs::write(&path, &good[..cut]).unwrap();
             let (recs, rep) = replay(&path).unwrap();
-            assert!(recs.len() < 3, "a full record came out of a truncated file: {cut}");
+            assert!(
+                recs.len() < 3,
+                "a full record came out of a truncated file: {cut}"
+            );
             assert!(rep.truncated_at.is_some());
             // the file must have been truncated at the intact prefix
             let after = std::fs::metadata(&path).unwrap().len();
@@ -382,7 +385,10 @@ mod tests {
             // a second replay must give the same result and no longer truncate
             let (recs2, rep2) = replay(&path).unwrap();
             assert_eq!(recs2, recs);
-            assert!(rep2.truncated_at.is_none(), "the second replay must be clean");
+            assert!(
+                rep2.truncated_at.is_none(),
+                "the second replay must be clean"
+            );
         }
     }
 
@@ -396,8 +402,15 @@ mod tests {
         let boundary = 8 + first_len;
         std::fs::write(&path, &good[..boundary]).unwrap();
         let (recs, rep) = replay(&path).unwrap();
-        assert_eq!(recs.len(), 1, "a cut at the boundary must preserve the full record");
-        assert!(rep.truncated_at.is_none(), "a boundary counts as a clean end");
+        assert_eq!(
+            recs.len(),
+            1,
+            "a cut at the boundary must preserve the full record"
+        );
+        assert!(
+            rep.truncated_at.is_none(),
+            "a boundary counts as a clean end"
+        );
     }
 
     #[test]
@@ -412,7 +425,11 @@ mod tests {
         bad[second_body + 1] ^= 0xff;
         std::fs::write(&path, &bad).unwrap();
         let (recs, rep) = replay(&path).unwrap();
-        assert_eq!(recs.len(), 1, "nothing after a corrupt record may be applied");
+        assert_eq!(
+            recs.len(),
+            1,
+            "nothing after a corrupt record may be applied"
+        );
         assert_eq!(rep.reason.as_deref(), Some("crc mismatch"));
         assert_eq!(rep.truncated_at, Some(8 + first_len as u64));
     }

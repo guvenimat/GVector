@@ -1,17 +1,19 @@
-//! Kalıcılık altyapısı (Aşama 7a): dayanıklı yazım, çerçeveli dosya formatı,
+//! Persistence infrastructure (phase 7a): durable writes, a framed file format,
 //! manifest.
 //!
-//! Tasarım ilkeleri:
-//! - **Segment dosyaları değişmezdir.** Adları yazıldıkları generation'ı taşır
-//!   (`segment-<gen>-<idx>.gvdb`) ve bir daha asla üzerine yazılmaz. Bu hem
-//!   Windows dosya kilitleriyle uyumludur (açık handle'lı dosyaya yazmayız)
-//!   hem de her checkpoint'in yalnız YENİ segmentleri yazmasını sağlar —
-//!   1M ölçeğinde checkpoint maliyetini belirleyen şey budur.
-//! - **Manifest tek gerçek kaynaktır** ve atomik takas edilir (tmp + fsync +
-//!   rename). Yarım yazılmış manifest asla görünmez.
-//! - **Türetilebilir yapılar diske yazılmaz**: Eq posting-list'leri ve sayısal
+//! Design principles:
+//! - **Segment files are immutable.** Their names carry the generation they
+//!   were written in (`segment-<gen>-<idx>.gvdb`) and are never overwritten.
+//!   This is both compatible with Windows file locking (we never write to a
+//!   file with an open handle) and makes every checkpoint write only the NEW
+//!   segments — which is what determines checkpoint cost at 1M scale.
+//! - **The manifest is the single source of truth** and is swapped atomically
+//!   (tmp + fsync + rename). A half-written manifest is never visible.
+//! - **Derivable structures are not written to disk**: Eq posting lists and the
+//!   numeric
 //!   alan indeksleri metadata'dan tam olarak yeniden kurulur. Tek kaynak →
-//!   tutarsızlık riski yapısal olarak yok.
+//!   indexes are rebuilt at startup, so there is structurally no risk of them
+//!   drifting out of sync.
 
 pub mod wal;
 
@@ -25,22 +27,23 @@ use std::path::{Path, PathBuf};
 pub const MANIFEST_NAME: &str = "MANIFEST";
 const MANIFEST_MAGIC: [u8; 4] = *b"GVMF";
 const METADATA_MAGIC: [u8; 4] = *b"GVMD";
-/// Aşama 7 formatı. Aşama 3'ün tek-indeks formatıyla geriye uyum aranmaz.
+/// The phase 7 format. No backward compatibility with phase 3's single-index
+/// format is attempted.
 pub const STORAGE_VERSION: u32 = 2;
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
-    #[error("io hatası: {0}")]
+    #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("bozuk dosya ({path}): {reason}")]
     Corrupt { path: String, reason: String },
-    #[error("desteklenmeyen format versiyonu: {0} (bu sürüm {STORAGE_VERSION} okur)")]
+    #[error("unsupported format version: {0} (this build reads {STORAGE_VERSION})")]
     UnsupportedVersion(u32),
-    #[error("serileştirme hatası: {0}")]
+    #[error("serialization error: {0}")]
     Encode(#[from] bincode::Error),
-    #[error("indeks hatası: {0}")]
+    #[error("index error: {0}")]
     Index(#[from] crate::index::IndexError),
-    #[error("segment yükleme hatası: {0}")]
+    #[error("segment load error: {0}")]
     Segment(#[from] crate::index::hnsw::PersistError),
 }
 
@@ -51,14 +54,15 @@ fn corrupt(path: impl AsRef<Path>, reason: impl Into<String>) -> StorageError {
     }
 }
 
-/// Dayanıklı dosya yazımı: tmp'ye yaz → fsync → rename.
+/// Durable file write: write to tmp → fsync → rename.
 ///
 /// Windows notu (DECISIONS #32): dizinin kendisi fsync'lenemez — Rust std
-/// dizin handle'ı açmaz ve Windows dizin fsync'i genel olarak desteklemez.
-/// Dosya içeriği fsync'li, rename atomik (MoveFileEx REPLACE_EXISTING); ancak
-/// dizin girdisinin dayanıklılığı işletim sistemine bırakılmış durumda. Bu,
-/// güç kesintisinde "checkpoint görünmez ama WAL sağlam" senaryosunu mümkün
-/// kılar — kurtarma bu yüzden her zaman WAL replay'iyle tamamlanır.
+/// does not open a directory handle, and Windows generally does not support
+/// fsync on a directory. The file contents are fsynced and the rename is
+/// atomic (MoveFileEx REPLACE_EXISTING), but the durability of the directory
+/// entry is left to the operating system. That makes the scenario "the
+/// checkpoint is invisible but the WAL is intact" possible after a power loss —
+/// which is why recovery is always completed by a WAL replay.
 pub fn write_file_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
@@ -70,9 +74,10 @@ pub fn write_file_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Çerçeveli dosya: magic + versiyon + uzunluk + bincode payload + CRC32.
-/// CRC gövdenin tamamını kapsar ve payload'a DOKUNULMADAN önce doğrulanır —
-/// bozuk baytı deserializer'a hiç göstermemek fuzz yüzeyini küçültür.
+/// A framed file: magic + version + length + bincode payload + CRC32.
+/// The CRC covers the entire body and is verified BEFORE the payload is
+/// touched — never showing a corrupt byte to the deserializer shrinks the fuzz
+/// surface.
 fn encode_framed<T: serde::Serialize>(magic: [u8; 4], value: &T) -> Result<Vec<u8>, StorageError> {
     let payload = bincode::serialize(value)?;
     let mut buf = Vec::with_capacity(payload.len() + 20);
@@ -92,10 +97,10 @@ fn decode_framed<T: serde::de::DeserializeOwned>(
     path: &Path,
 ) -> Result<T, StorageError> {
     if bytes.len() < 20 {
-        return Err(corrupt(path, "dosya header için bile kısa"));
+        return Err(corrupt(path, "file too short even for the header"));
     }
     if bytes[0..4] != magic {
-        return Err(corrupt(path, "magic uyuşmuyor"));
+        return Err(corrupt(path, "magic mismatch"));
     }
     let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 byte"));
     if version != STORAGE_VERSION {
@@ -106,14 +111,14 @@ fn decode_framed<T: serde::de::DeserializeOwned>(
     let mut h = crc32fast::Hasher::new();
     h.update(body);
     if h.finalize() != stored {
-        return Err(corrupt(path, "crc32 uyuşmuyor (bozuk/kesik dosya)"));
+        return Err(corrupt(path, "crc32 mismatch (corrupt/truncated file)"));
     }
     let len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 byte")) as usize;
     let end = 16usize
         .checked_add(len)
-        .ok_or_else(|| corrupt(path, "payload uzunluğu taşıyor"))?;
+        .ok_or_else(|| corrupt(path, "payload length overflows"))?;
     if end > body.len() {
-        return Err(corrupt(path, "payload uzunluğu dosyayı aşıyor"));
+        return Err(corrupt(path, "payload length exceeds the file"));
     }
     Ok(bincode::deserialize(&bytes[16..end])?)
 }
@@ -121,12 +126,13 @@ fn decode_framed<T: serde::de::DeserializeOwned>(
 // ---------------------------------------------------------------------------
 // Disk temsili: MetaValue'nun etiketli ikizi
 //
-// `MetaValue` HTTP JSON şekli için `#[serde(untagged)]` — `{"renk": "mavi"}`
-// gibi doğal gövdeler bunu gerektiriyor. Ama untagged deserialization
-// `deserialize_any` ister; bincode self-describing olmadığı için bunu
-// desteklemez. Disk (ve Aşama 7b'de WAL) temsili bu yüzden ayrı ve ETİKETLİ.
-// API şekli ile depolama şeklini ayırmak zaten sağlıklı: biri sözleşme,
-// diğeri iç format, bağımsız evrilebilirler.
+// `MetaValue` is `#[serde(untagged)]` for the sake of the HTTP JSON shape —
+// natural bodies like `{"color": "blue"}` require it. But untagged
+// deserialization needs `deserialize_any`, which bincode does not support
+// because it is not self-describing. The disk representation (and the WAL
+// representation in phase 7b) is therefore separate and TAGGED. Separating the
+// API shape from the storage shape is healthy anyway: one is a contract, the
+// other an internal format, and they can evolve independently.
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
@@ -161,10 +167,10 @@ impl From<MetaValueRepr> for MetaValue {
 
 pub type MetaRepr = Vec<(String, MetaValueRepr)>;
 
-/// Metadata'yı disk temsiline çevirir. **Anahtara göre sıralı** — `HashMap`
-/// iterasyon sırası deterministik olmadığı için aynı metadata farklı baytlar
-/// üretebilirdi; bu hem CRC/dosya karşılaştırmalarını hem de ölçüm
-/// tekrarlanabilirliğini bozardı (testte yakalandı).
+/// Converts metadata into its disk representation. **Sorted by key** — because
+/// `HashMap` iteration order is not deterministic, the same metadata could
+/// otherwise produce different bytes, which would break both CRC/file
+/// comparisons and measurement reproducibility (caught by a test).
 pub(crate) fn meta_to_repr(m: &Metadata) -> MetaRepr {
     let mut out: MetaRepr = m.iter().map(|(k, v)| (k.clone(), v.into())).collect();
     out.sort_by(|a, b| a.0.cmp(&b.0));
@@ -175,8 +181,8 @@ pub(crate) fn repr_to_meta(r: MetaRepr) -> Metadata {
     r.into_iter().map(|(k, v)| (k, v.into())).collect()
 }
 
-/// id → metadata snapshot'ı. Tam yazım (artımlı değil): sıcak yolu WAL
-/// taşıdığı için snapshot yalnız checkpoint'te üretilir.
+/// The id → metadata snapshot. A full write (not incremental): since the WAL
+/// carries the hot path, the snapshot is only produced at checkpoint time.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct MetadataSnapshot {
     entries: Vec<(u64, MetaRepr)>,
@@ -208,18 +214,19 @@ pub fn decode_metadata(
 // Manifest
 // ---------------------------------------------------------------------------
 
-/// Bir segmentin manifest kaydı.
+/// The manifest record of one segment.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SegmentRef {
-    /// Dizine göreli dosya adı; değişmez.
+    /// File name relative to the directory; immutable.
     pub file: String,
-    /// Dosyanın tamamının CRC32'si (yazım anında hesaplanır, sonra taşınır —
-    /// eski segmentleri her checkpoint'te yeniden okumamak için).
+    /// CRC32 of the whole file (computed at write time and carried forward —
+    /// so old segments are not re-read at every checkpoint).
     pub crc32: u32,
-    /// Segmentteki toplam kayıt (tombstone'lular dahil) — gözlem/GC için.
+    /// Total records in the segment (including tombstoned ones) — for
+    /// observability and GC.
     pub records: u64,
-    /// Segment-yerel tombstone'lar. Segment dosyası değişmez olduğu için
-    /// silmeler burada yaşar (bkz. modül başlığı).
+    /// Segment-local tombstones. Since the segment file is immutable,
+    /// deletions live here (see the module header).
     pub tombstones: Vec<u64>,
 }
 
@@ -234,7 +241,7 @@ pub struct Manifest {
     pub segments: Vec<SegmentRef>,
     pub metadata_file: Option<String>,
     pub metadata_crc: u32,
-    /// Aktif WAL dosyası (Aşama 7b). Yoksa sıcak kalıcılık kapalı demektir.
+    /// The active WAL file (phase 7b). Absent means hot durability is off.
     pub wal_file: Option<String>,
     pub created_unix_secs: u64,
 }
@@ -259,8 +266,8 @@ impl Manifest {
         Ok(())
     }
 
-    /// Manifest'i okur ve doğrular. Dosya yoksa `Ok(None)` — boş dizin
-    /// "kurtarılacak bir şey yok" demektir, hata değil.
+    /// Reads and validates the manifest. `Ok(None)` if the file is absent — an
+    /// empty directory means "there is nothing to recover", not an error.
     pub fn read(dir: &Path) -> Result<Option<Manifest>, StorageError> {
         let path = dir.join(MANIFEST_NAME);
         match std::fs::read(&path) {
@@ -270,7 +277,7 @@ impl Manifest {
         }
     }
 
-    /// Manifest'te referanslanan dosyaların kümesi (GC için).
+    /// The set of files referenced by the manifest (for GC).
     pub fn referenced_files(&self) -> Vec<String> {
         let mut out: Vec<String> = self.segments.iter().map(|s| s.file.clone()).collect();
         out.extend(self.metadata_file.clone());
@@ -280,9 +287,10 @@ impl Manifest {
     }
 }
 
-/// Manifest'te geçmeyen segment/meta/wal dosyalarını siler.
-/// Silinen dosya sayısını döndürür. Manifest yazıldıktan SONRA çağrılmalı:
-/// sıra tersine dönerse hâlâ referanslanan bir dosya silinebilirdi.
+/// Deletes segment/meta/wal files that the manifest does not reference.
+/// Returns the number of files deleted. Must be called AFTER the manifest has
+/// been written: with the order reversed, a still-referenced file could be
+/// deleted.
 pub fn gc_unreferenced(dir: &Path, manifest: &Manifest) -> Result<usize, StorageError> {
     let keep = manifest.referenced_files();
     let mut removed = 0usize;
@@ -294,8 +302,8 @@ pub fn gc_unreferenced(dir: &Path, manifest: &Manifest) -> Result<usize, Storage
             || name.starts_with("wal-")
             || name.ends_with(".tmp");
         if is_ours && !keep.contains(&name) {
-            // Windows'ta açık handle varsa silme başarısız olabilir; bu
-            // ölümcül değil — bir sonraki GC dener.
+            // On Windows, deletion can fail while a handle is open; that is
+            // not fatal — the next GC will try again.
             if std::fs::remove_file(entry.path()).is_ok() {
                 removed += 1;
             }
@@ -304,7 +312,7 @@ pub fn gc_unreferenced(dir: &Path, manifest: &Manifest) -> Result<usize, Storage
     Ok(removed)
 }
 
-/// Dosya yolunu okuyup CRC'sini doğrular.
+/// Reads a file path and verifies its CRC.
 pub fn read_verified(dir: &Path, file: &str, expect_crc: u32) -> Result<Vec<u8>, StorageError> {
     let path = dir.join(file);
     let bytes = std::fs::read(&path)?;
@@ -314,7 +322,7 @@ pub fn read_verified(dir: &Path, file: &str, expect_crc: u32) -> Result<Vec<u8>,
     if actual != expect_crc {
         return Err(corrupt(
             &path,
-            format!("crc uyuşmuyor: manifest {expect_crc:08x}, dosya {actual:08x}"),
+            format!("crc mismatch: manifest {expect_crc:08x}, file {actual:08x}"),
         ));
     }
     Ok(bytes)
@@ -333,7 +341,7 @@ pub fn now_unix_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Test/deney için geçici dizin (scratch): süreç kimliği + sayaçla benzersiz.
+/// A scratch directory for tests/experiments: unique via process id + counter.
 pub fn temp_dir(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -397,24 +405,30 @@ mod tests {
             let mut bad = good.clone();
             bad[pos] ^= 0x01;
             std::fs::write(&path, &bad).unwrap();
-            assert!(Manifest::read(&dir).is_err(), "bozulma @{pos} yakalanmalı");
+            assert!(
+                Manifest::read(&dir).is_err(),
+                "corruption @{pos} must be caught"
+            );
         }
         // kesik dosya
         for cut in [0, 10, good.len() / 2] {
             std::fs::write(&path, &good[..cut]).unwrap();
-            assert!(Manifest::read(&dir).is_err(), "kesik @{cut} yakalanmalı");
+            assert!(
+                Manifest::read(&dir).is_err(),
+                "truncation @{cut} must be caught"
+            );
         }
     }
 
     #[test]
     fn metadata_snapshot_roundtrip_all_value_kinds() {
-        // untagged/bincode tuzağının regresyon testi: her MetaValue türü
+        // Regression test for the untagged/bincode trap: every MetaValue variant
         // disk temsilinden aynen geri gelmeli.
         let m: Metadata = [
             ("b".to_string(), MetaValue::Bool(true)),
             ("i".to_string(), MetaValue::Int(-7)),
             ("f".to_string(), MetaValue::Float(2.5)),
-            ("s".to_string(), MetaValue::Str("değer".into())),
+            ("s".to_string(), MetaValue::Str("value".into())),
         ]
         .into();
         let bytes = encode_metadata(&[(VectorId(9), m.clone())]).unwrap();
@@ -432,11 +446,14 @@ mod tests {
         std::fs::write(dir.join(&m.segments[0].file), b"x").unwrap();
         std::fs::write(dir.join("segment-000001-00.gvdb"), b"eski").unwrap();
         std::fs::write(dir.join("meta-000001.gvmeta"), b"eski").unwrap();
-        std::fs::write(dir.join("baska.txt"), b"dokunma").unwrap();
+        std::fs::write(dir.join("other.txt"), b"dokunma").unwrap();
         let removed = gc_unreferenced(&dir, &m).unwrap();
         assert_eq!(removed, 2);
         assert!(dir.join(&m.segments[0].file).exists());
-        assert!(dir.join("baska.txt").exists(), "yabancı dosyaya dokunulmaz");
+        assert!(
+            dir.join("other.txt").exists(),
+            "foreign files must not be touched"
+        );
         assert!(dir.join(MANIFEST_NAME).exists());
     }
 
