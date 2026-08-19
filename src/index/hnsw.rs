@@ -1,11 +1,11 @@
 //! HNSW indeksi — Malkov & Yashunin (2016), "Efficient and robust approximate
 //! nearest neighbor search using Hierarchical Navigable Small World graphs".
 //!
-//! Temsil: Rc/RefCell yok; her node bir `usize` slot, komşuluklar
-//! `links[slot][level] = Vec<usize>`. Bu hem borrow-checker sürtünmesini
-//! sıfırlar hem serileştirmeyi (Aşama 3) trivial yapar.
+//! Representation: no Rc/RefCell; every node is a `usize` slot and adjacency is
+//! `links[slot][level] = Vec<usize>`. This removes all borrow-checker friction
+//! and makes serialization (phase 3) trivial.
 //!
-//! Algoritma haritası (makaledeki numaralarla):
+//! Algorithm map (using the numbering from the paper):
 //! - Algorithm 1 (INSERT): `insert`
 //! - Algorithm 2 (SEARCH-LAYER): `search_layer`
 //! - Algorithm 4 (SELECT-NEIGHBORS-HEURISTIC): `select_neighbors_heuristic`
@@ -19,8 +19,8 @@ use rand::{Rng, SeedableRng};
 use std::cmp::Reverse;
 use std::collections::{BinaryHeap, HashMap};
 
-/// (mesafe, slot) çifti; mesafe üzerinden total_cmp sıralaması.
-/// `quant` modülü de aynı adaylık yapısını kullanır.
+/// A (distance, slot) pair ordered by distance via total_cmp.
+/// The `quant` module uses the same candidate structure.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct Cand {
     pub(crate) dist: f32,
@@ -42,17 +42,18 @@ impl Ord for Cand {
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HnswParams {
-    /// Üst katmanlarda hedef komşu sayısı (makaledeki M).
+    /// Target neighbour count on the upper layers (M in the paper).
     pub m: usize,
-    /// Taban katman (0) için komşu limiti; makale 2M önerir.
+    /// Neighbour limit for the base layer (0); the paper suggests 2M.
     pub m_max0: usize,
-    /// İnşa sırasındaki arama genişliği (efConstruction).
+    /// Search width during construction (efConstruction).
     pub ef_construction: usize,
-    /// Sorgu sırasındaki taban katman genişliği (ef).
+    /// Base-layer width at query time (ef).
     pub ef_search: usize,
-    /// Seviye atama rastgeleliği için seed (tekrarlanabilirlik).
+    /// Seed for level-assignment randomness (reproducibility).
     pub seed: u64,
-    /// Tombstone oranı bu eşiği aşınca delete otomatik compaction tetikler.
+    /// When the tombstone ratio exceeds this threshold, delete triggers an
+    /// automatic compaction.
     pub tombstone_threshold: f64,
 }
 
@@ -69,36 +70,39 @@ impl Default for HnswParams {
     }
 }
 
-/// Filtreli aramanın gezinti istatistikleri (ölçüm ve ileride planlayıcı
-/// sinyali). `admitted/visited` oranının çökmesi, fallback tetiklenmeden
-/// yaşanan "sessiz recall düşüşü"nün imzasıdır.
+/// Traversal statistics of a filtered search (for measurement, and later as a
+/// planner signal). A collapsing `admitted/visited` ratio is the signature of
+/// the "silent recall decline" that occurs without the fallback ever firing.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct FilterSearchStats {
-    /// Taban katmanda ziyaret edilen node sayısı.
+    /// Number of nodes visited on the base layer.
     pub visited: usize,
-    /// Sonuç kümesine kabul edilen aday sayısı (eviction öncesi).
+    /// Number of candidates admitted into the result set (before eviction).
     pub admitted: usize,
-    /// Graf araması k'dan az sonuç bulup doğrusal taramaya düşüldü mü?
+    /// Did the graph search find fewer than k results and fall back to a
+    /// linear scan?
     pub fallback_used: bool,
-    /// Ziyaret bütçesi doldu da arama erken kesildi mi? (Kabul/ziyaret
-    /// oranının çöktüğü patolojik durumun canlı tespiti — ölçümdeki
-    /// "kümelenmiş × uzak sorgu" hücresi. Kesilince fallback taramaya geçilir.)
+    /// Was the search cut short because the visit budget ran out? (A live
+    /// detector for the pathological case where the admit/visit ratio collapses
+    /// — the "clustered × distant query" cell in the measurements. When cut
+    /// short, the fallback scan takes over.)
     pub budget_exhausted: bool,
 }
 
-/// Vektör verisinin nerede durduğu: bellekte sahipli blok ya da diskten
-/// memmap ile lazy yüklenmiş bölge. Mmap yoluna yazılamaz; ilk insert'te
-/// veri sahipli Vec'e kopyalanır (copy-on-write).
+/// Where the vector data lives: an owned in-memory block, or a region lazily
+/// mapped from disk. The mmap path is not writable; on the first insert the
+/// data is copied into an owned Vec (copy-on-write).
 enum VectorStorage {
     Owned(Vec<f32>),
-    /// Şimdilik inşa edilmiyor: memmap2 açılışı unsafe gerektirir ve crate
-    /// deny(unsafe_code) ile derlenir; izin çıkarsa lazy load bunu kullanacak.
+    /// Not constructed for now: opening with memmap2 requires unsafe and the
+    /// crate is compiled with deny(unsafe_code); if that is ever lifted, lazy
+    /// loading will use this.
     #[allow(dead_code)]
     Mmap {
         map: memmap2::Mmap,
-        /// f32 verisinin dosya içindeki byte offset'i (4'e hizalı garanti).
+        /// Byte offset of the f32 data within the file (guaranteed 4-aligned).
         offset: usize,
-        /// f32 eleman sayısı.
+        /// Number of f32 elements.
         len: usize,
     },
 }
@@ -108,22 +112,22 @@ impl VectorStorage {
     fn as_slice(&self) -> &[f32] {
         match self {
             VectorStorage::Owned(v) => v,
-            // cast_slice hizayı runtime'da doğrular; offset'i 4'e hizalı
-            // yazdığımız ve mmap tabanı sayfa hizalı olduğu için güvenli.
+            // cast_slice verifies alignment at runtime; this is safe because
+            // we write the offset 4-aligned and the mmap base is page-aligned.
             VectorStorage::Mmap { map, offset, len } => {
                 bytemuck::cast_slice(&map[*offset..*offset + *len * 4])
             }
         }
     }
 
-    /// Yazma erişimi: mmap destekliyse önce sahipli kopyaya dönüştür.
+    /// Write access: if backed by mmap, first convert to an owned copy.
     fn to_owned_mut(&mut self) -> &mut Vec<f32> {
         if let VectorStorage::Mmap { .. } = self {
             *self = VectorStorage::Owned(self.as_slice().to_vec());
         }
         match self {
             VectorStorage::Owned(v) => v,
-            VectorStorage::Mmap { .. } => unreachable!("üstte dönüştürüldü"),
+            VectorStorage::Mmap { .. } => unreachable!("converted above"),
         }
     }
 }
@@ -132,18 +136,21 @@ pub struct HnswIndex {
     params: HnswParams,
     metric: Metric,
     dim: usize,
-    /// mL = 1/ln(M): seviye dağılım çarpanı (makale 4.1'deki optimum).
+    /// mL = 1/ln(M): the level distribution factor (the optimum from §4.1 of
+    /// the paper).
     ml: f64,
-    /// Vektörler tek bitişik blokta, slot-major.
+    /// Vectors in one contiguous block, slot-major.
     storage: VectorStorage,
     ids: Vec<VectorId>,
     slot_of: HashMap<VectorId, usize>,
-    /// links[slot][level] = komşu slot listesi. `links[slot].len()-1` node'un en üst seviyesi.
+    /// links[slot][level] = list of neighbour slots. `links[slot].len()-1` is
+    /// the node's top level.
     links: Vec<Vec<Vec<usize>>>,
-    /// Graf giriş noktası (en yüksek seviyeli node).
+    /// The graph entry point (the node with the highest level).
     entry: Option<usize>,
-    /// Tombstone bayrakları: silinen node graf'ta GEZİLİR (bağlantılılık
-    /// için köprü görevi sürer) ama sonuçlara girmez. Gerçek temizlik compaction'da.
+    /// Tombstone flags: a deleted node is still TRAVERSED in the graph (it goes
+    /// on serving as a bridge for connectivity) but never enters the results.
+    /// Actual cleanup happens during compaction.
     deleted: Vec<bool>,
     deleted_count: usize,
     rng: StdRng,
@@ -172,8 +179,8 @@ impl HnswIndex {
         &self.params
     }
 
-    /// ef_search'ü sonradan ayarlamak parametre süpürmesi için gerekli;
-    /// grafı etkilemez, sadece sorgu genişliğini değiştirir.
+    /// Adjusting ef_search after the fact is needed for parameter sweeps; it
+    /// does not affect the graph, only the query width.
     pub fn set_ef_search(&mut self, ef: usize) {
         self.params.ef_search = ef;
     }
@@ -188,27 +195,31 @@ impl HnswIndex {
         self.metric.distance(query, self.vector_at(slot))
     }
 
-    /// Üstel seviye ataması: floor(-ln(U) * mL). U=0 alt sınırı clamp'lenir.
+    /// Exponential level assignment: floor(-ln(U) * mL). The U=0 lower bound is
+    /// clamped.
     fn random_level(&mut self) -> usize {
         let u: f64 = self.rng.gen_range(f64::MIN_POSITIVE..1.0);
         (-u.ln() * self.ml).floor() as usize
     }
 
-    /// Algorithm 2 — SEARCH-LAYER: `entry_points`'ten başlayıp `level`'da
-    /// ef genişliğinde greedy best-first arama. Artan mesafeli ef sonuç döndürür.
+    /// Algorithm 2 — SEARCH-LAYER: a greedy best-first search of width ef on
+    /// `level`, starting from `entry_points`. Returns ef results in ascending
+    /// distance order.
     ///
-    /// `exclude_deleted`: true ise tombstone'lu node'lar GEZİLİR (komşuları
-    /// keşfedilir — bağlantılılık köprüsü olarak lazımlar) ama sonuç kümesine
-    /// alınmazlar. İnşa sırasında false: yeni node tombstone'lara da bağlanabilir,
-    /// compaction zaten onları toptan temizleyecek.
+    /// `exclude_deleted`: when true, tombstoned nodes are still TRAVERSED (their
+    /// neighbours are explored — they are needed as connectivity bridges) but
+    /// are not admitted into the result set. False during construction: a new
+    /// node may link to tombstones too, and compaction will clear them wholesale
+    /// anyway.
     ///
-    /// `filter`: metadata filtresi aynı ilkeyle çalışır — eşleşmeyen node
-    /// gezilir (bağlantılılık), sonuca girmez. None = filtre yok.
+    /// `filter`: the metadata filter works on the same principle — a
+    /// non-matching node is traversed (connectivity) but never enters the
+    /// results. None = no filter.
     ///
-    /// Dönüş: (sonuçlar, ziyaret edilen node sayısı, sonuç kümesine kabul
-    /// edilen aday sayısı). Sayaçlar iki increment'ten ibaret — üretim yolu
-    /// bedavaya enstrümante olur; filtreli aramada kabul/ziyaret oranının
-    /// çökmesi "sessiz recall düşüşü"nün imzasıdır (plan: filtre ölçümü).
+    /// Returns: (results, number of nodes visited, number of candidates admitted
+    /// into the result set). The counters are just two increments — the
+    /// production path is instrumented for free; a collapsing admit/visit ratio
+    /// in a filtered search is the signature of the "silent recall decline".
     #[allow(clippy::type_complexity, clippy::too_many_arguments)]
     fn search_layer(
         &self,
@@ -220,14 +231,15 @@ impl HnswIndex {
         filter: Option<&dyn Fn(usize) -> bool>,
         visited_budget: Option<usize>,
     ) -> (Vec<Cand>, usize, usize) {
-        // visited: slot başına bayrak. HashSet yerine Vec<bool>: n=100K'da bile
-        // 100KB'lik tek allocation, dal başına hash maliyeti yok.
+        // visited: one flag per slot. A Vec<bool> rather than a HashSet: even at
+        // n=100K that is a single 100KB allocation, with no per-branch hashing
+        // cost.
         let mut visited = vec![false; self.links.len()];
         let mut visited_count = 0usize;
         let mut admitted_count = 0usize;
         // candidates: en YAKIN tepede (min-heap, Reverse ile).
         let mut candidates: BinaryHeap<Reverse<Cand>> = BinaryHeap::new();
-        // results: en UZAK tepede (max-heap) — kötüleri atmak için.
+        // results: the FARTHEST on top (a max-heap) — so the worst can be evicted.
         let mut results: BinaryHeap<Cand> = BinaryHeap::new();
 
         for &ep in entry_points {
@@ -249,13 +261,15 @@ impl HnswIndex {
         }
 
         while let Some(Reverse(cur)) = candidates.pop() {
-            // Bütçe: filtreli aramada kabul oranı çökünce gezinti tüm grafa
-            // yayılabilir; bütçe bunu keser, çağıran taramaya geçer.
+            // Budget: when the admit ratio collapses in a filtered search, the
+            // traversal can spread across the whole graph; the budget cuts that
+            // off and the caller switches to a scan.
             if visited_budget.is_some_and(|b| visited_count >= b) {
                 break;
             }
-            // Erken çıkış: en yakın aday bile sonuç kümesinin en kötüsünden
-            // uzaksa bu katmanda daha iyisi bulunamaz (makaledeki durdurma koşulu).
+            // Early exit: if even the nearest candidate is farther than the
+            // worst of the result set, nothing better can be found on this layer
+            // (the stopping condition from the paper).
             if let Some(worst) = results.peek() {
                 if cur.dist > worst.dist && results.len() >= ef {
                     break;
@@ -273,7 +287,8 @@ impl HnswIndex {
                 if within {
                     let c = Cand { dist: d, slot: nb };
                     candidates.push(Reverse(c));
-                    // Tombstone / filtre-dışı node gezilir ama sonuçlara girmez.
+                    // A tombstoned / filtered-out node is traversed but never
+                    // enters the results.
                     let admissible =
                         !(exclude_deleted && self.deleted[nb]) && filter.is_none_or(|f| f(nb));
                     if admissible {
@@ -293,13 +308,15 @@ impl HnswIndex {
 
     /// Algorithm 4 — SELECT-NEIGHBORS-HEURISTIC.
     ///
-    /// Naif "en yakın M" yerine: aday, seçilmiş herhangi bir komşuya
-    /// query'den olduğundan daha yakınsa ELENİR. Bu, aynı kümeden gereksiz
-    /// kenarları kırpar ve kümeler ARASI köprü kenarları korur — grafın
-    /// bağlantılılığı (dolayısıyla recall) buna dayanır.
+    /// Instead of the naive "nearest M": a candidate is DISCARDED if it is
+    /// closer to any already-selected neighbour than it is to the query. This
+    /// prunes redundant edges within a cluster and preserves bridge edges
+    /// BETWEEN clusters — the graph's connectivity (and therefore its recall)
+    /// depends on it.
     ///
-    /// keepPrunedConnections=true davranışı: elenenlerden en yakınlarıyla
-    /// M'e tamamla (makaledeki opsiyonel adım; düşük dereceli node bırakmamak için).
+    /// keepPrunedConnections=true behaviour: top up to M with the nearest of the
+    /// discarded ones (the optional step in the paper, so no node is left with a
+    /// low degree).
     fn select_neighbors_heuristic(&self, candidates: &[Cand], m: usize) -> Vec<usize> {
         let mut selected: Vec<Cand> = Vec::with_capacity(m);
         let mut pruned: Vec<Cand> = Vec::new();
@@ -308,7 +325,7 @@ impl HnswIndex {
                 break;
             }
             let c_vec = self.vector_at(c.slot);
-            // c, seçilmişlerden birine query'ye olduğundan daha mı yakın?
+            // is c closer to one of the selected than it is to the query?
             let dominated = selected
                 .iter()
                 .any(|s| self.metric.distance(c_vec, self.vector_at(s.slot)) < c.dist);
@@ -318,7 +335,8 @@ impl HnswIndex {
                 selected.push(c);
             }
         }
-        // keepPrunedConnections: boş kalan kontenjanı elenen en yakınlarla doldur
+        // keepPrunedConnections: fill the remaining quota with the nearest of
+        // the discarded
         for c in pruned {
             if selected.len() >= m {
                 break;
@@ -328,7 +346,8 @@ impl HnswIndex {
         selected.into_iter().map(|c| c.slot).collect()
     }
 
-    /// Bir seviyedeki komşu limiti: taban katman daha yoğun (makale: M_max0 = 2M).
+    /// The neighbour limit at a level: the base layer is denser (paper:
+    /// M_max0 = 2M).
     #[inline]
     fn max_links(&self, level: usize) -> usize {
         if level == 0 {
@@ -338,13 +357,15 @@ impl HnswIndex {
         }
     }
 
-    /// `node`'un `level`'daki komşu listesi limiti aştıysa heuristic ile kırp.
+    /// If `node`'s neighbour list at `level` exceeds the limit, prune it with
+    /// the heuristic.
     fn shrink_links(&mut self, node: usize, level: usize) {
         let limit = self.max_links(level);
         if self.links[node][level].len() <= limit {
             return;
         }
-        // Aday listesi: mevcut komşular, node'a uzaklıklarıyla, artan sırada.
+        // Candidate list: the current neighbours with their distance to the
+        // node, in ascending order.
         let mut cands: Vec<Cand> = self.links[node][level]
             .iter()
             .map(|&nb| Cand {
@@ -358,8 +379,8 @@ impl HnswIndex {
         self.links[node][level] = self.select_neighbors_heuristic(&cands, limit);
     }
 
-    /// Sorguyu ef genişliğiyle çalıştırıp SearchResult listesi döndürür
-    /// (parametre süpürmesinde set_ef_search'süz kullanım için).
+    /// Runs the query at the given ef width and returns a list of
+    /// SearchResults (for use in parameter sweeps without set_ef_search).
     pub fn search_with_ef(&self, query: &[f32], k: usize, ef: usize) -> Vec<SearchResult> {
         let Some(entry) = self.entry else {
             return Vec::new();
@@ -374,18 +395,20 @@ impl HnswIndex {
         } else {
             query
         };
-        // Üst katmanlarda greedy iniş (ef=1): her katmanda en yakın node'a atla.
+        // Greedy descent through the upper layers (ef=1): jump to the nearest
+        // node on each layer.
         let top = self.links[entry].len() - 1;
         let mut ep = entry;
         for level in (1..=top).rev() {
-            // İnişte tombstone da geçerli durak: sadece yol gösteriyor.
+            // While descending, a tombstone is a valid stop: it is only guiding
+            // the way.
             ep = self
                 .search_layer(query, &[ep], 1, level, false, None, None)
                 .0[0]
                 .slot;
         }
-        // Taban katmanda geniş arama; ef en az k olmalı yoksa k sonuç çıkmaz.
-        // Tombstone'lar burada sonuç dışı.
+        // A wide search on the base layer; ef must be at least k or fewer than k
+        // results come out. Tombstones are excluded from the results here.
         let ef = ef.max(k);
         let (found, _, _) = self.search_layer(query, &[ep], ef, 0, true, None, None);
         found
@@ -395,12 +418,14 @@ impl HnswIndex {
             .collect()
     }
 
-    /// Filtreli arama: `allow(id)` true dönen kayıtlar aday olabilir.
-    /// Eşleşmeyen node'lar gezinti köprüsü olarak kullanılır (bkz. meta modülü).
+    /// Filtered search: only records for which `allow(id)` returns true can be
+    /// candidates. Non-matching nodes are still used as traversal bridges (see
+    /// the meta module).
     ///
-    /// Doğruluk garantisi: graf araması k'dan az sonuç bulursa (aşırı seçici
-    /// filtre grafın gezilen bölgesinde az eşleşme bıraktıysa) tüm yaşayan
-    /// kayıtlar üzerinde filtreli doğrusal taramaya düşülür — yavaş ama eksiksiz.
+    /// Correctness guarantee: if the graph search finds fewer than k results
+    /// (because a highly selective filter left few matches in the traversed
+    /// region), it falls back to a filtered linear scan over all live records —
+    /// slow but complete.
     pub fn search_filtered_with_ef(
         &self,
         query: &[f32],
@@ -411,9 +436,9 @@ impl HnswIndex {
         self.search_filtered_stats(query, k, ef, allow, None).0
     }
 
-    /// `search_filtered_with_ef`'in enstrümante hali — üretim yolu bu
-    /// fonksiyonu sarar, dönüş tipi ekstra alan gerektiğinde imza bozulmadan
-    /// `FilterSearchStats`'a alan eklenerek genişler.
+    /// The instrumented form of `search_filtered_with_ef` — the production path
+    /// wraps this function, so when extra output is needed the signature stays
+    /// stable and a field is simply added to `FilterSearchStats`.
     pub fn search_filtered_stats(
         &self,
         query: &[f32],
@@ -451,9 +476,9 @@ impl HnswIndex {
         stats.visited = visited;
         stats.admitted = admitted;
         stats.budget_exhausted = visited_budget.is_some_and(|b| visited >= b);
-        // Bütçe dolduysa kısmi sonuçları OLDUĞU GİBİ döndür — ne yapılacağına
-        // (posting-list taraması vb.) çağıran karar verir; buradaki O(n)
-        // fallback'i koşmak bütçenin amacını boşa çıkarırdı.
+        // If the budget ran out, return the partial results AS IS — the caller
+        // decides what to do next (a posting-list scan, say); running the O(n)
+        // fallback here would defeat the purpose of the budget.
         if stats.budget_exhausted {
             let out = found
                 .into_iter()
@@ -470,7 +495,7 @@ impl HnswIndex {
                 .collect();
             return (out, stats);
         }
-        // Fallback: seçicilik gezilen bölgeyi aştı — doğrusal tarama.
+        // Fallback: the selectivity outran the traversed region — linear scan.
         stats.fallback_used = true;
         let mut all: Vec<SearchResult> = (0..self.ids.len())
             .filter(|&s| !self.deleted[s] && slot_allow(s))
@@ -481,7 +506,7 @@ impl HnswIndex {
         (all, stats)
     }
 
-    /// Graf kenar belleği dahil toplam indeks belleği (byte).
+    /// Total index memory including graph edges (bytes).
     pub fn memory_bytes(&self) -> (usize, usize) {
         let vec_bytes = self.storage.as_slice().len() * 4 + self.ids.capacity() * 8;
         let link_bytes: usize = self
@@ -526,23 +551,24 @@ impl VectorIndex for HnswIndex {
         self.links.push(vec![Vec::new(); level + 1]);
 
         let Some(entry) = self.entry else {
-            // İlk eleman: doğrudan giriş noktası olur.
+            // The first element: it becomes the entry point directly.
             self.entry = Some(slot);
             return Ok(());
         };
 
-        let query = self.vector_at(slot).to_vec(); // borrow ayrımı için kopya
+        let query = self.vector_at(slot).to_vec(); // a copy, to separate borrows
         let top = self.links[entry].len() - 1;
         let mut ep = entry;
 
-        // 1. faz: yeni node'un seviyesinin ÜSTÜNDEKİ katmanlarda sadece
-        // greedy iniş — buralara kenar eklenmeyecek, sadece yaklaşıyoruz.
+        // Phase 1: on the layers ABOVE the new node's level, only greedy
+        // descent — no edges will be added there, we are merely getting closer.
         for lc in ((level + 1)..=top).rev() {
             ep = self.search_layer(&query, &[ep], 1, lc, false, None, None).0[0].slot;
         }
 
-        // 2. faz: level..0 arası her katmanda ef_construction genişliğinde ara,
-        // heuristic ile komşu seç, çift yönlü bağla, limit aşan komşuları kırp.
+        // Phase 2: on every layer from level down to 0, search at
+        // ef_construction width, pick neighbours with the heuristic, link both
+        // ways, and prune neighbours that exceed the limit.
         let mut eps = vec![ep];
         for lc in (0..=level.min(top)).rev() {
             let (found, _, _) = self.search_layer(
@@ -560,11 +586,13 @@ impl VectorIndex for HnswIndex {
                 self.links[nb][lc].push(slot);
                 self.shrink_links(nb, lc);
             }
-            // Bir alt katmana, bu katmanda bulunanların tümünden in (makale W'yi taşır).
+            // Descend to the next layer from everything found on this one (the
+            // paper carries W down).
             eps = found.into_iter().map(|c| c.slot).collect();
         }
 
-        // Yeni node herkesten yüksekse giriş noktası el değiştirir.
+        // If the new node is higher than everyone else, the entry point changes
+        // hands.
         if level > top {
             self.entry = Some(slot);
         }
@@ -575,16 +603,17 @@ impl VectorIndex for HnswIndex {
         self.search_with_ef(query, k, self.params.ef_search)
     }
 
-    /// Tombstone tabanlı silme: node graf'ta kalır (köprü görevi), sonuçlardan
-    /// düşer. `slot_of`'tan çıkarıldığı için aynı id yeniden eklenebilir.
+    /// Tombstone-based deletion: the node stays in the graph (serving as a
+    /// bridge) but drops out of the results. Since it is removed from
+    /// `slot_of`, the same id can be inserted again.
     fn delete(&mut self, id: VectorId) -> Result<(), IndexError> {
         let slot = self.slot_of.remove(&id).ok_or(IndexError::NotFound(id))?;
         self.deleted[slot] = true;
         self.deleted_count += 1;
-        // Kritik durum: giriş noktası silindi. Tombstone waypoint olarak
-        // çalışmaya devam edebilirdi ama tüm aramaların ölü bir node'dan
-        // başlaması hem kafa karıştırıcı hem compaction'ı zorlaştırır —
-        // yaşayan en yüksek seviyeli node'u yeni giriş yap.
+        // Critical case: the entry point was deleted. A tombstone could keep
+        // working as a waypoint, but having every search start from a dead node
+        // is both confusing and awkward for compaction — make the highest-level
+        // live node the new entry.
         if self.entry == Some(slot) {
             self.pick_new_entry();
         }
@@ -601,32 +630,35 @@ impl VectorIndex for HnswIndex {
 }
 
 impl HnswIndex {
-    /// Yaşayan node'lar arasından en yüksek seviyeliyi giriş noktası yapar.
-    /// Hepsi silinmişse entry None olur (arama boş döner, insert sıfırdan kurar).
+    /// Makes the highest-level live node the entry point. If all of them are
+    /// deleted, entry becomes None (search returns empty and insert rebuilds
+    /// from scratch).
     fn pick_new_entry(&mut self) {
         self.entry = (0..self.ids.len())
             .filter(|&s| !self.deleted[s])
             .max_by_key(|&s| self.links[s].len());
     }
 
-    /// Tombstone oranı ne olursa olsun indeksi yaşayan elemanlardan yeniden
-    /// kurar: vektör verisi, graf kenarları ve tombstone bellekleri gerçekten
-    /// geri verilir. O(n · insert) maliyetli — eşikle tetiklenmesinin nedeni bu.
+    /// Rebuilds the index from its live elements regardless of the tombstone
+    /// ratio: vector data, graph edges and tombstone memory are genuinely
+    /// released. It costs O(n · insert) — which is why it is triggered by a
+    /// threshold.
     pub fn compact(&mut self) {
         let mut fresh = HnswIndex::new(self.dim, self.metric, self.params.clone());
         for slot in 0..self.ids.len() {
             if !self.deleted[slot] {
-                // Cosine: saklanan vektör zaten normalize; tekrar normalize idempotent.
+                // Cosine: the stored vector is already normalized; normalizing
+                // again is idempotent.
                 fresh
                     .insert(self.ids[slot], self.vector_at(slot))
-                    .expect("compaction insert'i başarısız olamaz");
+                    .expect("a compaction insert cannot fail");
             }
         }
         *self = fresh;
     }
 
-    // Quantization (Aşama 6) grafın kendisini yeniden kullanır; bu erişimciler
-    // `quant` modülünün donmuş kopya çıkarabilmesi için crate-içi açık.
+    // Quantization (phase 6) reuses the graph itself; these accessors are
+    // crate-visible so the `quant` module can produce a frozen copy.
     pub(crate) fn graph_links(&self) -> &[Vec<Vec<usize>>] {
         &self.links
     }
@@ -649,13 +681,13 @@ impl HnswIndex {
         self.metric
     }
 
-    /// id bu indekste yaşıyor mu (tombstone'lular hariç)?
+    /// Is this id live in this index (excluding tombstoned ones)?
     pub fn contains(&self, id: VectorId) -> bool {
         self.slot_of.contains_key(&id)
     }
 
-    /// Yaşayan (id, vektör) çiftleri — segment merge yeniden inşası bunları
-    /// okur; tombstone'lular atlanır (merge doğal compaction'dır).
+    /// Live (id, vector) pairs — read by the segment merge rebuild; tombstoned
+    /// ones are skipped (a merge is a natural compaction).
     pub fn live_entries(&self) -> impl Iterator<Item = (VectorId, &[f32])> {
         self.ids
             .iter()
@@ -664,13 +696,13 @@ impl HnswIndex {
             .map(|(slot, &id)| (id, self.vector_at(slot)))
     }
 
-    /// Yaşayan bir kaydın (normalize edilmiş olabilecek) vektörü.
-    /// Planlayıcının tarama kolu id listesinden doğrudan mesafe hesaplar.
+    /// The (possibly normalized) vector of a live record.
+    /// The planner's scan arm computes distances directly from an id list.
     pub fn vector_of(&self, id: VectorId) -> Option<&[f32]> {
         self.slot_of.get(&id).map(|&s| self.vector_at(s))
     }
 
-    /// Tombstone oranı (test ve gözlem için).
+    /// The tombstone ratio (for tests and observability).
     pub fn tombstone_ratio(&self) -> f64 {
         if self.ids.is_empty() {
             0.0
@@ -681,21 +713,21 @@ impl HnswIndex {
 }
 
 // ---------------------------------------------------------------------------
-// Kalıcılık (Aşama 3)
+// Persistence (phase 3)
 //
-// Dosya düzeni (tüm sayılar little-endian):
+// File layout (all numbers little-endian):
 //   [0..4)   magic  b"GVDB"
-//   [4..8)   format versiyonu (u32) = 1
-//   [8..16)  meta uzunluğu (u64)
+//   [4..8)   format version (u32) = 1
+//   [8..16)  meta length (u64)
 //   [16..16+meta_len)  bincode(Meta)
-//   ...pad (meta sonunu 4 byte'a hizalar; f32 bölümü cast edilebilsin diye)
-//   [data_off..data_off+n*dim*4)  ham f32 vektör verisi
-//   [son 4 byte)  crc32 (kendinden önceki her şeyin)
+//   ...pad (aligns the end of meta to 4 bytes so the f32 section can be cast)
+//   [data_off..data_off+n*dim*4)  raw f32 vector data
+//   [last 4 bytes)  crc32 (of everything before it)
 //
-// Vektör bölümü meta'nın DIŞINDA tutulur: memmap2 ile dosyayı açıp bu bölgeyi
-// kopyasız kullanmak (lazy load) mümkün olsun diye. Meta (graf, id'ler) her
-// durumda belleğe deserialize edilir — graf gezinmesi zaten rastgele erişimli
-// ve küçük; asıl yer kaplayan vektör verisidir.
+// The vector section is kept OUTSIDE meta so that the file can be opened with
+// memmap2 and that region used without copying (lazy load). Meta (the graph and
+// ids) is deserialized into memory in every case — graph traversal is
+// random-access and small anyway; the vector data is what takes up the space.
 // ---------------------------------------------------------------------------
 
 const MAGIC: [u8; 4] = *b"GVDB";
@@ -703,17 +735,17 @@ const FORMAT_VERSION: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PersistError {
-    #[error("io hatası: {0}")]
+    #[error("io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("bozuk dosya: {0}")]
     Corrupt(String),
-    #[error("desteklenmeyen format versiyonu: {0} (bu sürüm {FORMAT_VERSION} okur)")]
+    #[error("unsupported format version: {0} (this build reads {FORMAT_VERSION})")]
     UnsupportedVersion(u32),
-    #[error("serileştirme hatası: {0}")]
+    #[error("serialization error: {0}")]
     Encode(#[from] bincode::Error),
 }
 
-/// Diske yazılan graf metadata'sı. Vektör verisi bilinçli olarak burada değil.
+/// The graph metadata written to disk. The vector data is deliberately not here.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct Meta {
     params: HnswParams,
@@ -723,8 +755,9 @@ struct Meta {
     ids: Vec<VectorId>,
     links: Vec<Vec<Vec<u64>>>,
     entry: Option<u64>,
-    /// Tombstone bayrakları (Aşama 4). Silinip yeniden eklenen id'ler yüzünden
-    /// `ids` içinde aynı id iki slotta görünebilir; yaşayan olan tekildir.
+    /// Tombstone flags (phase 4). Because of ids that were deleted and
+    /// re-inserted, the same id can appear in two slots within `ids`; the live
+    /// one is unique.
     deleted: Vec<bool>,
 }
 
@@ -739,9 +772,10 @@ impl HnswIndex {
         Ok(())
     }
 
-    /// Serileştirilmiş gövde (magic + versiyon + meta + f32 bölümü + CRC).
-    /// Segment snapshot'ı bunu kullanır: CRC'yi bellekte hesaplayıp manifest'e
-    /// yazabilmek için baytlara ihtiyaç var (dosyayı geri okumak yerine).
+    /// The serialized body (magic + version + meta + f32 section + CRC).
+    /// The segment snapshot uses this: it needs the bytes in order to compute
+    /// the CRC in memory and record it in the manifest (rather than reading the
+    /// file back).
     pub fn to_bytes(&self) -> Result<Vec<u8>, PersistError> {
         let meta = Meta {
             params: self.params.clone(),
@@ -769,7 +803,7 @@ impl HnswIndex {
         buf.extend((meta_bytes.len() as u64).to_le_bytes());
         buf.extend(&meta_bytes);
         while !buf.len().is_multiple_of(4) {
-            buf.push(0); // f32 bölümü hizalaması
+            buf.push(0); // alignment of the f32 section
         }
         buf.extend_from_slice(bytemuck::cast_slice::<f32, u8>(self.storage.as_slice()));
 
@@ -779,8 +813,8 @@ impl HnswIndex {
         Ok(buf)
     }
 
-    /// Baytlardan yükleme — fuzz hedefi ve testler bu yolu paylaşır.
-    /// Vektör verisi kopyalanır (Owned). Dönen indeks aramaya hazırdır.
+    /// Loading from bytes — the fuzz target and the tests share this path.
+    /// The vector data is copied (Owned). The returned index is ready to search.
     pub fn load_from_bytes(bytes: &[u8]) -> Result<HnswIndex, PersistError> {
         let (meta, data_range) = Self::parse(bytes)?;
         let data: Vec<f32> = bytes[data_range]
@@ -790,56 +824,59 @@ impl HnswIndex {
         Self::rebuild(meta, VectorStorage::Owned(data))
     }
 
-    /// Dosyadan yükleme.
+    /// Loading from a file.
     ///
-    /// `lazy=true` niyeti vektör bölümünü memmap2 ile kopyasız kullanmaktır
-    /// (VectorStorage::Mmap). Ancak `memmap2::Mmap::map` bir `unsafe fn`dir
-    /// (harita yaşarken dosyanın değişmemesi çağıranın sorumluluğudur) ve
-    /// crate `#![deny(unsafe_code)]` ile derlenir. Bu izin verilene dek
-    /// lazy parametre kabul edilir ama iki yol da güvenli tam-okumayla
-    /// çalışır — davranış aynı, sadece bellek kopyası tasarrufu ertelenmiş
-    /// durumda (bkz. DECISIONS.md, Aşama 3).
+    /// The intent of `lazy=true` is to use the vector section without copying,
+    /// via memmap2 (VectorStorage::Mmap). But `memmap2::Mmap::map` is an
+    /// `unsafe fn` (it is the caller's responsibility that the file does not
+    /// change while the mapping is alive) and the crate is compiled with
+    /// `#![deny(unsafe_code)]`. Until that is permitted the lazy parameter is
+    /// accepted but both paths run the safe full read — the behaviour is
+    /// identical, only the saved memory copy is deferred (see DECISIONS.md,
+    /// phase 3).
     pub fn load(path: &std::path::Path, _lazy: bool) -> Result<HnswIndex, PersistError> {
         let bytes = std::fs::read(path)?;
         Self::load_from_bytes(&bytes)
     }
 
-    /// Header + crc + sınır doğrulaması. Başarıda (Meta, f32 bölümünün aralığı).
+    /// Header + crc + bounds validation. On success: (Meta, the range of the
+    /// f32 section).
     fn parse(bytes: &[u8]) -> Result<(Meta, std::ops::Range<usize>), PersistError> {
         if bytes.len() < 20 {
-            return Err(corrupt("dosya header için bile kısa"));
+            return Err(corrupt("file too short even for the header"));
         }
         if bytes[0..4] != MAGIC {
-            return Err(corrupt("magic uyuşmuyor (bu bir GVDB dosyası değil)"));
+            return Err(corrupt("magic mismatch (this is not a GVDB file)"));
         }
         let version = u32::from_le_bytes(bytes[4..8].try_into().expect("4 byte"));
         if version != FORMAT_VERSION {
             return Err(PersistError::UnsupportedVersion(version));
         }
-        // Checksum önce: gövde sağlam değilse gerisini yorumlamaya çalışma.
+        // Checksum first: if the body is not intact, do not try to interpret
+        // the rest.
         let body = &bytes[..bytes.len() - 4];
         let stored_crc = u32::from_le_bytes(bytes[bytes.len() - 4..].try_into().expect("4 byte"));
         let mut hasher = crc32fast::Hasher::new();
         hasher.update(body);
         if hasher.finalize() != stored_crc {
-            return Err(corrupt("crc32 uyuşmuyor (dosya bozulmuş/kesilmiş)"));
+            return Err(corrupt("crc32 mismatch (file corrupted/truncated)"));
         }
         let meta_len = u64::from_le_bytes(bytes[8..16].try_into().expect("8 byte")) as usize;
         let meta_end = 16usize
             .checked_add(meta_len)
-            .ok_or_else(|| corrupt("meta_len taşıyor"))?;
+            .ok_or_else(|| corrupt("meta_len overflows"))?;
         if meta_end > body.len() {
-            return Err(corrupt("meta_len dosya boyutunu aşıyor"));
+            return Err(corrupt("meta_len exceeds the file size"));
         }
         let meta: Meta = bincode::deserialize(&bytes[16..meta_end])?;
         let data_off = meta_end.div_ceil(4) * 4;
         let expected = (meta.n as usize)
             .checked_mul(meta.dim as usize)
             .and_then(|x| x.checked_mul(4))
-            .ok_or_else(|| corrupt("n*dim taşıyor"))?;
+            .ok_or_else(|| corrupt("n*dim overflows"))?;
         if body.len() < data_off || body.len() - data_off != expected {
             return Err(corrupt(format!(
-                "vektör bölümü {} byte olmalıydı, {} var",
+                "the vector section should have been {} bytes, found {}",
                 expected,
                 body.len().saturating_sub(data_off)
             )));
@@ -847,59 +884,61 @@ impl HnswIndex {
         Ok((meta, data_off..data_off + expected))
     }
 
-    /// Meta + storage'dan çalışır indeks kurar; iç tutarlılığı doğrular
-    /// (fuzz'da çökmemek için her slot referansı sınır kontrolünden geçer).
+    /// Builds a working index from meta + storage, validating internal
+    /// consistency (every slot reference is bounds-checked so fuzzing cannot
+    /// crash it).
     fn rebuild(meta: Meta, storage: VectorStorage) -> Result<HnswIndex, PersistError> {
         let n = meta.n as usize;
         let dim = meta.dim as usize;
         if dim == 0 || dim > 1 << 20 {
-            return Err(corrupt("mantıksız dim"));
+            return Err(corrupt("implausible dim"));
         }
         if meta.ids.len() != n || meta.links.len() != n {
-            return Err(corrupt("ids/links uzunluğu n ile uyuşmuyor"));
+            return Err(corrupt("ids/links length does not match n"));
         }
         let mut links = Vec::with_capacity(n);
         for ls in &meta.links {
             if ls.is_empty() {
-                return Err(corrupt("node'un hiç seviyesi yok"));
+                return Err(corrupt("node has no levels at all"));
             }
             let mut node_levels = Vec::with_capacity(ls.len());
             for level in ls {
                 let l: Vec<usize> = level.iter().map(|&s| s as usize).collect();
                 if l.iter().any(|&s| s >= n) {
-                    return Err(corrupt("komşu slot sınır dışı"));
+                    return Err(corrupt("neighbour slot out of bounds"));
                 }
                 node_levels.push(l);
             }
             links.push(node_levels);
         }
         if meta.deleted.len() != n {
-            return Err(corrupt("deleted uzunluğu n ile uyuşmuyor"));
+            return Err(corrupt("deleted length does not match n"));
         }
         let deleted_count = meta.deleted.iter().filter(|&&d| d).count();
         let entry = match meta.entry {
             Some(e) if (e as usize) < n => Some(e as usize),
-            Some(_) => return Err(corrupt("entry point sınır dışı")),
-            // Tüm elemanlar tombstone'sa entry meşru olarak None olabilir.
+            Some(_) => return Err(corrupt("entry point out of bounds")),
+            // If every element is a tombstone, entry may legitimately be None.
             None if deleted_count == n => None,
-            None => return Err(corrupt("yaşayan eleman var ama entry yok")),
+            None => return Err(corrupt("there are live elements but no entry")),
         };
-        // Sadece yaşayan slotlar id haritasına girer; tombstone slotundaki id
-        // yeniden eklenmiş olabilir ve yaşayan kopyası haritada olmalı.
+        // Only live slots go into the id map; the id in a tombstoned slot may
+        // have been re-inserted, and the live copy is the one that belongs in
+        // the map.
         let mut slot_of = HashMap::with_capacity(n - deleted_count);
         for (slot, &id) in meta.ids.iter().enumerate() {
             if meta.deleted[slot] {
                 continue;
             }
             if slot_of.insert(id, slot).is_some() {
-                return Err(corrupt("yinelenen yaşayan VectorId"));
+                return Err(corrupt("duplicate live VectorId"));
             }
         }
         let ml = 1.0 / (meta.params.m.max(2) as f64).ln();
         Ok(HnswIndex {
-            // RNG durumu diske yazılmaz; yükleme sonrası seviye ataması
-            // seed ⊕ n'den yeniden türetilir (deterministik ama inşa
-            // ortasındaki durumla birebir aynı değil — bkz. DECISIONS.md).
+            // RNG state is not written to disk; after loading, level assignment
+            // is re-derived from seed ⊕ n (deterministic, but not identical to
+            // the state mid-construction — see DECISIONS.md).
             rng: StdRng::seed_from_u64(meta.params.seed ^ meta.n),
             params: meta.params,
             metric: meta.metric,
@@ -1007,15 +1046,16 @@ mod tests {
                     "slot {slot} level {level}: {} > limit",
                     nbrs.len()
                 );
-                // Not: kenarların çift yönlülüğü GARANTİ DEĞİL — shrink_links
-                // bir tarafı kırptığında karşı kenar kalır (graf yönlüdür,
-                // hnswlib ile aynı davranış). Bu yüzden sadece komşu slotların
-                // geçerli ve node'un o seviyeye sahip olduğunu doğruluyoruz.
+                // Note: edges are NOT GUARANTEED to be bidirectional — when
+                // shrink_links prunes one side, the opposite edge remains (the
+                // graph is directed; same behaviour as hnswlib). So we only
+                // verify that neighbour slots are valid and that the node
+                // actually has that level.
                 for &nb in nbrs {
                     assert!(nb < idx.links.len());
                     assert!(
                         level < idx.links[nb].len(),
-                        "komşu {nb} seviye {level}'a sahip değil"
+                        "neighbour {nb} does not have level {level}"
                     );
                 }
             }
@@ -1043,9 +1083,9 @@ mod tests {
         assert!(recall >= 0.95, "recall {recall} < 0.95");
     }
 
-    // ---- Silme / compaction testleri (Aşama 4) ----
+    // ---- Deletion / compaction tests (phase 4) ----
 
-    /// Compaction tetiklenmesin diye yüksek eşikli parametre.
+    /// Parameters with a high threshold so compaction is not triggered.
     fn no_compact_params() -> HnswParams {
         HnswParams {
             tombstone_threshold: 2.0, // asla otomatik tetiklenmez
@@ -1079,21 +1119,21 @@ mod tests {
     fn delete_entry_point_picks_new_entry_and_search_works() {
         let vecs = random_vectors(500, 8, 42);
         let mut idx = build_with(&vecs, no_compact_params());
-        // giriş noktasını bul ve sil — kritik senaryo
+        // find and delete the entry point — the critical scenario
         let entry_slot = idx.entry.unwrap();
         let entry_id = idx.ids[entry_slot];
         idx.delete(entry_id).unwrap();
-        let new_entry = idx.entry.expect("yeni entry seçilmeliydi");
+        let new_entry = idx.entry.expect("a new entry should have been chosen");
         assert_ne!(new_entry, entry_slot);
         assert!(!idx.deleted[new_entry]);
-        // yeni entry yaşayanların en yüksek seviyelisi olmalı
+        // the new entry must be the highest-level live node
         let max_level = (0..idx.ids.len())
             .filter(|&s| !idx.deleted[s])
             .map(|s| idx.links[s].len())
             .max()
             .unwrap();
         assert_eq!(idx.links[new_entry].len(), max_level);
-        // arama hâlâ çalışıyor ve silinen id dönmüyor
+        // search still works and does not return the deleted id
         let res = idx.search(&vecs[0].clone(), 10);
         assert_eq!(res.len(), 10);
         assert!(res.iter().all(|r| r.id != entry_id));
@@ -1109,7 +1149,7 @@ mod tests {
         assert_eq!(idx.len(), 0);
         assert!(idx.search(&[0.0; 4], 5).is_empty());
         assert!(idx.entry.is_none());
-        // boşalmış indekse ekleme sıfırdan kurulum gibi çalışmalı
+        // inserting into an emptied index must work like building from scratch
         idx.insert(VectorId(100), &[1.0; 4]).unwrap();
         assert_eq!(idx.search(&[1.0; 4], 1)[0].id, VectorId(100));
     }
@@ -1134,7 +1174,7 @@ mod tests {
         for (i, v) in vecs.iter().enumerate() {
             bf.insert(VectorId(i as u64), v).unwrap();
         }
-        // her 5. elemanı sil (%20)
+        // delete every 5th element (20%)
         for i in (0..2_000).step_by(5) {
             idx.delete(VectorId(i)).unwrap();
             bf.delete(VectorId(i)).unwrap();
@@ -1144,12 +1184,12 @@ mod tests {
         for q in &queries {
             let truth: Vec<_> = bf.search(q, 10).iter().map(|r| r.id).collect();
             let got = idx.search_with_ef(q, 10, 100);
-            assert_eq!(got.len(), 10, "silme sonrası eksik sonuç");
+            assert_eq!(got.len(), 10, "missing results after deletion");
             hits += got.iter().filter(|r| truth.contains(&r.id)).count();
             total += truth.len();
         }
         let recall = hits as f64 / total as f64;
-        assert!(recall >= 0.95, "silme sonrası recall {recall} < 0.95");
+        assert!(recall >= 0.95, "recall after deletion {recall} < 0.95");
     }
 
     #[test]
@@ -1163,25 +1203,25 @@ mod tests {
             },
         );
         let (vec_before, link_before) = idx.memory_bytes();
-        // %30 eşiğin hemen altına kadar sil — compaction tetiklenmemeli
+        // delete up to just below the 30% threshold — compaction must not fire
         for i in 0..299 {
             idx.delete(VectorId(i)).unwrap();
         }
         assert!(idx.tombstone_ratio() > 0.0);
-        // eşiği aşan silme compaction tetikler
+        // a deletion crossing the threshold triggers compaction
         idx.delete(VectorId(299)).unwrap();
         assert_eq!(
             idx.tombstone_ratio(),
             0.0,
-            "compaction tombstone bırakmamalı"
+            "compaction must leave no tombstones"
         );
         assert_eq!(idx.len(), 700);
         let (vec_after, link_after) = idx.memory_bytes();
         assert!(
             vec_after < vec_before && link_after < link_before,
-            "bellek düşmedi: vec {vec_before}->{vec_after}, link {link_before}->{link_after}"
+            "memory did not drop: vec {vec_before}->{vec_after}, link {link_before}->{link_after}"
         );
-        // compaction sonrası arama sağlıklı
+        // search is healthy after compaction
         let res = idx.search(&vecs[500].clone(), 5);
         assert_eq!(res[0].id, VectorId(500));
     }
@@ -1193,7 +1233,7 @@ mod tests {
         for i in (0..200).step_by(7) {
             idx.delete(VectorId(i)).unwrap();
         }
-        // silinmiş bir id'yi yeniden ekle: ids'te çift kayıt senaryosu
+        // re-insert a deleted id: the duplicate-entry-in-ids scenario
         idx.insert(VectorId(0), &[0.5; 8]).unwrap();
         let loaded = HnswIndex::load_from_bytes(&save_to_bytes(&idx)).unwrap();
         assert_eq!(idx.len(), loaded.len());
@@ -1202,7 +1242,7 @@ mod tests {
         }
     }
 
-    // ---- Kalıcılık testleri (Aşama 3) ----
+    // ---- Persistence tests (phase 3) ----
 
     fn save_to_bytes(idx: &HnswIndex) -> Vec<u8> {
         let dir = std::env::temp_dir().join(format!("gvdb-test-{}", std::process::id()));
@@ -1261,7 +1301,7 @@ mod tests {
         for cut in [0, 3, 10, bytes.len() / 2, bytes.len() - 1] {
             assert!(
                 HnswIndex::load_from_bytes(&bytes[..cut]).is_err(),
-                "kesik dosya (cut={cut}) hata döndürmeliydi"
+                "a truncated file (cut={cut}) should have returned an error"
             );
         }
     }
@@ -1270,13 +1310,13 @@ mod tests {
     fn persist_bitflip_detected_by_crc() {
         let idx = build(&random_vectors(100, 8, 42), Metric::L2);
         let bytes = save_to_bytes(&idx);
-        // header'dan sonra çeşitli noktalarda tek bit boz
+        // flip a single bit at various points after the header
         for pos in [8, 20, bytes.len() / 2, bytes.len() - 10] {
             let mut bad = bytes.clone();
             bad[pos] ^= 0x01;
             assert!(
                 HnswIndex::load_from_bytes(&bad).is_err(),
-                "bit flip @{pos} yakalanmalıydı"
+                "bit flip @{pos} should have been caught"
             );
         }
     }
@@ -1291,7 +1331,7 @@ mod tests {
             HnswIndex::load_from_bytes(&bad),
             Err(PersistError::Corrupt(_))
         ));
-        // versiyonu değiştir + crc'yi düzelt ki versiyon kontrolüne ulaşsın
+        // change the version and fix the crc so it reaches the version check
         let mut bad = bytes.clone();
         bad[4] = 99;
         let body_len = bad.len() - 4;
@@ -1306,31 +1346,32 @@ mod tests {
     }
 
     proptest! {
-        /// Mini-fuzz (cargo-fuzz'ın CI'siz muadili): rastgele baytlar asla
-        /// panic üretmemeli. Gerçek fuzz hedefi fuzz/fuzz_targets/load_index.rs.
+        /// A mini-fuzz (the CI-less counterpart of cargo-fuzz): random bytes
+        /// must never cause a panic. The real fuzz target is
+        /// fuzz/fuzz_targets/load_index.rs.
         #[test]
         fn prop_load_random_bytes_never_panics(bytes in proptest::collection::vec(any::<u8>(), 0..2048)) {
             let _ = HnswIndex::load_from_bytes(&bytes);
         }
 
-        /// Geçerli bir dosyanın rastgele bir baytını bozmak ya hata vermeli
-        /// ya da (pad baytı gibi checksum'a girmeyen yer yoktur — crc her şeyi
-        /// kapsar) asla panic olmamalı.
+        /// Corrupting a random byte of a valid file must either produce an
+        /// error or — since there is no location outside the checksum, not even
+        /// a pad byte, because the crc covers everything — never panic.
         #[test]
         fn prop_corrupted_valid_file_no_panic(pos in 0usize..500, xor in 1u8..255) {
             let idx = build(&random_vectors(20, 4, 42), Metric::L2);
             let mut bytes = save_to_bytes(&idx);
             let p = pos % bytes.len();
             bytes[p] ^= xor;
-            // crc her baytı kapsadığından bozulma Err olmalı
+            // since the crc covers every byte, corruption must yield Err
             prop_assert!(HnswIndex::load_from_bytes(&bytes).is_err());
         }
     }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(16))]
-        /// İnvariant: yüksek ef_search'te HNSW'nin İLK sonucu brute-force'un
-        /// ilk sonucuyla büyük ölçüde örtüşmeli.
+        /// Invariant: at a high ef_search, HNSW's FIRST result must largely
+        /// agree with brute force's first result.
         #[test]
         fn prop_top1_matches_bruteforce_at_high_ef(seed in 0u64..1000) {
             let vecs = random_vectors(300, 8, seed);
@@ -1348,8 +1389,8 @@ mod tests {
                     agree += 1;
                 }
             }
-            // 20 sorgunun en az 18'inde top-1 aynı olmalı
-            prop_assert!(agree >= 18, "top-1 örtüşme {agree}/20");
+            // top-1 must match in at least 18 of the 20 queries
+            prop_assert!(agree >= 18, "top-1 agreement {agree}/20");
         }
     }
 }
