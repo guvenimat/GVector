@@ -304,9 +304,7 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
     }
 }
 
-/// Phase 8: the 1M end-to-end reality check (the full system — segmented index
-/// + planner + filters + WAL). Pre-registered thresholds: DECISIONS #40/#41.
-/// Process RSS (bytes). Without adding a dependency: `WorkingSet64` is read via
+/// Process RSS (bytes). Without adding a dependency, `WorkingSet64` is read via
 /// PowerShell. It is called a handful of times between measurement steps, so the
 /// ~200 ms process startup cost does not affect the measurement.
 fn rss_bytes() -> u64 {
@@ -324,6 +322,8 @@ fn rss_bytes() -> u64 {
         .unwrap_or(0)
 }
 
+/// Phase 8: the 1M end-to-end reality check (the full system: segmented index,
+/// planner, filters and WAL). Pre-registered thresholds: DECISIONS #40/#41.
 fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric) {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
