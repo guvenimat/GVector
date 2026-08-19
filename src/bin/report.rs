@@ -1,11 +1,12 @@
-//! Uçtan uca rapor: recall@10, p50/p99 latency, bellek ve inşa süresi.
+//! End-to-end report: recall@10, p50/p99 latency, memory and build time.
 //!
-//! Kullanım:
+//! Usage:
 //!   cargo run --release --bin report -- random [n] [dim] [n_query]
-//!   cargo run --release --bin report -- sift <n> [n_query]   (data/sift altından okur)
+//!   cargo run --release --bin report -- sift <n> [n_query]   (reads from data/sift)
 //!
-//! Not: SIFT'in hazır ground truth'u 1M'lik TAM taban içindir; alt küme
-//! kullanırken GT'yi exact taramayla kendimiz üretiriz (aksi yanlış recall verir).
+//! Note: SIFT's bundled ground truth is for the FULL 1M base; when using a
+//! subset we generate the GT ourselves with an exact scan (otherwise recall
+//! comes out wrong).
 
 use std::time::Instant;
 use vector_gvector::dataset::{random_vectors, read_fvecs_subset, read_ivecs, DEFAULT_SEED};
@@ -16,13 +17,13 @@ use vector_gvector::index::hnsw::{HnswIndex, HnswParams};
 use vector_gvector::index::VectorIndex;
 use vector_gvector::types::VectorId;
 
-/// HNSW parametre süpürmesi: M × ef_search kombinasyonları için
-/// recall/latency tablosu basar; brute-force referansıyla hızlanmayı raporlar.
+/// HNSW parameter sweep: prints a recall/latency table for combinations of
+/// M × ef_search and reports the speedup against the brute-force reference.
 fn hnsw_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric) {
     let truth = ground_truth(base, queries, k, metric);
     let dim = base[0].len();
 
-    // Brute-force referans latency'si (hızlanma oranı için).
+    // Brute-force reference latency (for the speedup ratio).
     let mut bf = BruteForceIndex::new(dim, metric);
     for (i, v) in base.iter().enumerate() {
         bf.insert(VectorId(i as u64), v).expect("bf insert");
@@ -36,7 +37,7 @@ fn hnsw_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     );
     println!();
     println!(
-        "| M | ef_c | ef_search | recall@{k} | p50 | p99 | hızlanma(p50) | inşa | graf B/vektör |"
+        "| M | ef_c | ef_search | recall@{k} | p50 | p99 | speedup(p50) | build | graph B/vector |"
     );
     println!(
         "|---|------|-----------|-----------|-----|-----|---------------|------|----------------|"
@@ -76,14 +77,15 @@ fn hnsw_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     }
 }
 
-/// Filtre seçicilik süpürmesi (plan: fallback ölçümü).
+/// Filter selectivity sweep (plan: the fallback measurement).
 ///
-/// Üç eşleşme dağılımı:
-/// - uniform: id-uzayında düzgün serpilmiş (taban çizgisi)
-/// - clustered: VEKTÖR uzayında kümelenmiş — merkezin en yakın s·n komşusu.
-///   Sorgular merkeze uzaklığa göre yakın/orta/uzak gruplanır: kırılganlık
-///   sorgu eşleşme bölgesinden UZAKKEN bekleniyor.
-/// - contig: id-bitişik ilk s·n kayıt (segment sınırı etkileşimi için ayrı)
+/// Three match distributions:
+/// - uniform: spread evenly across id space (the baseline)
+/// - clustered: clustered in VECTOR space — the nearest s·n neighbours of a
+///   centre. Queries are grouped near/mid/far by their distance to that centre:
+///   the fragility is expected when the query is FAR from the match region.
+/// - contig: the first s·n records, contiguous in id space (kept separate for
+///   the interaction with segment boundaries)
 fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric) {
     use std::collections::HashSet;
     use vector_gvector::meta::{Filter, MetaValue, Metadata, Predicate};
@@ -91,7 +93,7 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
     let n = base.len();
     let dim = base[0].len();
     let ef = 50usize;
-    let ef_cap = 4096usize; // ölçekli ef tavanı (kullanıcı geri bildirimi)
+    let ef_cap = 4096usize; // cap for the scaled-ef arm (from user feedback)
 
     let mut hnsw = HnswIndex::new(dim, metric, HnswParams::default());
     let mut bf = BruteForceIndex::new(dim, metric);
@@ -100,17 +102,17 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
         bf.insert(VectorId(i as u64), v).expect("insert");
     }
 
-    // Filtresiz referans (s=1.0 satırının sabit maliyet karşılaştırması).
+    // Unfiltered reference (the fixed-cost comparison for the s=1.0 row).
     let unfiltered = measure_latency(queries, |q| {
         std::hint::black_box(hnsw.search_with_ef(q, k, ef));
     });
     println!(
-        "filtresiz search p50 = {:?} (s=1.0 karşılaştırması)",
+        "unfiltered search p50 = {:?} (comparison for s=1.0)",
         unfiltered.p50
     );
 
-    // Planlama maliyeti: O(n) metadata taraması bir sorgu planlayıcısına ne
-    // kadar pahalı olurdu? Gerçekçi bir metadata haritası kurup tam sayım süresi.
+    // Planning cost: how expensive would an O(n) metadata scan be for a query
+    // planner? Build a realistic metadata map and time a full count.
     let mut meta_store = vector_gvector::meta::MetaStore::new();
     for i in 0..n {
         meta_store.insert(
@@ -130,16 +132,17 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
         .filter(|&i| probe.matches_id(&meta_store, VectorId(i as u64)))
         .count();
     println!(
-        "planlama maliyeti (O(n) tam sayım, n={n}): {:?} (sayım={cnt})",
+        "planning cost (O(n) full count, n={n}): {:?} (count={cnt})",
         t.elapsed()
     );
     println!();
     println!("| varyant | s | grup | recall | p50 | fallback | ziyaret | kabul/ziyaret | ef' recall | ef' p50 | tarama p50 |");
     println!("|---------|---|------|--------|-----|----------|---------|----------------|------------|---------|------------|");
 
-    // Kümelenmiş varyantın merkezi: taban kümeden bir vektör.
+    // The centre of the clustered variant: a vector from the base set.
     let center = &base[0];
-    // Sorguları merkeze uzaklığa göre sırala, üçe böl (yakın/orta/uzak).
+    // Sort queries by distance to the centre and split into thirds
+    // (near/mid/far).
     let mut q_order: Vec<usize> = (0..queries.len()).collect();
     q_order.sort_by(|&a, &b| {
         metric
@@ -171,10 +174,11 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
             let s_real = allow_set.len() as f64 / n as f64;
             let ef_scaled = ((k as f64 / s_real).ceil() as usize).clamp(ef, ef_cap);
 
-            // Kümelenmişte sorgular uzaklık gruplarına ayrılır; diğerlerinde tek grup.
+            // For the clustered variant queries are split into distance groups;
+            // the others use a single group.
             let groups: Vec<(&str, Vec<usize>)> = if variant == "clustered" {
                 vec![
-                    ("yakın", q_order[..third].to_vec()),
+                    ("near", q_order[..third].to_vec()),
                     ("orta", q_order[third..2 * third].to_vec()),
                     ("uzak", q_order[2 * third..].to_vec()),
                 ]
@@ -214,7 +218,7 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
                 let lat_scaled = measure_latency(&qs, |q| {
                     std::hint::black_box(hnsw.search_filtered_with_ef(q, k, ef_scaled, &allow));
                 });
-                // Planlayıcının alternatif kolu: yalnız eşleşenlerde tarama.
+                // The planner's alternative arm: scanning only the matches.
                 let lat_scan = measure_latency(&qs, |q| {
                     std::hint::black_box(bf.search_filtered(q, k, &allow));
                 });
@@ -231,12 +235,12 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
         }
     }
 
-    // ---- "Sonra" tablosu: planlayıcılı SegmentedIndex uçtan uca ----
+    // ---- The "after" table: SegmentedIndex with the planner, end to end ----
     // Her s seviyesi bir Bool etiketi olur ("s0".."s6"); filtre Eq ile
-    // posting-list yolunu kullanır. Varyant başına tek inşa.
+    // uses the posting-list path. One build per variant.
     use vector_gvector::index::segmented::SegmentedIndex;
     println!();
-    println!("== planlayıcılı SegmentedIndex (posting-list + tarama / filtresiz over-fetch) ==");
+    println!("== SegmentedIndex with planner (posting list + scan / unfiltered over-fetch) ==");
     println!("| varyant | s | grup | recall | p50 |");
     println!("|---------|---|------|--------|-----|");
     for variant in ["uniform", "clustered", "contig"] {
@@ -266,7 +270,7 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
             let allow = |id: VectorId| allow_set.contains(&id.0);
             let groups: Vec<(&str, Vec<usize>)> = if variant == "clustered" {
                 vec![
-                    ("yakın", q_order[..third].to_vec()),
+                    ("near", q_order[..third].to_vec()),
                     ("orta", q_order[third..2 * third].to_vec()),
                     ("uzak", q_order[2 * third..].to_vec()),
                 ]
@@ -300,11 +304,11 @@ fn filter_sweep(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metri
     }
 }
 
-/// Aşama 8: 1M uçtan uca gerçeklik ölçümü (tam sistem — segmented +
-/// planlayıcı + filtreler + WAL). Ön-kayıtlı eşikler: DECISIONS #40/#41.
-/// Süreç RSS'i (byte). Yeni bağımlılık eklemeden: PowerShell'den
-/// `WorkingSet64` okunur. Ölçüm adımları arasında birkaç kez çağrılıyor,
-/// ~200 ms'lik süreç başlatma maliyeti ölçümü etkilemiyor.
+/// Phase 8: the 1M end-to-end reality check (the full system — segmented index
+/// + planner + filters + WAL). Pre-registered thresholds: DECISIONS #40/#41.
+/// Process RSS (bytes). Without adding a dependency: `WorkingSet64` is read via
+/// PowerShell. It is called a handful of times between measurement steps, so the
+/// ~200 ms process startup cost does not affect the measurement.
 fn rss_bytes() -> u64 {
     let pid = std::process::id();
     std::process::Command::new("powershell")
@@ -333,13 +337,13 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     let seal = n / 8; // tavan=8 ile tam 8 segment
     let dir = std::path::PathBuf::from("data/fullscale");
     let _ = std::fs::remove_dir_all(&dir);
-    // Filtre kritik hücreleri için kümelenmiş eşleşme kümeleri ÖNCEDEN
-    // hesaplanır ve metadata alanı olarak işaretlenir — böylece ölçüm gerçek
-    // planlayıcı yolundan geçer (kol örtüşmesi ancak böyle ölçülebilir).
+    // The clustered match sets for the critical filter cells are computed UP
+    // FRONT and marked as metadata fields — that way the measurement goes through
+    // the real planner path (arm agreement can only be measured this way).
     let center = base[0].clone();
     let s_levels = [0.001f64, 0.05, 0.3];
     let cluster_names = ["c001", "c05", "c3"];
-    println!("kümelenmiş filtre kümeleri hazırlanıyor (exact top-k × 3)...");
+    println!("preparing clustered filter sets (exact top-k × 3)...");
     let t_prep = Instant::now();
     let clusters: Vec<HashSet<u64>> = s_levels
         .iter()
@@ -351,7 +355,7 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
                 .collect()
         })
         .collect();
-    println!("  hazır ({:?})", t_prep.elapsed());
+    println!("  ready ({:?})", t_prep.elapsed());
     let meta_of = |i: usize| -> Metadata {
         let mut m: Metadata = [
             ("grup".to_string(), MetaValue::Int((i % 8) as i64)),
@@ -367,7 +371,7 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
         m
     };
 
-    println!("### 1. İnşa (n={n}, seal={seal}, tavan=8, 3 metadata alanı, WAL=group:20)");
+    println!("### 1. Build (n={n}, seal={seal}, ceiling=8, 3 metadata fields, WAL=group:20)");
     let idx = SegmentedIndex::open_durable(
         dir.clone(),
         dim,
@@ -388,17 +392,17 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     idx.commit_wal().expect("commit");
     let build = t.elapsed();
     let (n_seg, n_buf) = idx.shape();
-    println!("inşa: {build:.1?} → {n_seg} segment + {n_buf} buffer");
+    println!("build: {build:.1?} → {n_seg} segments + {n_buf} buffer");
 
     println!();
-    println!("### 2. Bellek (hesaplanan; RSS dışarıdan örneklenir)");
+    println!("### 2. Memory (computed; RSS sampled externally)");
     let index_mem = idx.memory_bytes();
     let (m_meta, m_post, m_num) = idx.metadata_memory_bytes();
     let meta_total = m_meta + m_post + m_num;
     let mb = |b: usize| b as f64 / 1048576.0;
-    println!("vektör+graf (f32): {:.0} MB", mb(index_mem));
+    println!("vectors+graph (f32): {:.0} MB", mb(index_mem));
     println!(
-        "metadata toplam: {:.0} MB (harita {:.0} + posting {:.0} + sayısal {:.0})",
+        "metadata total: {:.0} MB (map {:.0} + postings {:.0} + numeric {:.0})",
         mb(meta_total),
         mb(m_meta),
         mb(m_post),
@@ -406,7 +410,7 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     );
     let meta_share = meta_total as f64 / (index_mem + meta_total) as f64;
     println!(
-        "metadata payı: {:.1}% — 9c eşiği %25 → {}",
+        "metadata share: {:.1}% — the 9c threshold is 25% → {}",
         meta_share * 100.0,
         if meta_share > 0.25 { "GO" } else { "NO-GO" }
     );
@@ -421,18 +425,18 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
         .filter_map(|e| e.ok()?.metadata().ok().map(|m| m.len()))
         .sum();
     println!(
-        "checkpoint (gen={gen}): {ck:.2?}, disk {:.0} MB ({:.0} B/vektör)",
+        "checkpoint (gen={gen}): {ck:.2?}, disk {:.0} MB ({:.0} B/vector)",
         disk as f64 / 1048576.0,
         disk as f64 / n as f64
     );
 
     println!();
-    println!("### 4. Recall tabanı (ef=100)");
-    // Resmi SIFT ground truth YALNIZ tam 1M taban için geçerli; alt kümede
-    // id'ler başka vektörlere işaret eder (smoke test'te recall 0.0000 olarak
-    // yakalandı). Alt kümede exact taramayla üretiyoruz.
+    println!("### 4. Recall baseline (ef=100)");
+    // The official SIFT ground truth is valid ONLY for the full 1M base; on a
+    // subset the ids point at different vectors (this was caught as recall
+    // 0.0000 in a smoke test). On a subset we generate it with an exact scan.
     let truth: Vec<Vec<VectorId>> = if n == 1_000_000 {
-        println!("  (resmi SIFT ground truth — tam set, geçerli)");
+        println!("  (official SIFT ground truth — full set, valid)");
         read_ivecs(std::path::Path::new("data/sift/sift_groundtruth.ivecs"))
             .expect("ground truth")
             .iter()
@@ -440,7 +444,7 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
             .map(|row| row.iter().take(k).map(|&i| VectorId(i as u64)).collect())
             .collect()
     } else {
-        println!("  (alt küme: resmi GT geçersiz → exact taramayla üretiliyor)");
+        println!("  (subset: the official GT is invalid → generating via exact scan)");
         ground_truth(base, queries, k, metric)
     };
     let results: Vec<Vec<VectorId>> = queries
@@ -452,14 +456,14 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
         std::hint::black_box(idx.search_shared(q, k));
     });
     println!(
-        "recall@{k} = {recall:.4} (eşik ≥0.99 → {}), p50={:?} p99={:?}",
+        "recall@{k} = {recall:.4} (threshold ≥0.99 → {}), p50={:?} p99={:?}",
         if recall >= 0.99 { "TUTTU" } else { "TUTMADI" },
         lat.p50,
         lat.p99
     );
 
     println!();
-    println!("### 5. Filtre kritik hücreleri (clustered × uzak sorgu, gerçek planlayıcı yolu)");
+    println!("### 5. Critical filter cells (clustered × distant query, real planner path)");
     let mut q_order: Vec<usize> = (0..queries.len()).collect();
     q_order.sort_by(|&a, &b| {
         metric
@@ -472,7 +476,7 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
         .collect();
     let scan_limit = (16 * k).max(n / 20);
     println!("scan_limit = {scan_limit}");
-    println!("| s | eşleşme | kol (oracle) | recall | p50 |");
+    println!("| s | matches | arm (oracle) | recall | p50 |");
     println!("|---|---------|--------------|--------|-----|");
     let mut arm_agree = 0usize;
     for (si, s) in s_levels.iter().enumerate() {
@@ -493,7 +497,7 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
         let mut hits = 0usize;
         let mut total = 0usize;
         for q in &far {
-            // referans: yalnız eşleşenler üzerinde exact top-k
+            // reference: exact top-k over the matches only
             let mut cand: Vec<(f32, u64)> = allow_set
                 .iter()
                 .map(|&id| (metric.distance(q, &base[id as usize]), id))
@@ -515,15 +519,15 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
         );
     }
     println!(
-        "kol örtüşmesi: {arm_agree}/{} ({:.0}%)",
+        "arm agreement: {arm_agree}/{} ({:.0}%)",
         s_levels.len(),
         arm_agree as f64 / s_levels.len() as f64 * 100.0
     );
 
     println!();
-    println!("### 6. Merge penceresi (9a gerekçesi ve tabanı)");
-    let extra = seal + 5_000; // 9. segmenti mühürler → merge tetiklenir
-    println!("  {extra} ek yazma (pencere öncesi+sonrası örnekleme için)");
+    println!("### 6. Merge window (the rationale and baseline for 9a)");
+    let extra = seal + 5_000; // seals a 9th segment → triggers a merge
+    println!("  {extra} extra writes (to sample before and after the window)");
     let mut lats: Vec<std::time::Duration> = Vec::with_capacity(extra);
     let t_all = Instant::now();
     for i in 0..extra {
@@ -542,13 +546,13 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     sorted_lat.sort();
     let pct =
         |p: f64| sorted_lat[((sorted_lat.len() as f64 * p) as usize).min(sorted_lat.len() - 1)];
-    // Pencereler: en uzun yazma = seal+merge yapan çağrı
+    // The windows: the longest write = the call that does seal+merge
     let max_lat = *sorted_lat.last().unwrap();
-    // Taban: en uzun 3 yazma (seal/merge çağrıları) hariç p99
+    // Baseline: p99 excluding the 3 longest writes (the seal/merge calls)
     let cutoff = sorted_lat.len().saturating_sub(3);
     let base_p99 = sorted_lat[(cutoff as f64 * 0.99) as usize];
     println!(
-        "taban p50={:?} p99={:?} (seal/merge çağrıları hariç)",
+        "baseline p50={:?} p99={:?} (excluding seal/merge calls)",
         pct(0.5),
         base_p99
     );
@@ -561,14 +565,14 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     );
     let ratio = max_lat.as_secs_f64() / base_p99.as_secs_f64().max(1e-9);
     println!(
-        "oran: {ratio:.0}x (9a kabul eşiği 50x — 9a SONRASI ölçülecek; \
-         şimdiki değer 9a'nın gerekçesi)"
+        "ratio: {ratio:.0}x (the 9a acceptance threshold is 50x — to be measured \
+         AFTER 9a; the current value is the rationale for 9a)"
     );
     let (n_seg2, _) = idx.shape();
-    println!("segment sayısı: {n_seg2} (tavan 8 korunuyor)");
+    println!("segment count: {n_seg2} (ceiling 8 holds)");
 
     println!();
-    println!("### 7. Soğuk başlangıç (9b tabanı)");
+    println!("### 7. Cold start (the 9b baseline)");
     idx.checkpoint().expect("checkpoint2");
     drop(idx);
     let mut cold_times = Vec::new();
@@ -586,16 +590,16 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
         let el = t.elapsed();
         cold_times.push(el);
         if round == 0 {
-            println!("  boş WAL: {el:.2?} ({} kayıt)", re.len_shared());
+            println!("  empty WAL: {el:.2?} ({} records)", re.len_shared());
         }
     }
     cold_times.sort();
     println!(
-        "soğuk başlangıç medyan (3 tur, boş WAL): {:.2?}",
+        "cold start median (3 rounds, empty WAL): {:.2?}",
         cold_times[1]
     );
 
-    // 10K'lık WAL ile soğuk başlangıç
+    // Cold start with a 10K WAL
     let idx = SegmentedIndex::open_durable(
         dir.clone(),
         dim,
@@ -624,19 +628,20 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     )
     .expect("reopen");
     println!(
-        "soğuk başlangıç + 10K WAL ({wal_mb:.1} MB): {:.2?} (replay {} kayıt)",
+        "cold start + 10K WAL ({wal_mb:.1} MB): {:.2?} (replayed {} records)",
         t.elapsed(),
         re.replay_report().applied
     );
 
     println!();
-    println!("### 8. Karışık yük: 8 okuyucu + 1 yazıcı × 3 fsync politikası");
-    // Yazıcı GERÇEKÇİ hızda çalışır (throttle). Sınırsız yazma iki şeyi
-    // birden bozuyordu: (a) buffer şişip okuyucuları brute-force taramaya
-    // mahkûm ediyor, (b) mühürleme tetiklenip tablo "fsync politikası"
-    // yerine "araya giren HNSW inşası" ölçüyordu. Sorumuz "yazıcı varken
-    // okuyucular yavaşlıyor mu", "yazıcı ne kadar hızlı" değil (o Aşama 7'de).
-    const WRITE_RATE: u64 = 200; // op/s hedefi (per_op bile yetişebilmeli)
+    println!("### 8. Mixed load: 8 readers + 1 writer × 3 fsync policies");
+    // The writer runs at a REALISTIC rate (throttled). Unbounded writing broke
+    // two things at once: (a) the buffer swelled and condemned readers to a
+    // brute-force scan, and (b) sealing was triggered so the table measured "an
+    // HNSW build cutting in" rather than "the fsync policy". Our question is "do
+    // readers slow down while a writer is active", not "how fast is the writer"
+    // (that was phase 7).
+    const WRITE_RATE: u64 = 200; // target op/s (even per_op must keep up)
     let idx = Arc::new(re);
     let bench_reads = |idx: &Arc<SegmentedIndex>,
                        with_writer: bool|
@@ -692,7 +697,7 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
         )
     };
     let (base_qps, _, base_p50) = bench_reads(&idx, false);
-    println!("yazıcısız taban: {base_qps:.0} QPS, okuma p50 {base_p50:?} (8 okuyucu)");
+    println!("writer-free baseline: {base_qps:.0} QPS, read p50 {base_p50:?} (8 readers)");
     println!("| politika | okuma QPS | tabana oran | yazma op/s | okuma p50 |");
     println!("|----------|-----------|-------------|------------|-----------|");
     for policy in [
@@ -712,13 +717,12 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     println!();
     println!("### 9. 1M kaza testi (dolu WAL + kesme)");
     let idx = Arc::try_unwrap(idx).ok().expect("tek referans");
-    // WAL'ı kasten mühürleme eşiğinin ÜSTÜNE çıkar: replay'in kurtarma
-    // süresini nasıl etkilediğini görmek için (replay insert'leri buffer'ı
-    // doldurunca HNSW inşası tetikleniyor — kurtarma süresi WAL boyutunda
-    // doğrusal DEĞİL).
+    // Deliberately push the WAL ABOVE the sealing threshold, to see how replay
+    // affects recovery time (once the replayed inserts fill the buffer an HNSW
+    // build is triggered — so recovery time is NOT linear in WAL size).
     let wal_fill = idx.seal_threshold().min(150_000) + 20_000;
     println!(
-        "  WAL'a {wal_fill} kayıt yazılıyor (mühürleme eşiği {})",
+        "  writing {wal_fill} records to the WAL (sealing threshold {})",
         idx.seal_threshold()
     );
     for i in 0..wal_fill {
@@ -734,7 +738,7 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
     drop(idx);
     let full = std::fs::read(&wal_path).unwrap_or_default();
     if full.is_empty() {
-        println!("WAL boş — kesme senaryosu atlandı");
+        println!("the WAL is empty — the truncation scenario was skipped");
     } else {
         let cut = full.len() * 2 / 3;
         std::fs::write(&wal_path, &full[..cut]).expect("kes");
@@ -748,9 +752,9 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
             seal,
             SyncPolicy::Group { window_ms: 20 },
         )
-        .expect("kesik WAL ile açılış");
+        .expect("opening with a truncated WAL");
         println!(
-            "kesik WAL ({:.1} MB → {:.1} MB) açılış: {:.2?}, replay {} kayıt (sağlam önek {} kayıt)",
+            "truncated WAL ({:.1} MB → {:.1} MB) open: {:.2?}, replayed {} records (intact prefix {} records)",
             full.len() as f64 / 1048576.0,
             cut as f64 / 1048576.0,
             t.elapsed(),
@@ -758,19 +762,19 @@ fn full_scale(base: &[Vec<f32>], queries: &[Vec<f32>], k: usize, metric: Metric)
             prefix.len()
         );
         println!(
-            "  kayıt sayısı: kesme öncesi {live_before} → kurtarılan {} (fark = kesilen kuyruk)",
+            "  record count: {live_before} before the cut → {} recovered (the difference is the severed tail)",
             re.len_shared()
         );
     }
     println!();
-    println!("=== fullscale tamamlandı ===");
+    println!("=== fullscale complete ===");
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mode = args.first().map(String::as_str).unwrap_or("random");
     let k = 10;
-    let metric = Metric::L2; // SIFT literatürde L2 ile değerlendirilir
+    let metric = Metric::L2; // SIFT is evaluated with L2 in the literature
 
     let (base, queries, label) = match mode {
         "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter"
@@ -779,27 +783,29 @@ fn main() {
         | "postingcost" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
-            // SIFT yoksa PANİK YERİNE rastgele veriye düşülür: projeye yeni
-            // bakan biri 1 GB'lık veri kümesini indirmeden bir ölçüm
-            // koşturabilmeli. Düşüş SESSİZ DEĞİL — recall rakamları gerçek
-            // veriyle karşılaştırılamaz, o yüzden uyarı basılır ve etiket
+            // If SIFT is absent we fall back to random data INSTEAD OF PANICKING:
+            // someone new to the project should be able to run a measurement
+            // without downloading a 1 GB dataset. The fallback is NOT SILENT —
+            // recall numbers are not comparable to real data, so a warning is
+            // printed and the label
             // "random" olur.
             match std::fs::File::open("data/sift/sift_base.fvecs") {
                 Ok(bf) => {
                     let mut f = std::io::BufReader::new(bf);
-                    let base = read_fvecs_subset(&mut f, n).expect("base okunamadı");
+                    let base = read_fvecs_subset(&mut f, n).expect("could not read base");
                     let mut fq = std::io::BufReader::new(
-                        std::fs::File::open("data/sift/sift_query.fvecs").expect("query dosyası"),
+                        std::fs::File::open("data/sift/sift_query.fvecs").expect("query file"),
                     );
-                    let queries = read_fvecs_subset(&mut fq, n_query).expect("query okunamadı");
-                    (base, queries, format!("SIFT alt küme n={n}"))
+                    let queries =
+                        read_fvecs_subset(&mut fq, n_query).expect("could not read queries");
+                    (base, queries, format!("SIFT subset n={n}"))
                 }
                 Err(_) => {
-                    eprintln!("UYARI: data/sift bulunamadı → rastgele vektörlerle koşuluyor.");
-                    eprintln!("  Rastgele veride recall rakamları SIFT sonuçlarıyla");
-                    eprintln!("  karşılaştırılamaz: rastgele yüksek boyutlu veri ANN için");
-                    eprintln!("  en kötü durumdur. Gerçek ölçüm için SIFT-1M'i data/sift/");
-                    eprintln!("  altına açın.");
+                    eprintln!("WARNING: data/sift not found → running on random vectors.");
+                    eprintln!("  Recall numbers on random data are not comparable to");
+                    eprintln!("  SIFT results: random high-dimensional data is the worst");
+                    eprintln!("  case for ANN. For real measurements, extract SIFT-1M");
+                    eprintln!("  into data/sift/.");
                     let dim = 128;
                     (
                         random_vectors(n, dim, DEFAULT_SEED),
@@ -837,19 +843,20 @@ fn main() {
     }
 
     if mode == "postingcost" {
-        // 9c riski: sıralı Vec'e ekleme O(n) kaydırma yapar. id'ler ARTAN
-        // sırada gelirse ekleme daima sona düşer (O(1)); RASTGELE sırada
-        // gelirse O(n²)'ye döner. Ölçümlerimiz id'leri hep artan sırada
-        // ürettiği için bu fark görünmüyordu — burada kasten kırılıyor.
+        // The 9c risk: inserting into a sorted Vec costs an O(n) shift. If ids
+        // arrive in ASCENDING order the insert always lands at the end (O(1)); in
+        // RANDOM order it degrades to O(n²). Our measurements always generated ids
+        // in ascending order, so this difference was invisible — here it is broken
+        // on purpose.
         use rand::seq::SliceRandom;
         use rand::SeedableRng;
         use vector_gvector::index::segmented::SegmentedIndex;
         use vector_gvector::meta::{MetaValue, Metadata};
 
         let n = base.len().min(200_000);
-        println!("tek posting listesine {n} kayıt (hepsi aynı Eq değeri)");
+        println!("{n} records into a single posting list (all sharing one Eq value)");
         println!();
-        println!("| id sırası | süre | kayıt/s |");
+        println!("| id order | time | records/s |");
         println!("|-----------|------|---------|");
         for label in ["artan", "rastgele"] {
             let mut ids: Vec<u64> = (0..n as u64).collect();
@@ -857,7 +864,8 @@ fn main() {
                 let mut rng = rand::rngs::StdRng::seed_from_u64(DEFAULT_SEED);
                 ids.shuffle(&mut rng);
             }
-            // Mühürleme kapalı: ölçülen şey posting bakımı, HNSW inşası değil.
+            // Sealing off: what is measured is posting maintenance, not HNSW
+            // construction.
             let idx = SegmentedIndex::new(dim, metric, HnswParams::default(), usize::MAX);
             let t = Instant::now();
             for (i, id) in ids.iter().enumerate() {
@@ -872,18 +880,18 @@ fn main() {
     }
 
     if mode == "memverify" {
-        // 9c-0: metadata bellek TAHMİNİNİ gerçek RSS ile doğrula.
+        // 9c-0: validate the metadata memory ESTIMATE against real RSS.
         //
-        // Yapılar sırayla bırakılır ve her adımda RSS ölçülür. Tahmin
-        // (capacity × sabit katsayı) ile gerçek fark karşılaştırılır.
-        // 9c'nin GO kararı (%51.5 pay) tahmine dayanıyor; tahmin büyük
-        // ölçüde saparsa 9c'nin kapsamı yeniden çizilmeli.
+        // The structures are dropped one at a time and RSS is measured at each
+        // step, comparing the estimate (capacity × a fixed factor) with the real
+        // delta. 9c's GO decision (a 51.5% share) rests on that estimate; if it is
+        // far off, 9c's scope has to be redrawn.
         use vector_gvector::index::segmented::SegmentedIndex;
         use vector_gvector::storage::wal::SyncPolicy;
 
         let dir = std::path::PathBuf::from("data/fullscale");
         if !dir.join("MANIFEST").exists() {
-            eprintln!("data/fullscale yok — önce `report -- fullscale 1000000 99` koş");
+            eprintln!("data/fullscale is missing — run `report -- fullscale 1000000 99` first");
             return;
         }
         let idx = SegmentedIndex::open_durable(
@@ -894,18 +902,18 @@ fn main() {
             125_000,
             SyncPolicy::None,
         )
-        .expect("aç");
-        // Isınma: yapılara dokunulsun (lazy sayfa yüklemesi bitsin).
+        .expect("open");
+        // Warmup: touch the structures (so lazy page loading completes).
         let _ = idx.search_shared(&queries[0], k);
         let (m_est, p_est, n_est) = idx.metadata_memory_bytes();
         let mb = |b: usize| b as f64 / 1e6;
         let rss_mb = |b: u64| b as f64 / 1e6;
-        println!("kayıt: {}", idx.len_shared());
+        println!("records: {}", idx.len_shared());
         println!();
-        println!("| adım | RSS | düşüş | tahmin | tahmin/gerçek |");
+        println!("| step | RSS | drop | estimate | estimate/real |");
         println!("|------|-----|-------|--------|----------------|");
         let r0 = rss_bytes();
-        println!("| başlangıç | {:.0} MB | — | — | — |", rss_mb(r0));
+        println!("| start | {:.0} MB | — | — | — |", rss_mb(r0));
         let mut prev = r0;
         for (what, est) in [("numeric", n_est), ("postings", p_est), ("metadata", m_est)] {
             idx.clear_for_measurement(what);
@@ -924,41 +932,44 @@ fn main() {
         let total_real = r0.saturating_sub(prev);
         println!();
         println!(
-            "TOPLAM: tahmin {:.0} MB, gerçek düşüş {:.0} MB → tahmin/gerçek {:.2}x",
+            "TOTAL: estimate {:.0} MB, real drop {:.0} MB → estimate/real {:.2}x",
             mb(total_est),
             rss_mb(total_real),
             total_est as f64 / (total_real as f64).max(1.0)
         );
         println!(
-            "metadata payı (gerçek): {:.1}% (RSS {:.0} MB üzerinden)",
+            "metadata share (real): {:.1}% (of {:.0} MB RSS)",
             total_real as f64 / r0 as f64 * 100.0,
             rss_mb(r0)
         );
         println!();
-        println!("NOT: serbest bırakılan bellek işletim sistemine hemen dönmeyebilir;");
-        println!("bu durumda gerçek düşüş OLDUĞUNDAN AZ görünür (tahmin lehine sapma).");
+        println!("NOTE: freed memory may not return to the OS immediately;");
+        println!(
+            "in that case the real drop looks SMALLER than it is (a bias favouring the estimate)."
+        );
         return;
     }
 
     if mode == "accumulation" {
-        // 9a-2 KRİTER 2 (ön-kayıt #49): sürekli TAM HIZ yazma altında segment
-        // sayısı dengeleniyor mu, yoksa monoton büyüyor mu?
+        // 9a-2 CRITERION 2 (pre-registration #49): under sustained FULL-SPEED
+        // writing, does the segment count stabilize or grow monotonically?
         //
-        // Eşik (ölçümden önce sabitlendi): son üçte birin ortalaması ilk üçte
-        // birinkini en fazla %20 aşacak VE hiçbir örnek tavan+4'ü (12)
-        // aşmayacak → backpressure'sız kabul. Aksi halde backpressure aynı
-        // arc'ta yapılır.
+        // The threshold (fixed before the measurement): the average of the last
+        // third may exceed that of the first third by at most 20% AND no sample
+        // may exceed ceiling+4 (12) → accepted without backpressure. Otherwise
+        // backpressure is done in the same arc.
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use std::sync::Arc;
         use vector_gvector::index::segmented::SegmentedIndex;
         use vector_gvector::meta::Metadata;
         use vector_gvector::storage::wal::SyncPolicy;
 
-        // WAL KAPALI: birikme ölçümü yazma yolunun İÇ dinamiğini ölçüyor;
-        // WAL açıkken ilk denemede 120 s'de 4.3 GB log yazıldı ve disk/bellek
-        // ölçümü boğdu. Süre ön-kayıt #59: 10 dakika. 2 dakikalık pencere
-        // segment sayısının merge tavanına ULAŞMASINA yetmiyordu, bu yüzden
-        // "tavana yaklaşma" eğrisi "monoton büyüme" olarak yanlış okundu.
+        // WAL OFF: the accumulation measurement targets the INTERNAL dynamics of
+        // the write path; with the WAL on, the first attempt wrote a 4.3 GB log in
+        // 120 s and drowned the measurement in disk/memory pressure. Duration per
+        // pre-registration #59: 10 minutes. A 2-minute window was not enough for
+        // the segment count to REACH the merge ceiling, so the "approaching the
+        // ceiling" curve was misread as "monotone growth".
         let secs: u64 = 600;
         let seal = 125_000usize;
         let dir = std::path::PathBuf::from("data/accum");
@@ -971,18 +982,19 @@ fn main() {
             seal,
             SyncPolicy::None,
         )
-        .expect("aç");
+        .expect("open");
         idx.set_max_segments(8);
         let idx = Arc::new(idx);
-        println!("{secs} s boyunca TAM HIZ yazma; seal={seal}, tavan=8, örnekleme 5 s");
+        println!("FULL-SPEED writing for {secs} s; seal={seal}, ceiling=8, sampled every 5 s");
         println!();
-        println!("| t (s) | segment | mühürlenen | buffer | toplam kayıt | yazma op/s |");
+        println!("| t (s) | segments | sealing | buffer | total records | write op/s |");
         println!("|-------|---------|------------|--------|--------------|------------|");
 
         let stop = AtomicBool::new(false);
         let written = AtomicUsize::new(0);
         let mut samples: Vec<usize> = Vec::new();
-        // #59: birincil kriter KUYRUK, segment ayrı kalem olarak izlenir.
+        // #59: the primary criterion is the QUEUE; segments are tracked as a
+        // separate item.
         let mut queue_samples: Vec<usize> = Vec::new();
         let mut seg_samples: Vec<usize> = Vec::new();
         std::thread::scope(|sc| {
@@ -1008,9 +1020,9 @@ fn main() {
                 let (segs, buf) = idx.shape();
                 let sealing = idx.sealing_count();
                 let total = written.load(Ordering::Relaxed);
-                samples.push(segs + sealing); // ön-kayıt #49'un (kusurlu) metriği
+                samples.push(segs + sealing); // pre-registration #49's (flawed) metric
                 queue_samples.push(sealing); // #59 birincil
-                seg_samples.push(segs); // #59 ikincil (merge tavanının testi)
+                seg_samples.push(segs); // #59 secondary (a test of the merge ceiling)
                 println!(
                     "| {} | {segs} | {sealing} | {buf} | {} | {:.0} |",
                     t * 5,
@@ -1035,18 +1047,18 @@ fn main() {
             0.0
         };
         println!();
-        println!("| kriter | değer | eşik | sonuç |");
+        println!("| criterion | value | threshold | result |");
         println!("|--------|-------|------|-------|");
         println!(
             "| ilk 1/3 ort. → son 1/3 ort. | {first_avg:.1} → {last_avg:.1} ({growth:+.0}%) | ≤ +%20 | {} |",
-            if growth <= 20.0 { "OK" } else { "AŞILDI" }
+            if growth <= 20.0 { "OK" } else { "EXCEEDED" }
         );
         println!(
-            "| zirve (segment+mühürlenen) | {peak} | ≤ 12 (tavan+4) | {} |",
-            if peak <= 12 { "OK" } else { "AŞILDI" }
+            "| peak (segments+sealing) | {peak} | ≤ 12 (ceiling+4) | {} |",
+            if peak <= 12 { "OK" } else { "EXCEEDED" }
         );
         let verdict = growth <= 20.0 && peak <= 12;
-        // #59 BİRİNCİL: kuyruk sabit bir üst sınırda dengeleniyor mu?
+        // #59 PRIMARY: does the queue settle at a fixed upper bound?
         let q_first = avg(&queue_samples[..third]);
         let q_last = avg(&queue_samples[queue_samples.len() - third..]);
         let q_peak = *queue_samples.iter().max().unwrap_or(&0);
@@ -1057,46 +1069,47 @@ fn main() {
         };
         let seg_peak = *seg_samples.iter().max().unwrap_or(&0);
         println!();
-        println!("| #59 kalem | değer | eşik | sonuç |");
+        println!("| #59 item | value | threshold | result |");
         println!("|-----------|-------|------|-------|");
         println!(
-            "| BİRİNCİL kuyruk: ilk 1/3 → son 1/3 | {q_first:.1} → {q_last:.1} ({q_growth:+.0}%) | dengelenir (monoton büyümez) | {} |",
-            if q_growth <= 20.0 { "OK" } else { "AŞILDI" }
+            "| PRIMARY queue: first 1/3 → last 1/3 | {q_first:.1} → {q_last:.1} ({q_growth:+.0}%) | settles (no monotone growth) | {} |",
+            if q_growth <= 20.0 { "OK" } else { "EXCEEDED" }
         );
-        println!("| BİRİNCİL kuyruk zirvesi | {q_peak} | sabit üst sınır | — |");
+        println!("| PRIMARY queue peak | {q_peak} | a fixed upper bound | — |");
         println!(
-            "| İKİNCİL segment (merge tavanının testi) | zirve {seg_peak} | ≤ 12 | {} |",
-            if seg_peak <= 12 { "OK" } else { "AŞILDI" }
+            "| SECONDARY segments (a test of the merge ceiling) | peak {seg_peak} | ≤ 12 | {} |",
+            if seg_peak <= 12 { "OK" } else { "EXCEEDED" }
         );
         println!();
         println!(
-            "#59 BİRİNCİL KRİTER: {}",
+            "#59 PRIMARY CRITERION: {}",
             if q_growth <= 20.0 {
-                "KUYRUK DENGELENİYOR → 9a-2 bu kalemden geçti"
+                "THE QUEUE SETTLES → 9a-2 passes on this item"
             } else {
-                "KUYRUK BÜYÜYOR → karşılanmadı"
+                "THE QUEUE GROWS → not met"
             }
         );
         println!();
         println!(
-            "(referans) ön-kayıt #49'un kusurlu metriği: {}",
+            "(reference) pre-registration #49's flawed metric: {}",
             if verdict {
-                "DENGELENIYOR → 9a-2 backpressure'sız kabul edilebilir"
+                "SETTLES → 9a-2 could be accepted without backpressure"
             } else {
-                "BİRİKİYOR → backpressure 9a-2'nin parçası (ön-kayıt #49)"
+                "ACCUMULATES → backpressure is part of 9a-2 (pre-registration #49)"
             }
         );
-        // NOT: kasten `wait_for_background()` YOK. Biriken kuyruğu boşaltmak
-        // ölçümün kendisinden kat kat uzun sürer (ilk denemede süreç yarım
-        // saatlik kuyrukla asıldı) — ve zaten sorulan soru "birikiyor mu",
-        // cevabı kuyruğun büyüklüğü.
+        // NOTE: `wait_for_background()` is deliberately ABSENT. Draining an
+        // accumulated queue takes many times longer than the measurement itself
+        // (on the first attempt the process hung with half an hour of queue) —
+        // and the question asked is "does it accumulate", whose answer is the size
+        // of the queue.
         let (stalls, stall_us) = idx.stall_stats();
         println!(
             "backpressure (#53): {stalls} insert bekletildi, toplam {:.1} s",
             stall_us as f64 / 1e6
         );
         println!(
-            "ölçüm sonu: {} segment + {} mühürlenen (kuyruk boşaltılmadı)",
+            "end of measurement: {} segments + {} sealing (queue not drained)",
             idx.shape().0,
             idx.sealing_count()
         );
@@ -1104,19 +1117,20 @@ fn main() {
     }
 
     if mode == "mergewindow" {
-        // 9a-1 ölçümü: merge arka plana alındıktan sonra yazıcının bloke
-        // olduğu pencere ne kadar? Ön-kayıtlı eşik (DECISIONS #40): merge
-        // penceresine denk gelen yazmaların p99'u, taban p99'un 50 katını
-        // aşmamalı. ÖLÇÜM KOŞULU Aşama 8 ile aynı tutulur (WAL group:20,
-        // döngü içinde commit YOK) — fsync'li ölçüm eşiği 9a ne kadar iyi
-        // olursa olsun otomatik aşardı.
+        // The 9a-1 measurement: after moving merging to the background, how long
+        // is the window in which the writer is blocked? The pre-registered
+        // threshold (DECISIONS #40): the p99 of writes coinciding with the merge
+        // window must not exceed 50x the baseline p99. THE MEASUREMENT CONDITION
+        // is kept identical to phase 8 (WAL group:20, NO commit inside the loop) —
+        // an fsync-inclusive measurement would blow the threshold no matter how
+        // good 9a was.
         use vector_gvector::index::segmented::SegmentedIndex;
         use vector_gvector::meta::Metadata;
         use vector_gvector::storage::wal::SyncPolicy;
 
         let dir = std::path::PathBuf::from("data/fullscale");
         if !dir.join("MANIFEST").exists() {
-            eprintln!("data/fullscale yok — önce `report -- fullscale 1000000 99` koş");
+            eprintln!("data/fullscale is missing — run `report -- fullscale 1000000 99` first");
             return;
         }
         let idx = SegmentedIndex::open_durable(
@@ -1125,35 +1139,35 @@ fn main() {
             metric,
             HnswParams::default(),
             125_000,
-            // Ön-kayıtlı koşul: group:20 (Aşama 8 ile aynı). GVDB_DIAG_NOWAL=1
-            // yalnız TEŞHİS içindir: 6-10 ms'lik sıçramaların kaynağı fsync mi,
-            // yoksa yazma yolunun kendisi mi? Kabul kararı DAİMA ön-kayıtlı
-            // koşulun sonucuna göre verilir.
+            // The pre-registered condition: group:20 (same as phase 8).
+            // GVDB_DIAG_NOWAL=1 is for DIAGNOSIS only: is the source of the
+            // 6-10 ms spikes fsync, or the write path itself? The acceptance
+            // decision is ALWAYS made from the pre-registered condition.
             if std::env::var("GVDB_DIAG_NOWAL").is_ok() {
                 SyncPolicy::None
             } else {
                 SyncPolicy::Group { window_ms: 20 }
             },
         )
-        .expect("aç");
+        .expect("open");
         if std::env::var("GVDB_DIAG_NOWAL").is_ok() {
-            println!("** TEŞHİS KOŞUSU: WAL sync kapalı — ön-kayıtlı koşul DEĞİL **");
+            println!("** DIAGNOSTIC RUN: WAL sync off — NOT the pre-registered condition **");
         }
         let (seg0, buf0) = idx.shape();
         println!(
-            "başlangıç: {seg0} segment + {buf0} buffer, {} kayıt, tavan 8",
+            "start: {seg0} segments + {buf0} buffer, {} records, ceiling 8",
             idx.len_shared()
         );
 
-        // Warmup: birkaç bin yazma (taban p99'un ısınmış ölçülmesi için).
+        // Warmup: a few thousand writes (so the baseline p99 is measured warm).
         //
-        // Id tabanı: `data/fullscale` KALICI bir dizin, her koşu ona yazıyor.
-        // Taban kayıt sayısından türetilirse (önceki hali) koşular birikince
-        // aralıklar üst üste biner ve ölçüm DuplicateId ile patlar — nitekim
-        // patladı. Saat tabanlı taban her koşuya çakışmayan bir bölge verir.
-        // Determinizm zedelenmiyor: id'ler yalnız etiket, ölçülen büyüklükler
-        // (latency, pencere) id değerine bağlı değil; vektör verisi ve seed
-        // sabit kalıyor.
+        // Id base: `data/fullscale` is a PERSISTENT directory that every run
+        // writes into. If the base were derived from the record count (as it once
+        // was), the ranges would overlap as runs accumulated and the measurement
+        // would blow up with DuplicateId — which it duly did. A clock-based base
+        // gives each run a non-colliding region. Determinism is not harmed: ids
+        // are mere labels, the measured quantities (latency, windows) do not
+        // depend on their values, and the vector data and seed stay fixed.
         let base_id = 1_000_000_000u64
             + std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1168,14 +1182,15 @@ fn main() {
             .expect("warmup insert");
         }
 
-        // Ölçüm: mühürleme eşiğini aşacak kadar yazma → seal + (arka plan) merge.
+        // Measurement: write enough to cross the sealing threshold → seal +
+        // (background) merge.
         let extra = idx.seal_threshold() + 5_000;
-        println!("{extra} yazma ölçülüyor (pencere öncesi+sonrası örnekleme dahil)...");
+        println!("measuring {extra} writes (including samples before and after the window)...");
         let mut lats: Vec<std::time::Duration> = Vec::with_capacity(extra);
-        // #61: backpressure kaynaklı beklemeler AYRI kalem. Her yazmadan
-        // önce/sonra stall sayacı okunur (iki relaxed atomik yükleme, ns
-        // mertebesinde) — böylece "kusur" ile "kasıtlı kısıtlama" aynı
-        // sayıda toplanmaz (#60'ın kaydettiği metrik kusuru).
+        // #61: backpressure-induced waits are a SEPARATE item. The stall counter
+        // is read before and after every write (two relaxed atomic loads, on the
+        // order of nanoseconds) so that "a defect" and "a deliberate restriction"
+        // are not summed into one number (the metric flaw recorded in #60).
         let mut stalled: Vec<bool> = Vec::with_capacity(extra);
         let t_all = Instant::now();
         for i in 0..extra {
@@ -1189,11 +1204,11 @@ fn main() {
             stalled.push(c1 > c0);
         }
         let wall = t_all.elapsed();
-        // 6 ms'lik sıçramanın KAYNAĞINI bulmak için: en yavaş 5 yazmanın
-        // sıra numarası, mühürlemenin düştüğü sıra numarasıyla karşılaştırılır.
-        // (Eşik değişmiyor; bu yalnız teşhis.) Mühürleme buffer eşiğine
-        // varınca olur, yani sıra numarası önceden hesaplanabilir.
-        // #61 BİRİNCİL: backpressure DIŞINDAKİ en uzun yazma.
+        // To find the SOURCE of the 6 ms spike: the index of the 5 slowest writes
+        // is compared with the index at which sealing occurs. (The threshold does
+        // not change; this is diagnosis only.) Sealing happens when the buffer
+        // reaches its threshold, so that index can be computed in advance.
+        // #61 PRIMARY: the longest write EXCLUDING backpressure.
         let clean: Vec<std::time::Duration> = lats
             .iter()
             .zip(stalled.iter())
@@ -1214,24 +1229,24 @@ fn main() {
             .copied()
             .unwrap_or_default();
         println!();
-        println!("| #61 kalem | değer |");
+        println!("| #61 item | value |");
         println!("|-----------|-------|");
-        println!("| BİRİNCİL: backpressure dışındaki en uzun yazma | {max_clean:?} |");
-        println!("| backpressure dışı p99 | {p99_clean:?} |");
+        println!("| PRIMARY: longest write excluding backpressure | {max_clean:?} |");
+        println!("| p99 excluding backpressure | {p99_clean:?} |");
         println!(
-            "| BİRİNCİL oran (en uzun / p99) | {:.0}x |",
+            "| PRIMARY ratio (longest / p99) | {:.0}x |",
             max_clean.as_secs_f64() / p99_clean.as_secs_f64().max(1e-12)
         );
         println!(
-            "| İKİNCİL (eşik YOK): bekletilen yazma sayısı | {} |",
+            "| SECONDARY (NO threshold): number of stalled writes | {} |",
             bp.len()
         );
         println!(
-            "| İKİNCİL: en uzun bekleme | {:?} |",
+            "| SECONDARY: longest stall | {:?} |",
             bp.iter().max().copied().unwrap_or_default()
         );
         println!(
-            "| İKİNCİL: toplam bekleme | {:?} |",
+            "| SECONDARY: total stall | {:?} |",
             bp.iter().sum::<std::time::Duration>()
         );
 
@@ -1240,7 +1255,7 @@ fn main() {
         slowest.sort_by_key(|b| std::cmp::Reverse(b.1));
         let seal_at = idx.seal_threshold().saturating_sub(buf0);
         println!();
-        println!("teşhis: mühürleme ~{seal_at}. yazmada; en yavaş 5 yazma:");
+        println!("diagnosis: sealing at write ~{seal_at}; the 5 slowest writes:");
         for (i, d) in slowest.iter().take(5) {
             println!("  #{i} → {d:?}");
         }
@@ -1250,64 +1265,64 @@ fn main() {
         sorted.sort();
         let pct = |p: f64| sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)];
         let max_lat = *sorted.last().unwrap();
-        // Taban: en uzun 3 çağrı (seal/merge tetikleyenler) hariç p99
+        // Baseline: p99 excluding the 3 longest calls (those triggering
+        // seal/merge)
         let cut = sorted.len().saturating_sub(3);
         let base_p99 = sorted[(cut as f64 * 0.99) as usize];
         let ratio = max_lat.as_secs_f64() / base_p99.as_secs_f64().max(1e-9);
 
         println!();
-        println!("| ölçüm | değer |");
+        println!("| measurement | value |");
         println!("|-------|-------|");
-        println!("| toplam süre (yazıcı thread) | {wall:.2?} |");
+        println!("| total time (writer thread) | {wall:.2?} |");
         println!("| taban p50 | {:?} |", pct(0.5));
-        println!("| taban p99 (seal/merge çağrıları hariç) | {base_p99:?} |");
+        println!("| baseline p99 (excluding seal/merge calls) | {base_p99:?} |");
         println!("| **en uzun tek yazma** | **{max_lat:.3?}** |");
         println!(
-            "| son mühürleme (yazıcıyı bloke eden) | {:?} |",
+            "| last sealing (the part blocking the writer) | {:?} |",
             std::time::Duration::from_micros(idx.last_seal_us())
         );
         println!(
-            "| ön-kayıtlı eşik 50x | **{}** |",
-            if ratio <= 50.0 {
-                "GEÇTİ"
-            } else {
-                "GEÇMEDİ"
-            }
+            "| pre-registered 50x threshold | **{}** |",
+            if ratio <= 50.0 { "MET" } else { "NOT MET" }
         );
-        // Merge istatistikleri ANCAK worker bitince anlamlı: ölçüm anında
-        // merge hâlâ arka planda koşuyor olabilir (ilk koşuda 0 görünmüştü).
+        // The merge statistics are only meaningful once the worker has finished:
+        // at measurement time a merge may still be running in the background (it
+        // showed up as 0 on the first run).
         let merge_running_at_end = idx.merge_in_flight();
         idx.wait_for_merge();
         println!(
-            "| son merge (ARKA PLAN, yazıcıyı bloke ETMEZ) | {:?} |",
+            "| last merge (BACKGROUND, does NOT block the writer) | {:?} |",
             std::time::Duration::from_micros(idx.last_merge_us())
         );
-        println!("| merge sayısı | {} |", idx.merge_count());
+        println!("| merge count | {} |", idx.merge_count());
         println!(
-            "| ölçüm biterken merge çalışıyor muydu | {} |",
+            "| was a merge running as the measurement ended | {} |",
             if merge_running_at_end {
-                "EVET (örtüşme doğrulandı)"
+                "YES (overlap confirmed)"
             } else {
-                "hayır"
+                "no"
             }
         );
         let (seg1, buf1) = idx.shape();
         println!();
         println!(
-            "merge bitince: {seg1} segment + {buf1} buffer, {} kayıt",
+            "after the merge: {seg1} segments + {buf1} buffer, {} records",
             idx.len_shared()
         );
         return;
     }
 
     if mode == "int8scale" {
-        // Aşama 8a: int8 çoklu-okuyucu ölçeklenmesi. Hipotez (düzeltilmiş):
-        // int8 çalışma kümesini ~2x küçültür (graf quantize EDİLMEZ), 3-4x
-        // değil. Kabul eşiği ön-kayıtlı: 8 thread / 1 thread ≥ 2.0 → GO.
+        // Phase 8a: int8 multi-reader scaling. Hypothesis (corrected): int8
+        // shrinks the working set by ~2x (the graph is NOT quantized), not 3-4x.
+        // The pre-registered acceptance threshold: 8 threads / 1 thread ≥ 2.0 →
+        // GO.
         //
-        // Adil karşılaştırma: f32 tarafı 8 segmentli ölçüldü, int8 tarafı da
-        // AYNI segment sayısında ölçülür (tek-graf int8 karşılaştırması
-        // segcurve'deki 1→8 segment farkını int8'in hanesine yazardı).
+        // A fair comparison: the f32 side was measured with 8 segments, so the
+        // int8 side is measured at the SAME segment count (comparing against a
+        // single-graph int8
+        // would credit int8 with the 1→8 segment difference from segcurve).
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
         use vector_gvector::index::quant::QuantizedHnsw;
         use vector_gvector::index::segmented::SegmentedIndex;
@@ -1315,11 +1330,11 @@ fn main() {
 
         let dir = std::path::PathBuf::from("data/fullscale");
         if !dir.join("MANIFEST").exists() {
-            eprintln!("data/fullscale yok — önce `report -- fullscale 1000000 99` koş");
+            eprintln!("data/fullscale is missing — run `report -- fullscale 1000000 99` first");
             return;
         }
         println!(
-            "makine: {} mantıksal çekirdek",
+            "machine: {} logical cores",
             std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(0)
@@ -1332,16 +1347,16 @@ fn main() {
             HnswParams::default(),
             125_000,
         )
-        .expect("aç");
+        .expect("open");
         let (n_seg, n_buf) = idx.shape();
         println!(
-            "f32 indeks: {n_seg} segment + {n_buf} buffer, {} kayıt ({:.1?})",
+            "f32 index: {n_seg} segments + {n_buf} buffer, {} records ({:.1?})",
             idx.len_shared(),
             t.elapsed()
         );
         let f32_mem = idx.memory_bytes();
 
-        // Ground truth: tam set ise resmi, değilse exact.
+        // Ground truth: the official one for the full set, otherwise exact.
         let truth: Vec<Vec<VectorId>> = if base.len() == 1_000_000 {
             read_ivecs(std::path::Path::new("data/sift/sift_groundtruth.ivecs"))
                 .expect("gt")
@@ -1353,14 +1368,15 @@ fn main() {
             ground_truth(&base, &queries, k, metric)
         };
 
-        // Çoklu-okuyucu ölçüm çekirdeği.
+        // The multi-reader measurement core.
         //
-        // METODOLOJİ NOTU: bu ölçümün ilk sürümü TEKRARLANABİLİR DEĞİLDİ —
-        // aynı kod, aynı veri, iki koşu: f32 ölçeklenmesi 5.08x ve 1.14x.
-        // Neden: aynı süreçte ikinci bir büyük indeks açmak (bellek baskısı +
-        // cache kirliliği). Aşama 8'in "1M'de okuma ölçeklenmiyor" bulgusu da
-        // 5 dakikadır çalışan, RSS'i 3.1 GB'a çıkmış bir süreçte ölçülmüştü.
-        // Düzeltme: warmup + üç tekrarın MEDYANI.
+        // METHODOLOGY NOTE: the first version of this measurement was NOT
+        // REPRODUCIBLE — same code, same data, two runs: f32 scaling of 5.08x and
+        // 1.14x. The cause: opening a second large index in the same process
+        // (memory pressure + cache pollution). Phase 8's finding that "reads do
+        // not scale at 1M" had likewise been measured in a process that had run
+        // for five minutes with RSS at 3.1 GB. The fix: warmup plus the MEDIAN of
+        // three repeats.
         let bench =
             |threads: usize, search: &(dyn Fn(&[f32]) -> Vec<SearchResult> + Sync)| -> f64 {
                 let run = |secs: u64| -> f64 {
@@ -1383,10 +1399,10 @@ fn main() {
                     });
                     count.load(Ordering::Relaxed) as f64 / secs as f64
                 };
-                run(1); // warmup: cache ısınsın, ölçüme girmesin
+                run(1); // warmup: let the cache warm, excluded from the measurement
                 let mut s = [run(3), run(3), run(3)];
                 s.sort_by(f64::total_cmp);
-                s[1] // medyan — tek koşunun gürültüsüne karşı
+                s[1] // the median — against the noise of a single run
             };
 
         let merge_hits = |mut all: Vec<SearchResult>, k: usize| -> Vec<SearchResult> {
@@ -1398,10 +1414,10 @@ fn main() {
         };
 
         println!();
-        println!("| indeks | ef | 1 thread | 2 | 4 | 8 | ölçeklenme (8/1) | recall@10 |");
+        println!("| index | ef | 1 thread | 2 | 4 | 8 | scaling (8/1) | recall@10 |");
         println!("|--------|----|----------|---|---|---|------------------|-----------|");
 
-        // --- f32 ölçümü (int8'e çevirmeden önce) ---
+        // --- the f32 measurement (before converting to int8) ---
         let mut f32_rows = Vec::new();
         for ef in [50usize, 100] {
             let search = |q: &[f32]| idx.search_shared_with_ef(q, k, ef);
@@ -1425,7 +1441,7 @@ fn main() {
             f32_rows.push((ef, qps, recall));
         }
 
-        // --- int8'e çevir, f32'yi BIRAK (cache'i kirletmesin) ---
+        // --- convert to int8 and DROP the f32 (so it does not pollute the cache) ---
         let t = Instant::now();
         let quantized: Vec<QuantizedHnsw> = idx.quantize_segments();
         let qt = t.elapsed();
@@ -1439,7 +1455,7 @@ fn main() {
         drop(idx);
         println!();
         println!(
-            "quantize: {qt:.1?} — çalışma kümesi f32 {:.0} MB → int8 {:.0} MB ({:.2}x)",
+            "quantize: {qt:.1?} — working set f32 {:.0} MB → int8 {:.0} MB ({:.2}x)",
             f32_mem as f64 / 1048576.0,
             int8_mem as f64 / 1048576.0,
             f32_mem as f64 / int8_mem.max(1) as f64
@@ -1479,8 +1495,8 @@ fn main() {
         for ((ef, fq, fr), (_, iq, ir)) in f32_rows.iter().zip(&int8_rows) {
             let scale = iq[3] / iq[0].max(1.0);
             println!(
-                "ef={ef}: int8 ölçeklenme {scale:.2}x (eşik ≥2.0 → {}), \
-                 8-thread QPS {:.0} → {:.0} ({:.2}x), recall {fr:.4} → {ir:.4} (kayıp {:.4})",
+                "ef={ef}: int8 scaling {scale:.2}x (threshold ≥2.0 → {}), \
+                 8-thread QPS {:.0} → {:.0} ({:.2}x), recall {fr:.4} → {ir:.4} (loss {:.4})",
                 if scale >= 2.0 { "GO" } else { "NO-GO" },
                 fq[3],
                 iq[3],
@@ -1492,9 +1508,9 @@ fn main() {
     }
 
     if mode == "coldprofile" {
-        // 9b kararı için: soğuk başlangıcın bileşenleri. mmap yalnız
-        // "dosya okuma + vektör kopyalama" kısmını kaldırabilir; graf parse'ı
-        // ve metadata yeniden kurma kalır. Kazancın ÜST SINIRI budur.
+        // For the 9b decision: the components of cold start. mmap can only remove
+        // the "file read + vector copy" part; graph parsing and metadata rebuild
+        // remain. This is the UPPER BOUND on the gain.
         use vector_gvector::storage::{read_verified, Manifest};
         let dir = std::path::PathBuf::from("data/fullscale");
         let manifest = Manifest::read(&dir)
@@ -1516,7 +1532,7 @@ fn main() {
         }
         let t_read = t.elapsed();
         println!(
-            "(a) segment dosyaları okuma + CRC doğrulama: {t_read:.2?} ({:.0} MB)",
+            "(a) reading segment files + CRC verification: {t_read:.2?} ({:.0} MB)",
             total as f64 / 1048576.0
         );
 
@@ -1527,17 +1543,17 @@ fn main() {
             n_rec += h.len();
         }
         let t_parse = t.elapsed();
-        println!("(b) segment parse (graf + vektör kopyası): {t_parse:.2?} ({n_rec} kayıt)");
+        println!("(b) segment parse (graph + vector copy): {t_parse:.2?} ({n_rec} records)");
         drop(blobs);
 
         let t = Instant::now();
-        let mfile = manifest.metadata_file.clone().expect("metadata dosyası");
+        let mfile = manifest.metadata_file.clone().expect("metadata file");
         let mbytes = read_verified(&dir, &mfile, manifest.metadata_crc).expect("meta oku");
         let entries =
             vector_gvector::storage::decode_metadata(&mbytes, &dir.join(&mfile)).expect("decode");
         let t_meta_read = t.elapsed();
         println!(
-            "(c) metadata okuma + decode: {t_meta_read:.2?} ({} kayıt, {:.0} MB)",
+            "(c) metadata read + decode: {t_meta_read:.2?} ({} records, {:.0} MB)",
             entries.len(),
             mbytes.len() as f64 / 1048576.0
         );
@@ -1550,21 +1566,21 @@ fn main() {
             HnswParams::default(),
             125_000,
         )
-        .expect("aç");
+        .expect("open");
         let t_total = t.elapsed();
-        println!("(d) tam açılış (a+b+c+türetilmiş indeksler): {t_total:.2?}");
+        println!("(d) full open (a+b+c+derived indexes): {t_total:.2?}");
         let derived = t_total.saturating_sub(t_read + t_parse + t_meta_read);
-        println!("    → türetilmiş indeksleri kurma ≈ {derived:.2?}");
+        println!("    → building the derived indexes ≈ {derived:.2?}");
         println!();
         println!(
-            "mmap'in kaldırabileceği ÜST SINIR ≈ (a) + (b)'nin vektör payı = {:.2?} + kısmi",
+            "the UPPER BOUND mmap could remove ≈ (a) + the vector share of (b) = {:.2?} + partial",
             t_read
         );
         println!(
-            "9b eşiği: kazanç ≥ %40 VE ≥ 2 s. Toplam {t_total:.2?} → %40 = {:.2?}",
+            "the 9b threshold: gain ≥ 40% AND ≥ 2 s. Total {t_total:.2?} → 40% = {:.2?}",
             t_total.mul_f64(0.4)
         );
-        println!("    (doğrulama: {} kayıt açıldı)", full.len_shared());
+        println!("    (verification: {} records opened)", full.len_shared());
         return;
     }
 
@@ -1574,21 +1590,24 @@ fn main() {
     }
 
     if mode == "wal" {
-        // Aşama 7c ölçümü: fsync politikası × yazma throughput'u + replay.
+        // The phase 7c measurement: fsync policy × write throughput + replay.
         use vector_gvector::index::segmented::SegmentedIndex;
         use vector_gvector::meta::{MetaValue, Metadata};
         use vector_gvector::storage::wal::SyncPolicy;
 
         let n = base.len().min(20_000);
-        // Sunucunun yazıcı task'i komutları batch'ler ve batch sonunda TEK
-        // commit yapar; ölçüm bunu birebir modellemeli, yoksa group commit
-        // pratikte per_op'a dönüşür ve tablo politikaların farkını göstermez.
+        // The server's writer task batches commands and performs a SINGLE commit
+        // at the end of a batch; the measurement must model that exactly, or group
+        // commit effectively degenerates into per_op and the table shows no
+        // difference between the policies.
         const BATCH: usize = 64;
         println!(
-            "WAL ölçümü: {n} insert, batch={BATCH} (sunucu yazıcı task'i gibi), mühürleme kapalı"
+            "WAL measurement: {n} inserts, batch={BATCH} (like the server writer task), sealing off"
         );
         println!();
-        println!("| politika | süre | throughput | fsync/op | WAL boyutu | replay süresi | replay kayıt |");
+        println!(
+            "| policy | time | throughput | fsync/op | WAL size | replay time | replayed records |"
+        );
         println!("|----------|------|------------|----------|------------|---------------|--------------|");
         for policy in [
             SyncPolicy::None,
@@ -1603,7 +1622,7 @@ fn main() {
                 dim,
                 metric,
                 HnswParams::default(),
-                usize::MAX, // mühürleme yok: HNSW inşası ölçümü kirletmesin
+                usize::MAX, // no sealing: keep HNSW construction out of the measurement
                 policy,
             )
             .expect("open");
@@ -1612,7 +1631,7 @@ fn main() {
                 let meta: Metadata = [("v".to_string(), MetaValue::Int(i as i64))].into();
                 idx.insert_with_meta(VectorId(i as u64), v, meta)
                     .expect("insert");
-                // Batch sonu commit: yanıtlar ancak bundan sonra gönderilir.
+                // End-of-batch commit: responses are only sent after this.
                 if (i + 1) % BATCH == 0 {
                     idx.commit_wal().expect("commit");
                 }
@@ -1649,8 +1668,8 @@ fn main() {
             );
         }
 
-        // Büyük WAL replay'i: tam taban, fsync'siz yazım (replay süresi
-        // politikadan bağımsız — okuma yolu aynı).
+        // A large WAL replay: the full base, written without fsync (replay time
+        // is independent of the policy — the read path is the same).
         if base.len() > n {
             let dir = std::path::PathBuf::from("data/wal-bigreplay");
             let _ = std::fs::remove_dir_all(&dir);
@@ -1683,7 +1702,7 @@ fn main() {
             .expect("reopen");
             println!();
             println!(
-                "dolu WAL replay: {} kayıt / {wal_mb:.1} MB → {:?} ({:.0} kayıt/s)",
+                "full WAL replay: {} records / {wal_mb:.1} MB → {:?} ({:.0} records/s)",
                 re.replay_report().applied,
                 t.elapsed(),
                 base.len() as f64 / t.elapsed().as_secs_f64()
@@ -1693,7 +1712,7 @@ fn main() {
     }
 
     if mode == "durability" {
-        // Aşama 7a ölçümü: checkpoint + soğuk başlangıç maliyeti.
+        // The phase 7a measurement: checkpoint + cold-start cost.
         use vector_gvector::index::segmented::SegmentedIndex;
         use vector_gvector::meta::{MetaValue, Metadata};
         let dir = std::path::PathBuf::from("data/durability");
@@ -1717,7 +1736,7 @@ fn main() {
             idx.insert_with_meta(VectorId(i as u64), v, meta)
                 .expect("insert");
         }
-        println!("inşa (3 metadata alanı ile): {:?}", t.elapsed());
+        println!("build (with 3 metadata fields): {:?}", t.elapsed());
 
         let t = Instant::now();
         let g1 = idx.checkpoint().expect("checkpoint");
@@ -1727,12 +1746,12 @@ fn main() {
             .filter_map(|e| e.ok()?.metadata().ok().map(|m| m.len()))
             .sum();
         println!(
-            "ilk checkpoint (gen={g1}): {ck1:?}, disk {:.1} MB ({:.0} B/vektör)",
+            "first checkpoint (gen={g1}): {ck1:?}, disk {:.1} MB ({:.0} B/vector)",
             disk as f64 / 1048576.0,
             disk as f64 / base.len() as f64
         );
 
-        // İkinci checkpoint: hiç yeni segment yok → yalnız metadata+manifest
+        // Second checkpoint: no new segments at all → metadata+manifest only
         let t = Instant::now();
         let g2 = idx.checkpoint().expect("checkpoint2");
         println!(
@@ -1748,26 +1767,27 @@ fn main() {
                 .expect("reopen");
         let cold = t.elapsed();
         println!(
-            "soğuk başlangıç: {cold:?} ({n_seg} segment, {} kayıt, türetilmiş indeksler yeniden kuruldu)",
+            "cold start: {cold:?} ({n_seg} segments, {} records, derived indexes rebuilt)",
             reopened.len_shared()
         );
-        // Doğruluk: yeniden açılan indeks aynı sonuçları veriyor mu?
+        // Correctness: does the reopened index give the same results?
         let truth = ground_truth(&base, &queries, k, metric);
         let results: Vec<Vec<VectorId>> = queries
             .iter()
             .map(|q| reopened.search_shared(q, k).iter().map(|r| r.id).collect())
             .collect();
         println!(
-            "yeniden açılış sonrası recall@{k} = {:.4}",
+            "recall@{k} after reopening = {:.4}",
             recall_at_k(&results, &truth, k)
         );
         return;
     }
 
     if mode == "rangefilter" {
-        // Range histogramı ölçümü (DECISIONS #31 kabul kriterleri):
-        // düzgün + çarpık (log-normal) dağılım, tahmin aralığı vs gerçek,
-        // korelasyonlu Eq+Range hücresi, kol-örtüşme oranı, bakım maliyeti.
+        // The Range histogram measurement (acceptance criteria of DECISIONS #31):
+        // uniform + skewed (log-normal) distributions, estimated interval vs
+        // truth, a correlated Eq+Range cell, the arm agreement rate, and the
+        // maintenance cost.
         use rand::rngs::StdRng;
         use rand::{Rng, SeedableRng};
         use std::collections::HashSet;
@@ -1787,7 +1807,8 @@ fn main() {
             })
             .collect();
 
-        // Bakım maliyeti: metadata'sız vs iki sayısal alanlı inşa.
+        // Maintenance cost: a build without metadata vs one with two numeric
+        // fields.
         let t = Instant::now();
         let plain = SegmentedIndex::new(dim, metric, HnswParams::default(), n / 4);
         for (i, v) in base.iter().enumerate() {
@@ -1812,7 +1833,7 @@ fn main() {
         }
         let t_meta = t.elapsed();
         println!(
-            "bakım maliyeti: metadata'sız inşa {t_plain:.1?}, 3 alanlı (2 sayısal) {t_meta:.1?} (+{:.0}%)",
+            "maintenance cost: build without metadata {t_plain:.1?}, with 3 fields (2 numeric) {t_meta:.1?} (+{:.0}%)",
             (t_meta.as_secs_f64() / t_plain.as_secs_f64() - 1.0) * 100.0
         );
 
@@ -1824,7 +1845,7 @@ fn main() {
         println!("scan_limit = {scan_limit}");
         println!();
         println!(
-            "| alan | s | gerçek | tahmin [alt,üst] | üst/gerçek | kol (oracle) | recall | p50 |"
+            "| field | s | truth | estimate [lower,upper] | upper/truth | arm (oracle) | recall | p50 |"
         );
         println!(
             "|------|---|--------|------------------|-----------|--------------|--------|-----|"
@@ -1837,11 +1858,11 @@ fn main() {
 
         for s in [0.001f64, 0.01, 0.05, 0.1, 0.3, 0.5] {
             let m = ((s * n as f64) as usize).max(1);
-            // (etiket, filtre, gerçek eşleşen id kümesi, tahmin sorgusu)
+            // (label, filter, the true matching id set, the estimation query)
             type RangeCase<'a> = (&'a str, Filter, HashSet<u64>, (&'a str, f64, f64));
             let cases: Vec<RangeCase> = vec![
                 (
-                    "v(düzgün)",
+                    "v(uniform)",
                     Filter {
                         must: vec![Predicate::Range {
                             key: "v".into(),
@@ -1853,7 +1874,7 @@ fn main() {
                     ("v", 0.0, (m - 1) as f64),
                 ),
                 (
-                    "lv(çarpık)",
+                    "lv(skewed)",
                     {
                         let cutoff = sorted_lv[m - 1];
                         Filter {
@@ -1909,8 +1930,9 @@ fn main() {
             }
         }
 
-        // Korelasyonlu hücre: Eq(par=0) [i < n/2] ∧ Range v∈[0.4n, 0.6n) —
-        // gerçek kesişim 0.1n; bağımsızlık/min-üst tahmini ~0.2n → oran ~2.
+        // The correlated cell: Eq(par=0) [i < n/2] ∧ Range v∈[0.4n, 0.6n) — the
+        // true intersection is 0.1n, while the independence/min-upper estimate is
+        // ~0.2n → a ratio of ~2.
         let f_corr = Filter {
             must: vec![
                 Predicate::Eq {
@@ -1951,7 +1973,7 @@ fn main() {
             std::hint::black_box(idx.search_filtered(q, k, &f_corr));
         });
         println!(
-            "| Eq∧Range (korelasyonlu) | 0.1 | {} | range:[{el},{eu}] min-üst:{} | {:.2} | {arm} ({oracle}) | {:.3} | {:?} |",
+            "| Eq∧Range (correlated) | 0.1 | {} | range:[{el},{eu}] min-upper:{} | {:.2} | {arm} ({oracle}) | {:.3} | {:?} |",
             truth_corr.len(),
             eu.min(n / 2),
             eu.min(n / 2) as f64 / truth_corr.len().max(1) as f64,
@@ -1960,17 +1982,17 @@ fn main() {
         );
         println!();
         println!(
-            "kol örtüşmesi: {agree}/{rows} ({:.0}%)",
+            "arm agreement: {agree}/{rows} ({:.0}%)",
             agree as f64 / rows as f64 * 100.0
         );
         return;
     }
 
     if mode == "mergecost" {
-        // Tavan bekçisinin maliyeti: aynı veri, tavanlı vs tavansız.
+        // The cost of the ceiling guard: same data, with and without a ceiling.
         use vector_gvector::index::segmented::SegmentedIndex;
-        let seal = base.len() / 10; // tavansızda 10 segment üretir
-        for (label, ceiling) in [("tavansız", 100usize), ("tavan=8", 8)] {
+        let seal = base.len() / 10; // produces 10 segments without a ceiling
+        for (label, ceiling) in [("no ceiling", 100usize), ("ceiling=8", 8)] {
             let mut idx = SegmentedIndex::new(dim, metric, HnswParams::default(), seal);
             idx.set_max_segments(ceiling);
             let t = Instant::now();
@@ -1983,28 +2005,30 @@ fn main() {
                 std::hint::black_box(idx.search_shared(q, k));
             });
             println!(
-                "{label}: inşa {build:.1?}, {n_seg} segment (+{n_buf} buffer), \
+                "{label}: build {build:.1?}, {n_seg} segments (+{n_buf} buffer), \
                  arama p50 {:?}, bellek {:.0} MB",
                 stats.p50,
                 idx.memory_bytes() as f64 / 1048576.0
             );
         }
-        // Bellek tepe noktası (analitik): merge sırasında iki kaynak + birleşik
-        // aynı anda yaşar. En kötü durum iki eşit segment: tepe ≈ kalıcı + 2×seg.
+        // Peak memory (analytical): during a merge the two sources and the merged
+        // segment coexist. Worst case with two equal segments: peak ≈ steady +
+        // 2×seg.
         let seg_bytes = (seal * (dim * 4 + 404)) as f64 / 1048576.0;
         println!(
-            "merge tepe belleği ≈ kalıcı + 2×{seg_bytes:.0} MB (iki kaynak, \
-             takas anına dek yaşar; birleşik zaten kalıcının parçası)"
+            "peak merge memory ≈ steady + 2×{seg_bytes:.0} MB (the two sources \
+             live until the swap; the merged one is already part of steady state)"
         );
         return;
     }
 
     if mode == "segcurve" {
-        // Segment sayısı × latency/recall eğrisi (merge politikası girdisi).
-        // Aynı veri farklı seal eşikleriyle bölünür; arama filtresiz.
+        // The segment count × latency/recall curve (an input to the merge
+        // policy). The same data is split with different seal thresholds; searches
+        // are unfiltered.
         use vector_gvector::index::segmented::SegmentedIndex;
         let truth = ground_truth(&base, &queries, k, metric);
-        println!("| segment | p50 | p99 | recall@{k} | inşa |");
+        println!("| segments | p50 | p99 | recall@{k} | build |");
         println!("|---------|-----|-----|-----------|------|");
         for parts in [1usize, 2, 4, 5, 8, 10] {
             let seal = base.len().div_ceil(parts);
@@ -2032,12 +2056,13 @@ fn main() {
     }
 
     if mode == "delete" {
-        // Aşama 4 doğrulaması: %20 silme sonrası recall + compaction bellek etkisi.
+        // Phase 4 validation: recall after 20% deletion + the memory effect of
+        // compaction.
         let mut hnsw = HnswIndex::new(
             dim,
             metric,
             HnswParams {
-                tombstone_threshold: 2.0, // manuel compaction için otomatiği kapat
+                tombstone_threshold: 2.0, // disable the automatic one to compact manually
                 ..Default::default()
             },
         );
@@ -2058,7 +2083,7 @@ fn main() {
             recall_at_k(&results, &truth, k)
         };
         println!(
-            "silme öncesi recall@{k} (ef=50) = {:.4}",
+            "recall@{k} before deletion (ef=50) = {:.4}",
             recall_of(&hnsw, &bf)
         );
         for i in (0..base.len()).step_by(5) {
@@ -2066,7 +2091,7 @@ fn main() {
             bf.delete(VectorId(i as u64)).expect("bf delete");
         }
         println!(
-            "%20 silme sonrası recall@{k} = {:.4} (tombstone oranı {:.2})",
+            "recall@{k} after 20% deletion = {:.4} (tombstone ratio {:.2})",
             recall_of(&hnsw, &bf),
             hnsw.tombstone_ratio()
         );
@@ -2081,25 +2106,22 @@ fn main() {
             l0 as f64 / 1048576.0,
             hnsw.memory_bytes().1 as f64 / 1048576.0
         );
-        println!(
-            "compaction sonrası recall@{k} = {:.4}",
-            recall_of(&hnsw, &bf)
-        );
+        println!("recall@{k} after compaction = {:.4}", recall_of(&hnsw, &bf));
         return;
     }
 
     if mode == "sift1m" {
         // Tam 1M stres testi: resmi ground truth (sift_groundtruth.ivecs)
-        // burada GEÇERLİ — alt kümelerdeki gibi kendimiz üretmiyoruz.
+        // is VALID here — unlike with subsets, we do not generate it ourselves.
         use vector_gvector::index::quant::QuantizedHnsw;
         let gt = read_ivecs(std::path::Path::new("data/sift/sift_groundtruth.ivecs"))
-            .expect("ground truth okunamadı");
+            .expect("could not read the ground truth");
         let truth: Vec<Vec<VectorId>> = gt
             .iter()
             .take(queries.len())
             .map(|row| row.iter().take(k).map(|&i| VectorId(i as u64)).collect())
             .collect();
-        assert_eq!(truth.len(), queries.len(), "GT/query sayısı uyuşmalı");
+        assert_eq!(truth.len(), queries.len(), "GT/query counts must match");
 
         let t = Instant::now();
         let mut hnsw = HnswIndex::new(dim, metric, HnswParams::default());
@@ -2109,10 +2131,10 @@ fn main() {
                 println!("  insert {} / {} ({:?})", i + 1, base.len(), t.elapsed());
             }
         }
-        println!("inşa: {:?} ({} vektör)", t.elapsed(), hnsw.len());
+        println!("build: {:?} ({} vectors)", t.elapsed(), hnsw.len());
         let (vmem, lmem) = hnsw.memory_bytes();
         println!(
-            "bellek: vektör {:.0} MB + graf {:.0} MB (graf {:.0} B/vektör)",
+            "memory: vectors {:.0} MB + graph {:.0} MB (graph {:.0} B/vector)",
             vmem as f64 / 1048576.0,
             lmem as f64 / 1048576.0,
             lmem as f64 / base.len() as f64
@@ -2133,7 +2155,7 @@ fn main() {
         }
         let t = Instant::now();
         let quant = QuantizedHnsw::from_hnsw(&hnsw);
-        drop(hnsw); // f32 kopyasını bırak: bellekte yalnız kodlar + graf kalır
+        drop(hnsw); // drop the f32 copy: only the codes + graph stay in memory
         println!("quantize: {:?}", t.elapsed());
         let (cmem, qlmem) = quant.memory_bytes();
         println!(
@@ -2178,7 +2200,7 @@ fn main() {
         let (code_mem, qlink_mem) = quant.memory_bytes();
 
         println!();
-        println!("| indeks | ef | recall@{k} | p50 | p99 | vektör MB | toplam MB |");
+        println!("| index | ef | recall@{k} | p50 | p99 | vectors MB | total MB |");
         println!("|--------|----|-----------|-----|-----|-----------|-----------|");
         for ef in [25, 50, 100] {
             for use_quant in [false, true] {
@@ -2231,9 +2253,12 @@ fn main() {
             idx.insert_shared(VectorId(i as u64), v).expect("insert");
         }
         let (n_seg, n_buf) = idx.shape();
-        println!("inşa: {:?} ({n_seg} segment + {n_buf} buffer)", t.elapsed());
+        println!(
+            "build: {:?} ({n_seg} segments + {n_buf} buffer)",
+            t.elapsed()
+        );
 
-        // recall kontrolü (segment birleştirme doğruluğu)
+        // recall check (correctness of segment merging)
         let truth = ground_truth(&base, &queries, k, metric);
         let results: Vec<Vec<VectorId>> = queries
             .iter()
@@ -2241,7 +2266,7 @@ fn main() {
             .collect();
         println!("recall@{k} = {:.4}", recall_at_k(&results, &truth, k));
 
-        // throughput: her thread 3 sn boyunca arar, toplam sorgu sayılır
+        // throughput: each thread searches for 3 s and the total queries are counted
         let measure_qps = |threads: usize, with_writer: bool| -> f64 {
             let stop = AtomicBool::new(false);
             let total = AtomicUsize::new(0);
@@ -2266,7 +2291,7 @@ fn main() {
                     let stop = &stop;
                     let base = &base;
                     s.spawn(move || {
-                        // yazıcı: sil + geri ekle döngüsü (net boyut sabit kalır)
+                        // writer: a delete + re-insert loop (net size stays constant)
                         let mut i = 0u64;
                         while !stop.load(Ordering::Relaxed) {
                             let id = VectorId(i % 10_000);
@@ -2286,12 +2311,12 @@ fn main() {
 
         for threads in [1, 4, 8] {
             println!(
-                "okuma throughput ({threads} thread, yazıcı yok): {:.0} QPS",
+                "read throughput ({threads} threads, no writer): {:.0} QPS",
                 measure_qps(threads, false)
             );
         }
         println!(
-            "okuma throughput (4 thread + aktif yazıcı): {:.0} QPS",
+            "read throughput (4 threads + an active writer): {:.0} QPS",
             measure_qps(4, true)
         );
         let (n_seg, n_buf) = idx.shape();
@@ -2303,19 +2328,19 @@ fn main() {
     }
 
     if mode == "persist" {
-        // Kalıcılık doğrulaması: kaydet → yükle → sonuçlar birebir aynı mı?
+        // Persistence validation: save → load → are the results identical?
         let t = Instant::now();
         let mut hnsw = HnswIndex::new(dim, metric, HnswParams::default());
         for (i, v) in base.iter().enumerate() {
             hnsw.insert(VectorId(i as u64), v).expect("insert");
         }
-        println!("inşa: {:?}", t.elapsed());
+        println!("build: {:?}", t.elapsed());
         let path = std::path::Path::new("data/index.gvdb");
         let t = Instant::now();
         hnsw.save(path).expect("save");
         let size = std::fs::metadata(path).expect("stat").len();
         println!(
-            "save: {:?}, dosya {:.1} MB ({:.0} B/vektör)",
+            "save: {:?}, file {:.1} MB ({:.0} B/vector)",
             t.elapsed(),
             size as f64 / (1024.0 * 1024.0),
             size as f64 / base.len() as f64
@@ -2331,7 +2356,7 @@ fn main() {
             }
         }
         println!(
-            "yeniden yükleme sonrası {} sorguda sonuçlar birebir aynı: {identical}",
+            "results identical across {} queries after reloading: {identical}",
             queries.len()
         );
         assert!(identical);
@@ -2340,7 +2365,7 @@ fn main() {
 
     let t = Instant::now();
     let truth = ground_truth(&base, &queries, k, metric);
-    println!("ground truth üretimi (exact, rayon): {:?}", t.elapsed());
+    println!("ground truth generation (exact, rayon): {:?}", t.elapsed());
 
     let t = Instant::now();
     let mut index = BruteForceIndex::new(dim, metric);
@@ -2348,7 +2373,7 @@ fn main() {
         index.insert(VectorId(i as u64), v).expect("insert");
     }
     let build = t.elapsed();
-    println!("inşa süresi: {build:?} ({} vektör)", index.len());
+    println!("build time: {build:?} ({} vectors)", index.len());
 
     let results: Vec<Vec<VectorId>> = queries
         .iter()
@@ -2361,13 +2386,13 @@ fn main() {
         std::hint::black_box(index.search(q, k));
     });
     println!(
-        "search latency: p50={:?} p99={:?} mean={:?} ({} örnek)",
+        "search latency: p50={:?} p99={:?} mean={:?} ({} samples)",
         stats.p50, stats.p99, stats.mean, stats.samples
     );
 
     let mem = index.memory_bytes();
     println!(
-        "indeks belleği: {:.1} MB toplam, {:.1} byte/vektör (ham veri {} byte/vektör)",
+        "index memory: {:.1} MB total, {:.1} bytes/vector (raw data {} bytes/vector)",
         mem as f64 / (1024.0 * 1024.0),
         mem as f64 / index.len() as f64,
         dim * 4
