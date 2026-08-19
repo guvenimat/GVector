@@ -1,946 +1,1016 @@
-# Mimari Kararlar
+# Architectural Decisions
 
-## Aşama 9c — metadata bellek sıkıştırması (KARARLAR) — 2026-08-19
+## Phase 9c — metadata memory compaction (DECISIONS) — 2026-08-19
 
-### 64. Posting listeleri: `HashSet<VectorId>` → sıralı `Vec<VectorId>`
-Mühürlü segmentlerde küme değişmiyor; üyelik ikili aramayla O(log n) ve
-id başına tam 8 byte tutuluyor (`HashSet`'te 16 + doluluk payı + tablo
-başlığı). Kazanç beklenenden küçük çıktı (353 → 299 MB): baskın terim
-kümelerin İÇİ değil, **ayrı (alan, değer) anahtarı sayısı** — sayısal
-alanların her ayrık değeri bir posting girdisi üretiyor ve dış `HashMap`
-hakim. Doğru kalem doğru çözüldü, ama kalemin iç dağılımı tahminden
-farklıydı.
+### 64. Posting lists: `HashSet<VectorId>` → sorted `Vec<VectorId>`
+In sealed segments the set never changes; membership is O(log n) via binary
+search and exactly 8 bytes are held per id (16 plus load-factor slack plus a
+table header in a `HashSet`). The gain came out smaller than expected
+(353 → 299 MB): the dominant term is not the INSIDE of the sets but the
+**number of distinct (field, value) keys** — every distinct value of a numeric
+field produces a posting entry, so the outer `HashMap` dominates. The right
+item was fixed correctly, but the distribution *within* that item differed from
+the estimate.
 
-**Bilinen maliyet (ölçüldü):** sıralı `Vec`'e ekleme O(n) kaydırma yapar.
-id'ler artan sırada gelirse konum daima sondadır (O(1)); rastgele sırada
-**8.8x** yavaşlar (200K tek listede 144 ms → 1.27 s). O(n²) büyümesi bu
-boyutta ısırmıyor çünkü liste (1.6 MB) önbelleğe sığıyor; 1M'lik TEK
-liste ~30 s eder. Kabul edildi: o seçicilikte (tek değere milyonlarca
-kayıt) tarama kolu zaten devreye girmez.
+**Known cost (measured):** inserting into a sorted `Vec` costs an O(n) shift.
+If ids arrive in ascending order the position is always at the end (O(1)); in
+random order it is **8.8x** slower (144 ms → 1.27 s for a single 200K list).
+The O(n²) growth does not bite at this size because the list (1.6 MB) fits in
+cache; a SINGLE 1M-entry list would take ~30 s. Accepted: at that selectivity
+(millions of records under one value) the scan arm never engages anyway.
 
-### 65. id→metadata: şema tabanlı kompakt temsil (`MetaStore`)
-Kayıt başına `HashMap<String, MetaValue>` yerine: alan adları BİR KEZ
-sözlükte (u32 id), kayıt gövdesi `Box<[(u32, MetaValue)]>`. `Box<[T]>`
-seçildi çünkü kapasite payı yok ve başlığı `Vec`'ten 8 byte küçük. Alan
-sayısı kayıt başına bir avuç olduğu için arama DOĞRUSAL — o boyutta hash
-tablosu kurmak kazandırmaz, sorunun kendisi zaten oydu.
+### 65. id→metadata: a schema-based compact representation (`MetaStore`)
+Instead of a `HashMap<String, MetaValue>` per record: field names stored ONCE in
+a dictionary (u32 ids), with the record body as `Box<[(u32, MetaValue)]>`.
+`Box<[T]>` was chosen because it has no capacity slack and its header is 8 bytes
+smaller than `Vec`'s. Lookup is LINEAR because there is a handful of fields per
+record — building a hash table at that size does not pay off, and that was the
+problem in the first place.
 
-**421 → 158 MB (2.7x)**, 9c'nin asıl kazancı. Koşul mantığı tek yerde
-tutuldu (`Predicate::matches_with`, erişim yolundan bağımsız), yoksa iki
-depo iki ayrı filtre koduna dönüşürdü.
+**421 → 158 MB (2.7x)**, the real gain of 9c. The predicate logic was kept in
+one place (`Predicate::matches_with`, independent of the access path), otherwise
+two stores would have become two separate filter implementations.
 
-### 66. `metadata_memory_bytes()` SİSTEMATİK olarak eksik gösteriyor
-9c-0 doğrulamasında üç kalemin ÜÇÜNDE DE aynı yönde saptı (toplam 0.77x).
-Rastgele hata olsaydı yön karışık olurdu. Muhtemel sebep: allocator
-overhead'i ve `HashMap`'in boş bucket'ları sayılmıyor.
+### 66. `metadata_memory_bytes()` SYSTEMATICALLY under-reports
+In the 9c-0 validation it was off in the same direction for ALL THREE items
+(0.77x in total). With random error the directions would have been mixed. The
+likely cause: allocator overhead and the empty buckets of a `HashMap` are not
+counted.
 
-Düzeltmek kapsam dışı bırakıldı, ama kayda geçiyor: **aynı fonksiyon
-`/stats`'ta da kullanılıyor**, yani kullanıcıya sistematik olarak DÜŞÜK
-bellek rakamı gösteriliyor. Kullanan biri kapasite planlaması yaparsa
-gerçek kullanım gösterilenin ~1.3 katı olacak.
+Fixing it was left out of scope, but it goes on record: **the same function is
+also used by `/stats`**, so the user is systematically shown a LOW memory
+figure. Anyone doing capacity planning with it will find real usage is about
+1.3x what was displayed.
 
-### 67. Sayısal indeksler ERTELENDİ — gerekçe bellek payı değil, risk/kazanç
-197 MB (gerçek ölçüm), metadata toplamının ~%16'sı. Dokunulmadı.
+### 67. Numeric indexes DEFERRED — the reason is risk/reward, not memory share
+197 MB (measured), about 16% of the metadata total. Left untouched.
 
-Gerekçe **bellek payı değil**: o yapı (`BTreeMap` + histogram) filtre
-planlayıcısının **kesin-sayım kolunu** besliyor — projedeki en incelikli
-doğruluk mekanizmasının altında duruyor. Kapanışa giderken en riskli
-bileşene el atmak yanlış zamanlama.
+The reason is **not the memory share**: that structure (`BTreeMap` + histogram)
+feeds the **exact-counting arm** of the filter planner — it sits underneath the
+most delicate correctness mechanism in the project. Reaching for the riskiest
+component on the way to closing out is the wrong timing.
 
-**Yeniden bakma koşulu:** bellek gerçekten sınırlayıcı olursa VE aynı
-turda kesin-sayım kolunun regresyon testleri güçlendirilebilirse.
+**Revisit condition:** if memory genuinely becomes constraining AND the
+regression tests for the exact-counting arm can be strengthened in the same
+round.
 
-### 68. Kalan pay hâlâ eşiğin üstünde: bir sonraki adım yazıldı ve ERTELENDİ
-Gerçek pay %41.0 → **%33.3** (eşik %25). Kural gereği bir sonraki adım
-yazılıp erteleniyor:
+### 68. The remaining share is still above the threshold: the next step was written and DEFERRED
+The real share went from 41.0% to **33.3%** (threshold 25%). Per the rule, the
+next step is written down and deferred:
 
-**Sonraki adım — sayısal alanlar için Eq posting'i hiç tutmamak.** Kalan
-payın en büyük iki kalemi (posting'in dış `HashMap`'i ve sayısal
-indeksler) aynı kökten besleniyor: sayısal bir alanın her ayrık değeri
-HEM bir posting anahtarı HEM bir `BTreeMap` girdisi üretiyor. Range zaten
-sayısal indeksten karşılanıyor; sayısal Eq de oradan karşılanabilir. Bu
-bir optimizasyon değil, **tekrarın kaldırılması** olurdu.
+**Next step — stop keeping Eq postings for numeric fields.** The two largest
+remaining items (the posting lists' outer `HashMap` and the numeric indexes)
+share one root cause: every distinct value of a numeric field produces BOTH a
+posting key AND a `BTreeMap` entry. Range is already served from the numeric
+index; numeric Eq could be served from there too. This would be **the removal of
+a duplication**, not an optimization.
 
-### 69. `with_capacity` regresyonu: tembel tahsis kayboldu
-#61'in `with_capacity` işi, eşiğin `usize::MAX` verildiği yerlerde
-(ölçüm/test: "pratikte mühürleme yok") **kapasite taşmasıyla panik**
-üretti — önceden tahsis tembeldi. Ayırma bayt cinsinden sınırlandı
-(512 MB); sınırın üstünde `Vec` eski kademeli büyümeye döner. Regresyon
-testi eklendi (`huge_seal_threshold_does_not_panic`).
+### 69. A `with_capacity` regression: lazy allocation disappeared
+The `with_capacity` work from #61 caused a **panic with a capacity overflow**
+wherever the threshold is given as `usize::MAX` (measurement/test: "no sealing in
+practice") — allocation used to be lazy. The allocation is now bounded in bytes
+(512 MB); above that bound `Vec` falls back to its old incremental growth. A
+regression test was added (`huge_seal_threshold_does_not_panic`).
 
-Ders: bir performans düzeltmesi, düzeltilen yolun DIŞINDAKİ uç
-girdilerin davranışını değiştirebilir.
-
-
-## Aşama 9a-2 — kriterlerin değerlendirmesi (KARARLAR) — 2026-08-19
-
-Ölçüm sonuçları BENCHMARKS'ta ve AYRI bir commit'te (ef2ce04). Bu bölüm
-o sonuçlardan çıkarılan kararlardır.
-
-### 60. Kriter 1 (#40) KARŞILANMADI — ve eşiğin altındaki dünya değişti
-Sonuç "geçmedi" olarak DURUR (609x / 943x, eşik 50x). Eşik yeniden
-yorumlanmadı. Yanına kusur kaydı eklenir:
-
-**#40, backpressure'ın var olmadığı bir sistemde tanımlandı.** O tarihte
-uzun bir yazma DAİMA bir kusurun belirtisiydi — yazıcı hiçbir zaman
-kasten beklemiyordu. #53 ile backpressure eklendiği anda bu ontoloji
-değişti: artık uzun yazma, sistemin DOĞRU çalıştığının kanıtı olabilir
-(kuyruğu sınırlamanın tek yolu yazıcıyı bekletmektir). Nitekim WAL
-kapalı teşhis koşusunda en uzun yazma 24.9 s çıktı ve bunun tamamı
-tasarlanmış backpressure'dı.
-
-Yani "en uzun yazma" metriği artık İKİ FARKLI OLGUYU (kusur ve kasıtlı
-kısıtlama) aynı sayıda topluyor. Bu, #58'deki kriter-2 kusuruyla
-**yapısal olarak aynı hata sınıfı, tersten**: orada iki farklı BÜYÜKLÜĞÜ
-toplamıştık (kuyruk + segment), burada iki farklı NEDENİ.
-
-**Bu bir eşik hatası değil, eşiğin altındaki dünyanın değişmesidir.**
-
-**VE ŞU NET DURMALI: 9a-2 hedefini TUTTURDU.** Mühürlemenin yazıcıyı
-blokladığı süre 20.8 s → **0 ns – 2 µs**. Eşiğin geçilmemesi bununla
-ilgisiz; kalan 6–10 ms'lik sıçramalar mühürleme noktasıyla ilgisiz
-yerlerde ve kaynakları fsync + (hipotez) buffer realloc. Tabloya altı ay
-sonra bakan biri 9a-2'nin başarısız olduğunu SANMAMALI.
-
-### 61. YENİ ÖN-KAYIT — kriter 1'in ikinci sürümü (ölçüm KOŞULMADAN önce)
-- **Birincil:** **backpressure DIŞINDAKİ** en uzun yazma / taban p99.
-  Backpressure süresi tasarım parametresidir (kuyruk eşiği ve mühürleme
-  hızının fonksiyonu), kusur değil — ölçüde ayrıştırılır.
-- **İkincil (bu turda YALNIZ ÖLÇÜLÜR, EŞİK YOK):** backpressure kaynaklı
-  beklemelerin dağılımı — kaç yazma etkilendi, en uzun bekleme ne kadar.
-  Gerekçe: backpressure'ı ölçümden tamamen çıkarmak "sistem yazmaları
-  saatlerce bekletiyor ama kriter geçiyor" durumunu mümkün kılar. Eşik
-  koymak için yeterli veri yok; eşik BİR SONRAKİ tura bırakılıyor.
-- **Koşul:** ölçüm HER İKİ fsync politikasında koşulur (group:20 ve
-  kapalı), böylece fsync katkısı ile buffer realloc katkısı ayrışır.
-- **Önce yapılacak iş:** yazma buffer'ında `with_capacity` (realloc'u
-  kaldırır). Sonra ölçülür; realloc hipotezi kanıtlanır ya da çürür.
-
-### 62. Segment birikmesi AYRI KALEM — bu arc'ta değil
-Sayılar: mühürleme ~25 s'de bir segment ÜRETİYOR, merge ~54 s'de bir
-EKSİLTİYOR. Sürekli yüksek yükte birikme kaçınılmaz (10 dk'da 0 → 16).
-
-Bu 9a-2'nin sorunu değil, **merge tavanı mekanizmasının** sorunu; 9a-2'nin
-kabulüne bağlamak iki farklı işi birbirine kilitler. Ama kayıt güçlü
-olmalı: **bu şu an sistemin tek sınırsız büyüyen boyutudur** ve daha önce
-tam da bunu kapatmıştık (segment tavanı). Geri döndü, çünkü **mühürleme
-hızlandı, merge hızlanmadı** — 9a'nın kendi başarısının yan etkisi.
-
-Muhtemel çözümler (ikisi de ayrı tasarım işi): paralel merge, ya da
-merge'in iki yerine üç segmenti birden alması.
-
-**Yeniden bakma koşulu:** "sürekli yazma yükü öngörülen kullanımın parçası
-olursa". Hedeflenen senaryolarda (RAG, iç araç) sürekli 5K op/s yazma
-yok — gerçek ama şu an TEORİK bir sorun.
-
-### 63. Ön-kayıt disiplininin bilinen sınırı: kriterler birbiriyle çelişebilir
-Bu turun asıl dersi: **kriter 2'yi geçiren mekanizma, kriter 1'i
-geçilemez hale getirdi.** Kriterler birbirinden bağımsız yazılıyor ama
-sistem bir bütün. Kusuru kaydedip devam etmek doğru cevaptır, ancak
-bundan sonra eşik yazarken şu soru da sorulacak:
-
-> **"Bu kriter, başka hangi kriterle çelişebilir?"**
-
-Bu, ön-kayıt kuralının kalıcı bir maddesidir.
+The lesson: a performance fix can change the behaviour of extreme inputs
+OUTSIDE the path being fixed.
 
 
-## Aşama 9a-2 — kriter 2 ikinci ölçüm + yeni ön-kayıt — 2026-08-19
+## Phase 9a-2 — evaluating the criteria (DECISIONS) — 2026-08-19
 
-### 56. Backpressure sinyali yanlış seçildi: "yavaşlat" tasarlayıp "durdur" elde etmek
-İlk backpressure eşiği **mühürlenen + segment > 2×tavan** idi. Bu sinyal
-yanlıştır: bir mühürleme BİTTİĞİNDE toplam düşmez — eleman kuyruktan
-segmentlere taşınır, toplam sabit kalır. Toplamı ancak merge düşürür, o da
-yalnız segment sayısı tavanı aşınca çalışır. 1M ölçümünde sonuç: yazıcı
-120 saniyenin **110'unda 0 op/s**, iki insert 60 s'lik güvenlik sınırına
-dayandı. O sınır olmasa üretimde sonsuza kadar asılırdı.
+The measurement results are in BENCHMARKS and in a SEPARATE commit (ef2ce04).
+This section holds the decisions drawn from those results.
 
-**Genel kural (bu projeden çıkan ders):** bir kontrol döngüsünün sinyali,
-o döngünün ETKİLEYEBİLDİĞİ bir büyüklük olmalı. Toplam sayı yazıcının
-yavaşlamasıyla düşmüyordu — yani geri besleme yoktu, yalnızca bir duvar
-vardı. "Yavaşlat" tasarlayıp "durdur" elde etmek dağıtık sistemlerde
-klasik bir hata sınıfıdır.
+### 60. Criterion 1 (#40) NOT MET — and the world underneath the threshold changed
+The result STAYS "not met" (609x / 943x, threshold 50x). The threshold was not
+reinterpreted. A defect record is added beside it:
 
-**Düzeltme:** sinyal yalnız **kuyruk uzunluğu**, eşik 2 (biri inşa
-edilirken biri sırada). Segment sayısını merge tavanı zaten bağlıyor;
-sınırsız büyüyen boyut kuyruktu. Sonuç: kuyruk 3'te sabit, yazma hızı
-sıfıra çökmek yerine mühürleme hızında (~5K op/s) dengelendi.
+**#40 was defined in a system where backpressure DID NOT EXIST.** Back then a
+long write was ALWAYS the symptom of a defect — the writer never waited on
+purpose. The moment backpressure arrived with #53, that ontology changed: a long
+write can now be proof that the system is working CORRECTLY (the only way to
+bound the queue is to stall the writer). Indeed, in the WAL-off diagnostic run
+the longest write was 24.9 s, and all of it was designed backpressure.
 
-### 57. Kabul kriterleri ÖLÇEKTE ölçülür — bunu test değil ölçüm yakaladı
-#56'daki kusuru birim testleri yakalayamadı: küçük ölçekte merge hızlı
-dönüyor, toplam gerçekten düşüyor ve denge kuruluyor. 1M'de mühürleme
-~20 s sürünce denge bozuluyor. Testler yeşildi, sistem çalışmıyordu.
-Bu, "geliştirme 10K'da, kabul 100K/1M'de" kuralının en iyi örneğidir.
+So the "longest write" metric now sums TWO DIFFERENT PHENOMENA (a defect and a
+deliberate restriction) into one number. This is **structurally the same class
+of error as the criterion-2 flaw in #58, only inverted**: there we summed two
+different QUANTITIES (queue + segments), here two different CAUSES.
 
-### 58. Ön-kayıt #49'un metrik kusuru — SONUÇ YİNE "KARŞILANMADI"
-İkinci ölçümde (düzeltilmiş sinyal, 2 dk, 1M): kuyruk **3'te sabit**,
-zirve 9 ≤ 12 (**OK**), ama ilk 1/3 → son 1/3 ortalaması 3.8 → 7.9
-(**+%110**, eşik +%20) → **AŞILDI**. Sonuç #40'ta olduğu gibi
-"karşılanmadı" olarak DURUR; eşik yeniden yorumlanmadı.
+**This is not an error in the threshold; it is the world underneath the
+threshold changing.**
 
-**Kusur analizi (kullanıcı, eşiği yazan kişi):** `segment + mühürlenen`
-toplamı iki FARKLI REJİMDEKİ sayıyı topluyor — segment sayısı zaten merge
-tavanıyla bağlı, kuyruk ise (o tarihte) sınırsızdı. Ölçmek istenen şey
-"sınırsız büyüyen boyut var mı", ölçülen şey ise ikisinin toplamı oldu.
-Bu kayıt eşiği DEĞİŞTİRMEZ; eşiğin ölçmek istediği şeyle ölçtüğü şey
-arasındaki farkı belgeler.
+**AND THIS MUST STAND CLEARLY: 9a-2 HIT its target.** The time sealing blocks
+the writer went from 20.8 s to **0 ns – 2 µs**. The threshold not being met is
+unrelated to that; the remaining 6–10 ms spikes occur at points unrelated to
+sealing and come from fsync plus (hypothesis) buffer realloc. Someone reading
+the table six months from now must NOT conclude that 9a-2 failed.
 
-### 59. YENİ ÖN-KAYIT — 9a-2 kriter 2, ikinci sürüm (ölçüm KOŞULMADAN önce yazıldı)
-**Şeffaflık notu:** hem bu ön-kayıt hem de sürenin uzatılması kararı,
-2 dakikalık ölçümün sonucu GÖRÜLDÜKTEN SONRA alındı. Gerekçe: 2 dakikalık
-pencere segment sayısının merge tavanına ulaşmasına yetmediği için eğri
-yanlış okundu (büyüme, tavana yaklaşma olarak değil monoton artış olarak
-göründü). Okuyucu bu bilgiyle kendi indirimini yapsın.
+### 61. NEW PRE-REGISTRATION — the second version of criterion 1 (written BEFORE the measurement)
+- **Primary:** the longest write **EXCLUDING backpressure** / baseline p99.
+  Backpressure duration is a design parameter (a function of the queue threshold
+  and the sealing rate), not a defect — it is separated out in the measurement.
+- **Secondary (this round it is ONLY MEASURED, NO THRESHOLD):** the distribution
+  of backpressure-induced waits — how many writes were affected and how long the
+  longest wait was. Rationale: removing backpressure from the measurement
+  entirely would make "the system stalls writes for hours but the criterion
+  passes" possible. There is not enough data to set a threshold; the threshold is
+  left to the NEXT round.
+- **Condition:** the measurement is run under BOTH fsync policies (group:20 and
+  off), so the fsync contribution separates from the buffer-realloc contribution.
+- **Work to do first:** `with_capacity` on the write buffer (which removes the
+  realloc). Then measure; the realloc hypothesis is either proven or refuted.
 
-- **Birincil kriter (9a-2'nin kendisi):** 10 dakikalık sürekli tam hız
-  yazma altında **kuyruk uzunluğu** sabit bir üst sınırda dengelenir
-  (gözlenen sınır: 3). Monoton büyürse → karşılanmadı.
-- **İkincil kalem (9a-2'nin DEĞİL, merge tavanının testi):** segment
-  sayısı merge tavanı + tolerans (8+4=12) içinde kalır. Ayrı kalem olarak
-  kaydedilir; 9a-2'nin kabulünü belirlemez.
-- **Süre 10 dakika**, çünkü segment sayısının tavana varıp merge'in
-  devreye girmesi gerekiyor.
-- Kriter 1 (latency, #40) değişmedi ve ayrıca ölçülür. 9a-2 ancak
-  birincil kriter + kriter 1 birlikte geçerse kabul edilir.
+### 62. Segment accumulation is a SEPARATE ITEM — not in this arc
+The numbers: sealing PRODUCES a segment about every 25 s, merging REMOVES one
+about every 54 s. Under sustained heavy load, accumulation is inevitable (0 → 16
+over ten minutes).
 
+This is not 9a-2's problem but the **merge ceiling mechanism's** problem; tying
+it to 9a-2's acceptance would lock two separate pieces of work together. But the
+record must be strong: **this is currently the one dimension of the system that
+grows without bound**, and we had closed exactly this before (the segment
+ceiling). It came back because **sealing got faster and merging did not** — a
+side effect of 9a's own success.
 
-## Aşama 9a-2 — tek worker + backpressure — 2026-08-19
+Possible fixes (both separate design work): parallel merging, or having a merge
+take three segments instead of two.
 
-### 53. Mühürleme TEK worker + kuyruk; yazma yolunda backpressure
-#52'deki kusurun düzeltmesi. `seal()` artık thread doğurmuyor; `SealContext`
-(merge'deki `MergeContext` kalıbının ikizi: CAS bayrağı + kuyruk boşalana
-kadar dönen tek döngü + bayrağı bırakırken çift kontrol) `sealing` listesini
-FIFO tüketiyor. Eşzamanlı inşa toplam işi azaltmıyordu, yalnız hepsini
-yavaşlatıyordu; sıralı worker aynı işi yapar ama her mühürleme SIRAYLA biter,
-kuyruk tüketilir, bellek geri verilir.
+**Revisit condition:** "if sustained write load becomes part of the intended
+usage". In the target scenarios (RAG, internal tooling) there is no sustained
+5K op/s write stream — a real problem, but a THEORETICAL one for now.
 
-**Backpressure:** kuyruk + segment sayısı 2×tavanı aşınca yazma yolunda
-1 ms'lik uykularla bekleme (Lucene `IndexWriter` stall'ü). Yazma reddedilmez,
-yavaşlatılır; tek yazar sözleşmesi korunur; bekleme hiçbir kilit tutmadan
-yapılır, okuyucular etkilenmez. Üst sınır 60 s (worker beklenmedik şekilde
-ilerlemezse yazıcı sonsuza kadar beklemesin). Gözlem: `stall_stats()`.
+### 63. A known limit of pre-registration discipline: criteria can conflict
+The real lesson of this round: **the mechanism that made criterion 2 pass made
+criterion 1 impossible to pass.** Criteria are written independently, but the
+system is a single whole. Recording the defect and moving on is the right
+answer; from now on, though, writing a threshold also means asking:
 
-### 54. KİLİT SIRASI (global kural): segments → sealing → buffer
-Bu düzeltmeyi yazarken İKİ deadlock üretildi, ikisi de testte **asılma**
-olarak ortaya çıktı (panik değil, sessiz asılma):
+> **"Which other criterion could this one conflict with?"**
 
-1. `sealing.read().len() + segments.read().len()` — tek ifadedeki geçiciler
-   satır sonuna kadar yaşar, yani iki kilit İÇ İÇE alınır ve sıra worker'ın
-   tersidir. **Kural: iki kilidi asla tek ifadede alma**; ayrı satırlarda
-   ara değişkene al, guard'lar hemen düşsün.
-2. `while let Some(x) = sealing.read()...first().cloned()` — `while let`,
-   `loop { match EXPR {...} }` olarak desugar edilir ve match
-   scrutinee'sinin geçicileri **gövde dahil** yaşar; read kilidi tutulurken
-   `build_one` write kilidi ister. Düz `while COND` güvenlidir (koşulun
-   geçicileri koşul biterken düşer) — merge worker'ı bu yüzden sağlamdı.
-   Rust 2024 bunu `if let` için düzeltti, `while let` hâlâ eski davranışta.
-   **Kural: kilit alan scrutinee'yi kendi satırında al, `let ... else` ile
-   ayır.**
-
-Dördüncü bir kilit eklendiğinde aynı hatayı tekrarlamamak için sıra burada
-sabitleniyor: **segments → sealing → buffer**. Birden fazlası gerekiyorsa
-bu sırayla alınır; mümkünse hiç iç içe alınmaz.
-
-### 55. CI'ya timeout eklendi
-Deadlock'un belirtisi asılmadır; timeout'suz CI varsayılan 6 saat bekler ve
-neden belirsiz kalır. Job 15 dk, test adımı 10 dk. Eşzamanlılık kodu ekleyen
-bir projede ucuz sigorta (kullanıcı önerisi).
+This is a permanent clause of the pre-registration rule.
 
 
-## Aşama 9a-2 — KABUL EDİLMEDİ (kriter 2) — 2026-08-19
+## Phase 9a-2 — the second criterion-2 measurement + a new pre-registration — 2026-08-19
 
-### 51. Mühürleme arka plana alındı ama 9a-2 henüz KABUL EDİLMEDİ
-Kod ve testler tamam (aşağıda), ancak **ön-kayıt #49'un ikinci kriteri
-aşıldı**: 60 s tam hız yazmada mühürleme kuyruğu 0 → **35**'e çıktı
-(+%90 büyüme, eşik +%20; zirve 35, eşik 12). Ön-kayıt gereği
-**backpressure 9a-2'nin parçasıdır** ve o yapılmadan 9a-2 kabul edilmez.
-Eşik yeniden yorumlanmadı; sonuç "karşılanmadı" olarak kaydedildi.
+### 56. The backpressure signal was chosen wrongly: designing "slow down" and getting "stop"
+The first backpressure threshold was **sealing + segments > 2×ceiling**. That
+signal is wrong: the sum does not drop when a sealing FINISHES — the element
+moves from the queue into the segments and the sum stays constant. Only a merge
+lowers it, and a merge runs only once the segment count exceeds the ceiling. The
+result in the 1M measurement: the writer was at **0 op/s for 110 of 120
+seconds**, and two inserts hit the 60 s safety limit. Without that limit it would
+have hung forever in production.
 
-**Yapılanlar (duruyor, doğru çalışıyor):**
-- `seal()` yazıcı task'inde yalnız buffer takası yapıyor (µs); HNSW inşası
-  arka planda. Yazıcının bloke olduğu pencere pratikte ortadan kalktı.
-- "İki buffer" durumu üç yolda da doğru ele alınıyor (DECISIONS #50):
-  arama (`search_shared_with_ef`, filtreli aramanın her iki kolu,
-  `scan_candidates`), duplicate-id (`validate_insert` → `sealing_contains_live`)
-  ve delete (buffer → sealing → segments; mühürlenende tombstone + inşa
-  bitiminde diff-replay).
-- `checkpoint()` artık `wait_for_background()` çağırıyor: beklemeseydi
-  `sealing` listesindeki veri hiçbir segmentte olmaz, manifest görmez ve
-  WAL rotasyonu onu sahipsiz bırakırdı — sessiz veri kaybı.
-- Testler 9a-1 kalıbında, pencerenin gerçekten oluştuğunu doğruluyor
+**The general rule (the lesson from this project):** the signal of a control
+loop must be a quantity that the loop CAN INFLUENCE. The sum did not fall as the
+writer slowed down — there was no feedback, only a wall. Designing "slow down"
+and getting "stop" is a classic class of error in distributed systems.
+
+**The fix:** the signal is the **queue length alone**, threshold 2 (one being
+built while one waits). The merge ceiling already bounds the segment count; the
+dimension growing without bound was the queue. The result: the queue held steady
+at 3 and the write rate settled at the sealing rate (~5K op/s) instead of
+collapsing to zero.
+
+### 57. Acceptance criteria are measured AT SCALE — and measurement, not tests, caught this
+Unit tests could not catch the flaw in #56: at small scale merging turns over
+quickly, the sum really does fall, and equilibrium is reached. At 1M, where
+sealing takes ~20 s, that equilibrium breaks. The tests were green; the system
+was not working. This is the best example of the rule "develop at 10K, accept at
+100K/1M".
+
+### 58. The metric flaw in pre-registration #49 — the RESULT IS AGAIN "NOT MET"
+In the second measurement (corrected signal, 2 min, 1M): the queue held steady
+**at 3**, the peak was 9 ≤ 12 (**OK**), but the first-third → last-third average
+went 3.8 → 7.9 (**+110%**, threshold +20%) → **EXCEEDED**. As with #40, the
+result STAYS "not met"; the threshold was not reinterpreted.
+
+**Defect analysis (by the user, who wrote the threshold):** the sum
+`segments + sealing` adds two numbers from DIFFERENT REGIMES — the segment count
+is already bounded by the merge ceiling, whereas the queue was (at that time)
+unbounded. What was meant to be measured was "is there a dimension growing
+without bound"; what was measured was the sum of the two. This record does NOT
+CHANGE the threshold; it documents the gap between what the threshold meant to
+measure and what it measured.
+
+### 59. NEW PRE-REGISTRATION — 9a-2 criterion 2, second version (written BEFORE the measurement was run)
+**Transparency note:** both this pre-registration and the decision to extend the
+duration were taken AFTER seeing the result of the 2-minute measurement. The
+reason: a 2-minute window was not enough for the segment count to reach the merge
+ceiling, so the curve was misread (growth appeared as monotone increase rather
+than as approaching a ceiling). Let the reader apply their own discount.
+
+- **Primary criterion (9a-2 itself):** under 10 minutes of sustained full-speed
+  writing, the **queue length** settles at a fixed upper bound (observed bound:
+  3). If it grows monotonically → not met.
+- **Secondary item (a test of the merge ceiling, NOT of 9a-2):** the segment
+  count stays within the merge ceiling + tolerance (8+4=12). Recorded as a
+  separate item; it does not determine 9a-2's acceptance.
+- **Duration 10 minutes**, because the segment count needs to reach the ceiling
+  and trigger merging.
+- Criterion 1 (latency, #40) is unchanged and is measured separately. 9a-2 is
+  accepted only if the primary criterion and criterion 1 both pass.
+
+
+## Phase 9a-2 — single worker + backpressure — 2026-08-19
+
+### 53. Sealing on a SINGLE worker + queue; backpressure on the write path
+The fix for the flaw in #52. `seal()` no longer spawns threads; `SealContext`
+(the twin of the `MergeContext` pattern used for merging: a CAS flag, a single
+loop that runs until the queue drains, and a double check when releasing the
+flag) consumes the `sealing` list FIFO. Concurrent construction did not reduce
+the total work, it only slowed all of it down; a sequential worker does the same
+work but each sealing finishes IN TURN, so the queue is drained and memory is
+returned.
+
+**Backpressure:** once the queue plus segment count exceeds 2×ceiling, the write
+path waits in 1 ms sleeps (Lucene's `IndexWriter` stall). Writes are not
+rejected, they are slowed; the single-writer contract is preserved; the wait
+holds no lock, so readers are unaffected. Upper limit 60 s (so the writer does
+not wait forever if the worker unexpectedly fails to progress). Observability:
+`stall_stats()`.
+
+### 54. LOCK ORDER (a global rule): segments → sealing → buffer
+Writing this fix produced TWO deadlocks, both of which surfaced in the tests as a
+**hang** (not a panic — a silent hang):
+
+1. `sealing.read().len() + segments.read().len()` — temporaries in a single
+   expression live until the end of the statement, so the two locks are taken
+   NESTED, in the reverse order from the worker's. **Rule: never take two locks
+   in one expression**; assign them on separate lines so each guard drops
+   immediately.
+2. `while let Some(x) = sealing.read()...first().cloned()` — `while let`
+   desugars to `loop { match EXPR {...} }`, and the temporaries of the match
+   scrutinee live **including through the body**; so the read lock is held while
+   `build_one` asks for the write lock. A plain `while COND` is safe (the
+   condition's temporaries drop as soon as it is evaluated) — which is why the
+   merge worker was sound. Rust 2024 fixed this for `if let`, but `while let`
+   still has the old behaviour. **Rule: take a lock-acquiring scrutinee on its
+   own line, separated with `let ... else`.**
+
+So that the same mistake is not repeated when a fourth lock appears, the order is
+fixed here: **segments → sealing → buffer**. If more than one is needed they are
+taken in that order; where possible they are not nested at all.
+
+### 55. A timeout was added to CI
+The symptom of a deadlock is a hang; without a timeout, CI waits the default six
+hours and the cause stays unclear. 15 min for the job, 10 min for the test step.
+Cheap insurance in a project that is adding concurrency code (user suggestion).
+
+
+## Phase 9a-2 — NOT ACCEPTED (criterion 2) — 2026-08-19
+
+### 51. Sealing was moved to the background, but 9a-2 is NOT ACCEPTED yet
+The code and tests are complete (below), but **the second criterion of
+pre-registration #49 was exceeded**: under 60 s of full-speed writing the sealing
+queue went from 0 to **35** (+90% growth against a +20% threshold; peak 35
+against a threshold of 12). Per the pre-registration, **backpressure is part of
+9a-2**, and 9a-2 is not accepted until it is done. The threshold was not
+reinterpreted; the result was recorded as "not met".
+
+**What was done (it stands, and works correctly):**
+- `seal()` only swaps the buffer on the writer task (µs); the HNSW build runs in
+  the background. The window in which the writer is blocked has practically
+  vanished.
+- The "two buffers" state is handled correctly on all three paths (DECISIONS
+  #50): search (`search_shared_with_ef`, both arms of the filtered search,
+  `scan_candidates`), duplicate-id (`validate_insert` →
+  `sealing_contains_live`) and delete (buffer → sealing → segments; a tombstone
+  in the one being sealed plus diff-replay when the build finishes).
+- `checkpoint()` now calls `wait_for_background()`: without waiting, the data in
+  the `sealing` list would be in no segment, the manifest would not see it, and
+  the WAL rotation would orphan it — silent data loss.
+- The tests follow the 9a-1 pattern and assert that the window actually occurred
   (`seal_in_flight() > 0`, `saw_sealing > 0`).
 
-### 52. Ölçümün ortaya çıkardığı TASARIM KUSURU: sınırsız mühürleme thread'i
-Birikme ölçümünde segment sayısı 60 s boyunca **0'da kaldı**: 35 mühürleme
-aynı anda koşup 8 çekirdeği paylaştığı için hiçbiri bitemedi. Sebep,
-`seal()`'ın her çağrıda `thread::spawn` yapması. Bu, backpressure'dan
-bağımsız bir kusur ve önce düzeltilmeli.
+### 52. The DESIGN FLAW the measurement exposed: unbounded sealing threads
+In the accumulation measurement the segment count **stayed at 0** for the full
+60 s: 35 sealings ran at once and, sharing 8 cores, none could finish. The cause
+is that `seal()` calls `thread::spawn` on every invocation. This is a flaw
+independent of backpressure and must be fixed first.
 
-**Sıradaki işin tasarımı (yeni oturumda):**
-1. **Tek mühürleme worker'ı + kuyruk** (merge'deki `MergeContext` kalıbı):
-   sınırsız thread yerine bir worker, sıradaki buffer'ları sırayla mühürler.
-2. **Backpressure:** kuyruk uzunluğu bir eşiği aşınca yazma yolunda kısa
-   bekleme (Lucene `IndexWriter` stall'ü gibi) — yazmayı reddetmek değil,
-   yavaşlatmak. Tek yazar sözleşmesi korunur.
-3. Ardından ön-kayıt #49'un İKİ kriteri de yeniden ölçülür (latency +
-   birikme); 9a-2 ancak o zaman kabul edilir.
-
-
-## Aşama 9a-2 ÖN-KAYIT — 2026-08-19 (uygulama ve ölçüm YAPILMADAN önce)
-
-### 49. 9a-2'nin İKİ kabul kriteri var: latency VE birikme
-9a-2 mühürlemeyi de arka plana alıyor. Bu, latency eşiğini geçirirken
-sistemin **başka bir boyutunu sınırsız hale getirme riski** taşıyor:
-yazıcı artık hiçbir uzun işi beklemeyecek, yani yazmaları sınırsız hızda
-kabul edecek; arka plandaki inşa işleri ise sabit hızda ilerleyecek.
-
-Birikme matematiği (mevcut ölçümlerden): yazıcı ~100K op/s ile 125K'lık
-buffer'ı **~1.3 s**'de doldurur; mühürleme **~25 s** sürer. Bu oran
-korunursa mühürleme kuyruğu monoton büyür → segment sayısı artar, arama
-yavaşlar, bellek şişer. Bu, #30'da kapatılan "sınırsız büyüyen tek boyut"
-probleminin farklı bir kapıdan geri dönüşüdür.
-
-**Kriter 1 — latency (ön-kayıtlı #40, değişmez):** mühürleme/merge
-penceresine denk gelen yazmaların p99'u, taban p99'un **50 katını
-aşmamalı**. Ölçüm koşulu Aşama 8 ve 9a-1 ile aynı (WAL group:20, döngü
-içinde commit yok; izole süreç, warmup, iki koşu).
-
-**Kriter 2 — birikme (YENİ, bu ön-kayıtla sabitleniyor):** yazıcı TAM
-HIZDA, kesintisiz **en az 2 dakika** yazarken segment sayısı 5 saniyede
-bir örneklenir. Sonuç:
-- **DENGELENİYOR** (son üçte birin ortalaması, ilk üçte birin
-  ortalamasını en fazla %20 aşıyor) **VE** hiçbir örnekte tavan+4'ü
-  (tavan 8 → **12**) aşmıyor → 9a-2 backpressure'sız KABUL EDİLİR.
-- **MONOTON BÜYÜYOR** ya da tavan+4 aşılıyor → **backpressure 9a-2'nin
-  parçasıdır ve AYNI arc'ta yapılır**; onsuz 9a-2 kabul edilmez.
-  (Bu artık "yeniden bakma koşulu" değil, kabul kriteri.)
-- Birikme sırasında zirve RSS de raporlanır.
-
-Backpressure yapılırsa biçimi: segment sayısı 2×tavanı aşınca yazma
-yolunda kısa bir bekleme (Lucene'in `IndexWriter` stall'ü gibi) —
-yazmayı reddetmek değil, yavaşlatmak. Tek yazar sözleşmesi korunur.
-
-### 50. 9a-2'nin yapısal riski: "iki buffer" durumu
-Mühürleme arka plana geçince mühürlenmekte olan buffer ile yeni yazma
-buffer'ı bir süre birlikte yaşar. Bu ÜÇ kaynağı da etkiler:
-- **Arama:** segments + mühürlenen buffer + yeni buffer gezilmeli.
-- **Delete:** kayıt hangi kaynaktaysa oraya (mühürlenende tombstone).
-- **Duplicate-id (en sinsisi):** mühürlenmekte olan buffer'daki bir id
-  yeni buffer'a ikinci kez eklenirse ve kontrol yalnız yeni buffer'a
-  bakıyorsa, çakışma ancak mühürleme bittikten SONRA ortaya çıkar —
-  o noktada iki kopya da kalıcıdır.
-
-Testler 9a-1'in kalıbıyla yazılır: yarışın gerçekten oluştuğu
-(**"iki buffer durumu gözlendi"**) test içinde doğrulanır, aksi halde
-test sessizce zayıflar.
+**Design of the next piece of work (in a new session):**
+1. **A single sealing worker + queue** (the `MergeContext` pattern used for
+   merging): one worker instead of unbounded threads, sealing the queued buffers
+   in order.
+2. **Backpressure:** once the queue length crosses a threshold, a short wait on
+   the write path (like Lucene's `IndexWriter` stall) — slowing writes down, not
+   rejecting them. The single-writer contract is preserved.
+3. Then BOTH criteria of pre-registration #49 are measured again (latency +
+   accumulation); only then is 9a-2 accepted.
 
 
-## Aşama 9a-1 — merge arka planda — 2026-08-19
+## Phase 9a-2 PRE-REGISTRATION — 2026-08-19 (before implementation and measurement)
 
-### 46. Merge yazıcı task'inden ayrıldı; kalan pencere tamamen mühürleme
-Uygulama: `segments` alanı `Arc<RwLock<...>>` oldu (auto-deref sayesinde
-mevcut çağrılar değişmedi), merge `merge_smallest_pair_bg` serbest
-fonksiyonuna taşındı ve `spawn_merge_if_needed` ile arka plan thread'inde
-koşuyor. "Aynı anda en fazla bir merge" bir CAS bayrağıyla; tavan yeniden
-aşılırsa worker döngüsü devam ediyor (yeni thread doğmuyor, tetikler
-doğal olarak sıraya giriyor).
+### 49. 9a-2 has TWO acceptance criteria: latency AND accumulation
+9a-2 moves sealing into the background too. While that helps with the latency
+threshold, it carries the risk of **making another dimension of the system
+unbounded**: the writer will no longer wait for any long operation, i.e. it will
+accept writes at an unbounded rate, while the background build work proceeds at a
+fixed rate.
 
-**Ölçüm (BENCHMARKS, iki koşu):** yazıcının bloke olduğu en uzun pencere
-**80.5 s → 28.5/30.6 s (2.8x daralma)**; kalan sürenin TAMAMI mühürleme.
-Merge artık 53–54 s sürüyor ama **arka planda** ("ölçüm biterken merge
-çalışıyor muydu: EVET" ile örtüşme doğrulandı).
+The accumulation arithmetic (from the existing measurements): at ~100K op/s the
+writer fills a 125K buffer in **~1.3 s**, while sealing takes **~25 s**. If that
+ratio holds, the sealing queue grows monotonically → the segment count rises,
+search slows and memory swells. This is the "one dimension growing without
+bound" problem closed in #30, returning through a different door.
 
-- **Ön-kayıtlı 50x eşiği GEÇİLMEDİ** (oran ~2.8–3.6 milyon x). Bu ön-kayıtta
-  zaten öngörülmüştü: "9a-1'de geçilmez, raporlanır". Eşik 9a-2 sonrası
-  sınanacak; şu anki tek engel mühürleme.
-- **Dürüst bedel:** mühürlemenin kendisi 20.8 s → 28–30 s'ye çıktı (%40).
-  Sebep merge'in artık paralel koşup CPU paylaşması. "Arka plana almak
-  bedava değil" — net kazanç yine de 80.5 → 29 s.
+**Criterion 1 — latency (pre-registered in #40, unchanged):** the p99 of writes
+coinciding with the sealing/merge window must not exceed **50x** the baseline
+p99. The measurement condition is the same as in phase 8 and 9a-1 (WAL group:20,
+no commit inside the loop; an isolated process, warmup, two runs).
 
-### 47. ASIL kabul kriteri: tombstone diff-replay yarışı (geçti)
-Mühürlü segment insert almaz ama **delete alır**. Merge inşası saniyeler
-sürerken kaynaklara yeni tombstone düşerse, o kayıtlar birleşiğe CANLI
-kopyalanır ve silinmiş kayıtlar **sessizce geri gelir** — hiçbir latency
-ölçümü bunu yakalamaz. Çözüm: inşa başında tombstone SNAPSHOT'ı alınır,
-takas anında write kilidi altında güncel tombstone'larla FARK hesaplanıp
-birleşiğe taşınır (diff-replay).
+**Criterion 2 — accumulation (NEW, fixed by this pre-registration):** while the
+writer writes AT FULL SPEED, without interruption, for **at least 2 minutes**,
+the segment count is sampled every 5 seconds. Outcome:
+- **STABILIZES** (the average of the last third exceeds that of the first third
+  by at most 20%) **AND** no sample exceeds ceiling+4 (ceiling 8 → **12**) →
+  9a-2 is ACCEPTED without backpressure.
+- **GROWS MONOTONICALLY** or exceeds ceiling+4 → **backpressure is part of 9a-2
+  and is done in the SAME arc**; without it 9a-2 is not accepted. (This is no
+  longer a "revisit condition" but an acceptance criterion.)
+- Peak RSS during the accumulation is reported as well.
 
-Yarış penceresi **yapısal olarak** kapalı: `delete_vector_only` tombstone'u
-`segments` READ kilidini tutarken yazar, takas WRITE kilidi alır → ikisi
-karşılıklı dışlamalı. "Diff'i okudum, sonra tombstone geldi, sonra takas
-ettim" durumu oluşamaz.
+If backpressure is implemented, its form: once the segment count exceeds
+2×ceiling, a short wait on the write path (like Lucene's `IndexWriter` stall) —
+slowing writes down, not rejecting them. The single-writer contract is preserved.
 
-Test (`merge_carries_tombstones_created_during_build`) yarışın gerçekten
-tetiklendiğini `during_merge > 0` ile doğruluyor — aksi halde test sessizce
-zayıflardı. Ayrıca merge sırasında arama tutarlılığı ve merge ortasında
-çökme kurtarması ayrı testlerde.
+### 50. The structural risk of 9a-2: the "two buffers" state
+Once sealing moves to the background, the buffer being sealed and the new write
+buffer coexist for a while. This affects ALL THREE sources:
+- **Search:** segments + the buffer being sealed + the new buffer must all be
+  walked.
+- **Delete:** the record goes wherever it lives (a tombstone in the one being
+  sealed).
+- **Duplicate-id (the sneakiest):** if an id in the buffer being sealed is
+  inserted a second time into the new buffer and the check only looks at the new
+  buffer, the collision surfaces only AFTER sealing finishes — and by then both
+  copies are permanent.
 
-### 48. Yeni davranış: segment sayısı geçici olarak tavanı aşabilir
-Merge asenkron olduğu için mühürleme merge'den hızlıysa segment sayısı
-tavanın üstüne çıkıyor (ölçümde 9–11 segment gözlendi); yazma durunca
-worker tavana indiriyor. Bu, Lucene benzeri sistemlerde de normaldir.
-**Ertelenen iş:** sürekli yüksek yazma hızında birikme sınırsız olabilir;
-gerekirse backpressure (ör. segment sayısı 2×tavanı aşarsa yazmayı
-yavaşlatma) eklenir. Yeniden bakma koşulu: kalıcı yazma yükü altında
-segment sayısı 2×tavanı aşarsa.
+The tests are written in the 9a-1 pattern: that the race actually occurred (**"the
+two-buffer state was observed"**) is asserted inside the test, otherwise the test
+silently weakens.
 
 
-## Aşama 8a — int8 ölçeklenmesi — 2026-08-19
+## Phase 9a-1 — merging in the background — 2026-08-19
 
-### 44. DÜZELTME: "1M'de okuma ölçeklenmiyor" bulgusu (#43) YANLIŞTI
-Aşama 8'in karışık yük bölümünde 8 okuyucu için 945 QPS ölçülmüş ve
-"ölçeklenme çöküyor, bellek bant genişliği duvarı" sonucuna varılmıştı.
-İzole ölçüm bunu çürüttü: **f32 1M'de 5.4–6.1x ölçekleniyor** (8 fiziksel
-çekirdek). Hatanın kaynağı ölçüm ortamı: o tablo, 5 dakikadır çalışan,
-1M inşa + 130K yazma + merge + üç soğuk başlangıç yapmış, RSS'i 3.1 GB'a
-çıkmış bir süreçte `fullscale`'in 8. bölümü olarak alınmıştı.
+### 46. Merging was separated from the writer task; the remaining window is entirely sealing
+Implementation: the `segments` field became `Arc<RwLock<...>>` (auto-deref meant
+existing calls were unchanged), merging moved into the free function
+`merge_smallest_pair_bg`, and it runs on a background thread via
+`spawn_merge_if_needed`. "At most one merge at a time" is enforced with a CAS
+flag; if the ceiling is exceeded again the worker loop continues (no new thread
+is spawned, and triggers queue up naturally).
 
-- **Geçerliliğini koruyan kısım:** aynı tablodaki fsync politikası
-  karşılaştırması (oran 0.99–1.01) — üç politika da aynı kirli süreçte
-  ölçüldüğü için *göreli* sonuç geçerli. "fsync okuyuculara bindirmiyor"
-  kararı ayakta.
-- **Geçersiz kısım:** mutlak QPS değerleri ve "ölçeklenme çöküyor" yorumu.
-- **Ders (metodoloji):** performans ölçümleri izole, taze süreçte,
-  warmup + tekrar medyanıyla yapılmalı. `fullscale` gibi uzun bir koşunun
-  sonuna eklenen throughput ölçümü, ölçtüğünü sandığın şeyi ölçmez.
-  Bu ders `int8scale` moduna kod yorumu olarak da yazıldı.
-- **L3 açıklaması:** 100K'daki 8.7x ölçeklenme, çalışma kümesinin (92 MB)
-  makinenin **96 MB L3'üne** (Ryzen 7800X3D, 3D V-Cache) sığmasındandı.
-  1M'de sığmıyor ve ölçeklenme 8.7x → ~5.5x'e düşüyor: gerçek etki bu,
-  "çöküş" değil.
+**Measurement (BENCHMARKS, two runs):** the longest window in which the writer is
+blocked went **80.5 s → 28.5/30.6 s (a 2.8x reduction)**; ALL of the remaining
+time is sealing. Merging now takes 53–54 s but runs **in the background** (the
+overlap was confirmed by "was a merge running as the measurement ended: YES").
 
-### 45. 8a kararı: int8 entegrasyonu performans gerekçesiyle YAPILMAZ
-Ön-kayıtlı eşik (plan): 8 thread / 1 thread ≥ 2.0 → GO. **Ölçülen: 2.75–3.58x,
-yani eşik teknik olarak KARŞILANDI.** Ancak eşiğin dayandığı varsayım
-("f32 1M'de ölçeklenmiyor, int8 ölçeklenmeyi geri getirir") #44 ile çürüdü.
-Eşik değiştirilmiyor; sonuç olduğu gibi kaydediliyor ve karar varsayımın
-çürümesine göre veriliyor:
+- **The pre-registered 50x threshold was NOT MET** (the ratio is ~2.8–3.6
+  million x). This was already anticipated in the pre-registration: "it will not
+  be met in 9a-1; report it." The threshold will be tested again after 9a-2; the
+  only remaining obstacle is sealing.
+- **An honest cost:** sealing itself went from 20.8 s to 28–30 s (+40%). The
+  reason is that merging now runs in parallel and shares the CPU. "Moving it to
+  the background is not free" — the net gain is still 80.5 → 29 s.
 
-- **int8 ölçeklenmesi f32'den DAHA AZ** (2.75–3.58x vs 5.40–6.12x).
-- **int8 mutlak olarak ~2x YAVAŞ**: 8-thread QPS oranı 0.46–0.63x.
-- Sebep ADC'nin dequantize aritmetiği (Aşama 6: 15.6 ns vs 7.4 ns). Tek
-  thread'de bellek avantajı bunu dengeliyor, çok thread'de CPU darboğaz
-  olunca ADC ağır basıyor.
-- **Karar:** "1M+ için int8 segmented entegrasyonu" performans kalemi olarak
-  backlog'a GİRMEZ. Bellek gerekçesi (2.00x çalışma kümesi) Aşama 6'dan beri
-  zaten biliniyordu ve ayrı bir karardır.
-- **Yeniden bakma koşulu:** (a) ADC'nin SIMD'i iyileştirilirse (şu an u8→f32
-  dönüşümü şerit başına skaler; tam vektörleştirilmiş bir yol ölçülmedi),
-  (b) veri RAM'e sığmaz hale gelirse bellek gerekçesi performans gerekçesinin
-  önüne geçer, (c) graf temsili de küçültülürse (komşuluklarda u32 slot)
-  çalışma kümesi L3'e yaklaşabilir — o noktada tablo yeniden anlam kazanır.
+### 47. The REAL acceptance criterion: the tombstone diff-replay race (passed)
+A sealed segment takes no inserts but it does take **deletes**. If new tombstones
+land on the sources while the merge rebuild runs for seconds, those records are
+copied into the merged segment as LIVE and deleted records **silently come
+back** — no latency measurement would catch that. The fix: a SNAPSHOT of the
+tombstones is taken at the start of the build, and at swap time, under the write
+lock, the DIFFERENCE against the current tombstones is computed and applied to
+the merged segment (diff-replay).
 
-## Aşama 8 sonuçları — go/no-go kararları — 2026-08-19
+The race window is closed **structurally**: `delete_vector_only` writes the
+tombstone while holding the `segments` READ lock, and the swap takes the WRITE
+lock → the two are mutually exclusive. The interleaving "I read the diff, then a
+tombstone arrived, then I swapped" cannot occur.
 
-### 42. Eşik-karşılaştırmalı kararlar (ön-kayıt #40'a göre)
+The test (`merge_carries_tombstones_created_during_build`) asserts via
+`during_merge > 0` that the race was actually triggered — otherwise the test
+would silently weaken. Search consistency during a merge, and recovery from a
+crash mid-merge, are covered by separate tests.
 
-**9a — merge'in bağımsız task'e alınması: KOŞULSUZ YAPILIR (ön-kayıt gereği).**
-Gerekçe ölçüldü: en uzun tek yazma **80.5 s** (taban p99 7.8 µs), oran 10.3
-milyon x. Bir istemci bu pencerede yazma isteğinin yanıtını 80 saniye bekler.
-- **KRİTİK BULGU — 9a tek başına kabul kriterini SAĞLAYAMAZ.** Pencere iki
-  parçadan oluşuyor: **mühürleme 20.8 s + merge 59.7 s**. 9a yalnız merge'i
-  arka plana alıyor; geriye kalan mühürleme penceresi 20.8 s = taban p99'un
-  **2.7 milyon katı**, yani 50x kabul eşiği yine karşılanmaz. Ön-kaydın
-  "aşıyorsa kabul edilmemiştir ve nedeni araştırılır" maddesi devreye girer:
-  **neden mühürlemedir**. 9a'nın kapsamı genişletilmeli (mühürleme de arka
-  plan task'ine) ya da mühürleme artımlı hale getirilmeli — bu, ön-kaydı
-  değiştirmek değil, ölçümün ortaya çıkardığı yeni iştir.
+### 48. New behaviour: the segment count can temporarily exceed the ceiling
+Because merging is asynchronous, when sealing outpaces merging the segment count
+rises above the ceiling (9–11 segments were observed in the measurement); once
+writing stops the worker brings it back down. This is normal in Lucene-like
+systems too. **Deferred work:** under a sustained high write rate the
+accumulation could be unbounded; if needed, backpressure is added (e.g. slowing
+writes once the segment count exceeds 2×ceiling). Revisit condition: if under a
+sustained write load the segment count exceeds 2×ceiling.
 
-**9b — mmap ile lazy load: NO-GO. `unsafe` AÇILMIYOR.**
-Soğuk başlangıç bileşenlerine ayrıldı (BENCHMARKS): mmap'in kaldırabileceği
-iş yalnız (a) dosya okuma **196 ms** + (b)'nin vektör kopyalama payı ≈ toplam
-**~0.6 s üst sınır**. Eşik: kazanç ≥ %40 (**1.45 s**) VE ≥ 2 s. **İkisi de
-sağlanamıyor** — üst sınır bile eşiğin yarısının altında.
-- `deny(unsafe_code)` crate genelinde kalıyor.
-- **Yeniden bakma koşulu** (#40'tan): vektör verisi RAM'e sığmaz hale gelirse
-  (>%70 fiziksel bellek) mmap optimizasyon değil gereklilik olur.
-- **Ölçümün ortaya çıkardığı asıl fırsat başka yerde:** soğuk başlangıcın
-  **%63'ü türetilmiş indeksleri (posting + sayısal) yeniden kurmak** (2.28 s).
-  #34'te bunları "tek kaynak metadata olsun" diye diske yazmamayı seçmiştik;
-  ölçüm o kararın bedelini şimdi rakamla gösteriyor. Snapshot'lamak
-  mmap'ten ~4x daha büyük bir kazanç olurdu ve `unsafe` gerektirmez.
 
-**9c — mühürlü segment metadata sıkıştırması: GO.**
-Metadata payı **%51.5** (934 MB), eşik %25 — iki katından fazla. Metadata
-vektör+graf'tan (882 MB) **daha büyük**: "ikinci sınıf yolcu" olmaktan
-çıkmış, kapasiteyi belirleyen kalem haline gelmiş durumda.
-- Dağılım: id→metadata haritası 421 MB, Eq posting-list'leri 353 MB,
-  sayısal indeksler 160 MB.
-- Hesaplanan 1816 MB'a karşılık **zirve RSS 3167 MB** (fark 1351 MB:
-  allocator fragmentasyonu, `Vec` capacity payı, merge sırasındaki iki
-  kaynak + birleşik segment).
-- Not: 9c'nin planladığı "sıralı dizi + ikili arama" dönüşümü sayısal
-  indeksleri (160 MB) hedefliyor; ölçüm asıl şişkinliğin **id→metadata
-  haritası ve posting-list'lerde** olduğunu gösteriyor. String anahtarların
-  her kayıtta tekrarlanması (HashMap<String, MetaValue> per record) muhtemel
-  ana israf — 9c'nin kapsamı buna göre gözden geçirilmeli.
+## Phase 8a — int8 scaling — 2026-08-19
 
-### 43. Eşiğe bağlı olmayan ama kayda değer bulgular
-- **Okuma ölçeklenmesi 1M'de çöküyor:** tek thread 1048 QPS, 8 thread toplam
-  945 QPS (100K'da 8.7x ölçekleniyordu). Bellek bant genişliği duvarı.
-  Aşama 5'in "okuyucular birbirini bloklamaz" sözleşmesi *kilit* düzeyinde
-  hâlâ doğru; sınır artık yazılımda değil donanımda. int8 quantization'ın
-  (4x az bellek trafiği) 1M+ ölçekte asıl değeri burada.
-- **fsync politikası okuyuculara bindirmiyor** (oran 0.99–1.01): Aşama 5
-  sözleşmesinin ilk gerçek sınavı geçildi.
-- **Filtre latency'si ölçekle bozuluyor:** clustered×uzak s=0.3 hücresinde
-  p50 3.9 ms (100K) → 92.7 ms (1M); recall korunuyor (0.997) ama tarama
-  kolunun maliyeti eşleşme sayısıyla doğrusal.
-- **Segment modeli inşayı hızlandırıyor:** 1M tek graf 802 s, 8 segment
-  170 s (4.7x) — küçük graflarda inşa süper-doğrusallıktan kaçıyor.
-- **Replay doğrusal değil:** replay kayıt sayısı mühürleme eşiğini aşarsa
-  kurtarma içinde HNSW inşası tetiklenir. Checkpoint sıklığı = kurtarma
-  süresi tavanı.
+### 44. CORRECTION: the finding "reads do not scale at 1M" (#43) was WRONG
+The mixed-load section of phase 8 measured 945 QPS for 8 readers and concluded
+"scaling collapses, a memory-bandwidth wall". An isolated measurement refuted
+this: **f32 scales 5.4–6.1x at 1M** (8 physical cores). The source of the error
+was the measurement environment: that table was taken as section 8 of
+`fullscale`, in a process that had been running for five minutes and had done a
+1M build, 130K writes, a merge and three cold starts, with RSS at 3.1 GB.
 
-## Aşama 9 ÖN-KAYIT — 2026-08-18 (Aşama 8 ölçümü KOŞULMADAN önce yazıldı)
+- **The part that remains valid:** the fsync-policy comparison in that same table
+  (ratio 0.99–1.01) — since all three policies were measured in the same dirty
+  process, the *relative* result holds. The decision "fsync does not burden
+  readers" stands.
+- **The invalid part:** the absolute QPS values and the "scaling collapses"
+  interpretation.
+- **The lesson (methodology):** performance measurements must be taken in an
+  isolated, fresh process, with warmup and the median of repeats. A throughput
+  measurement appended to the end of a long run like `fullscale` does not measure
+  what you think it measures. This lesson was also written into the `int8scale`
+  mode as a code comment.
+- **The L3 explanation:** the 8.7x scaling at 100K came from the working set
+  (92 MB) fitting in the machine's **96 MB L3** (Ryzen 7800X3D, 3D V-Cache). At
+  1M it does not fit and scaling drops from 8.7x to ~5.5x: that is the real
+  effect, not a "collapse".
 
-### 40. Go/no-go eşikleri ve kabul kriterleri
-Kural: eşikler ölçümden önce yazılır ve sonuç görüldükten sonra
-DEĞİŞTİRİLEMEZ. Hepsi aynı koşuda ölçülen bir **tabana oranlıdır**; tabanlar
-da burada tanımlı ki "hangi tabanı kullanalım" tartışması kapalı olsun.
+### 45. The 8a decision: int8 integration will NOT be done on performance grounds
+The pre-registered threshold (from the plan): 8 threads / 1 thread ≥ 2.0 → GO.
+**Measured: 2.75–3.58x, so the threshold was technically MET.** But the
+assumption underlying the threshold ("f32 does not scale at 1M, int8 will bring
+scaling back") was refuted by #44. The threshold is not changed; the result is
+recorded as it stands, and the decision follows the collapse of the assumption:
 
-#### 9a — Merge'in bağımsız task'e alınması: KOŞULSUZ YAPILIR
-Eşik burada go/no-go kapısı DEĞİL, **kabul kriteridir**. Gerekçe: merge
-~250K kayıtlık yeniden inşa demek ve yazıcı task'ini bloke ediyor; 100K
-ölçümlerinden ekstrapole edilen pencere 10–40 s, yani herhangi bir makul
-eşik üç mertebe aşılacak. "Zaten belli" bir kapıya bütçe harcamak yerine
-ölçüm 9a'nın *gerekçesini* belgeler, eşik ise 9a'nın *başarısını* sınar.
+- **int8 scales LESS than f32** (2.75–3.58x vs 5.40–6.12x).
+- **int8 is about 2x SLOWER in absolute terms**: the 8-thread QPS ratio is
+  0.46–0.63x.
+- The cause is the dequantization arithmetic of ADC (phase 6: 15.6 ns vs
+  7.4 ns). On a single thread the memory advantage offsets it; with many threads,
+  once the CPU is the bottleneck, ADC dominates.
+- **Decision:** "int8 segmented integration for 1M+" does NOT enter the backlog
+  as a performance item. The memory rationale (a 2.00x working set) has been known
+  since phase 6 and is a separate decision.
+- **Revisit conditions:** (a) if ADC's SIMD is improved (the u8→f32 conversion is
+  currently scalar per lane; a fully vectorized path has not been measured),
+  (b) if the data no longer fits in RAM, the memory rationale outranks the
+  performance one, (c) if the graph representation is shrunk too (u32 slots in
+  the adjacency lists) the working set could approach L3 — at which point the
+  table becomes meaningful again.
 
-- **Taban:** merge penceresi DIŞINDA, aynı yük altında ölçülen yazma p99.
-- **Kabul (9a sonrası):** merge penceresine denk gelen yazmaların p99'u,
-  taban p99'un **50 katını aşmıyorsa** 9a başarılıdır. (50x ≈ 100–150 ms:
-  bir HTTP yazma isteğinde "yavaş ama kabul edilebilir"in üst sınırı.)
-  Aşıyorsa 9a **kabul edilmemiştir**, nedeni araştırılır.
-- **ASIL kabul kriteri latency değil, tombstone yarışıdır:** mühürlü segment
-  insert almaz ama delete (tombstone) alır. Merge sürerken kaynak
-  segmentlere düşen tombstone'lar, takas anında write kilidi altında
-  birleşiğe diff-replay edilmelidir. Bu yarış yanlışsa pencere kapansa bile
-  **sessizce veri kaybedilir** ve latency ölçümü bunu asla yakalamaz.
-  Bu senaryoya özel test 9a'nın birincil kabul koşuludur.
+## Phase 8 results — go/no-go decisions — 2026-08-19
 
-#### 9b — mmap ile lazy load (unsafe izin kapısı)
-- **Taban:** 1M soğuk başlangıç süresi ve arama p50 (ef=50, filtresiz).
-- **Go (izin istenir) — İKİ koşul birlikte:**
-  1. Soğuk başlangıç **≥ %40** kısalmalı **ve** mutlak kazanç **≥ 2 s**
-     olmalı (yüzde küçük tabanda anlamsızlaşmasın diye ikinci çapa);
-  2. Arama p50 regresyonu **%10'u aşmamalı**.
-- **No-go:** koşullardan biri sağlanmazsa `unsafe` açılmaz,
-  `deny(unsafe_code)` crate genelinde kalır. **Yeniden bakma koşulu:**
-  vektör verisi RAM'e sığmaz hale gelirse (>%70 fiziksel bellek) mmap bir
-  optimizasyon değil gereklilik olur; eşik o noktada yeniden tanımlanır.
-- **Recall kuralı (eşik değil):** mmap aynı baytları farklı yoldan okur;
-  recall'ın değişmesi eşik meselesi değil **bug göstergesidir**. Fark
-  çıkarsa karar verilmez — **durulur ve hata bulunur**.
+### 42. Threshold-based decisions (per pre-registration #40)
 
-#### 9c — Mühürlü segment metadata sıkıştırması
-- **Taban — konfigürasyon açıkça f32:** toplam indeks belleği = vektör +
-  graf, **f32 modunda** (sistemin varsayılan çalışma modu; `QuantizedHnsw`
-  segment modeline entegre değil). int8'de vektör payı 4x küçüldüğü için
-  aynı metadata otomatik olarak çok daha büyük bir oran tutardı — eşik iki
-  farklı sayı verirdi, bu yüzden taban sabitlendi.
-- **Ölçüm yöntemi:** eşik **hesaplanan** yapı boyutlarına göre değerlendirilir
-  (RSS'te metadata ayrıştırılamaz); RSS de raporlanır, aradaki fark
-  (allocator fragmentasyonu + Vec capacity payı) kendi başına bilgidir.
-- **Go:** metadata belleği toplam indeks belleğinin **%25'ini aşarsa**.
-  Gerekçe: bu oranın üstünde metadata, vektörlerin yanında ikinci sınıf bir
-  yolcu olmaktan çıkıp kapasite belirleyen kalem haline gelir.
-- **No-go:** %25'in altındaysa reddedilir. **Yeniden bakma koşulu:** sayısal
-  alan sayısı 3'ten fazlaya çıkarsa ya da 10M ölçeğine gidilirse (mutlak
-  bellek tavanı devreye girer) yeniden ölçülür.
-- 9c yapılırsa kendi kabul kriteri: kol örtüşmesi %100 kalmalı, filtre
-  recall'ı değişmemeli, mühürlemedeki O(n log n) dönüşüm maliyeti ölçülmeli.
+**9a — moving merging to an independent task: DONE UNCONDITIONALLY (per the
+pre-registration).** The rationale was measured: the longest single write is
+**80.5 s** (baseline p99 7.8 µs), a ratio of 10.3 million x. A client inside that
+window waits 80 seconds for the response to a write.
+- **CRITICAL FINDING — 9a alone CANNOT satisfy the acceptance criterion.** The
+  window consists of two parts: **sealing 20.8 s + merging 59.7 s**. 9a only moves
+  merging to the background; the remaining sealing window of 20.8 s is
+  **2.7 million times** the baseline p99, so the 50x acceptance threshold is still
+  not met. The pre-registration's clause "if exceeded, it is not accepted and the
+  cause is investigated" applies: **the cause is sealing**. Either 9a's scope must
+  widen (moving sealing to a background task as well) or sealing must become
+  incremental — this is not changing the pre-registration, it is the new work the
+  measurement revealed.
 
-### 41. Aşama 8 ölçüm protokolü (eşiklerin ölçülebilirliği için)
-- **Merge penceresi:** pencerenin hem ÖNCESİNDE hem SONRASINDA birkaç bin op
-  toplanır; aksi halde taban p99 gürültüden ibaret olur. Merge, 9. segment
-  mühürlemesiyle kasten tetiklenir (tavan 8).
-- **Bellek:** hesaplanan boyutlar (vektör, graf, metadata yapıları ayrı ayrı)
-  + süreç RSS'i birlikte raporlanır.
-- **1M kaza testi:** Aşama 7'nin matrisi küçük veriyle koştu; 1M snapshot +
-  dolu WAL ile en az bir kesme senaryosu tekrarlanır — replay süresinin
-  155 ms/100K'dan doğrusal gidip gitmediği burada görülür.
-- **Karışık yük:** 8 okuyucu + 1 yazıcı × 3 fsync politikası. Bu, Aşama 5'in
-  "okuyucular asla durmaz" sözleşmesinin ilk gerçek sınavı: fsync beklemesi
-  okuyucu QPS'ine bindiriyorsa sözleşme pratikte zayıflamış demektir.
+**9b — lazy loading via mmap: NO-GO. `unsafe` STAYS CLOSED.**
+Cold start was broken down into components (BENCHMARKS): the work mmap could
+remove is only (a) file reading, **196 ms**, plus the vector-copying share of
+(b) ≈ an upper bound of **~0.6 s** in total. The threshold: a gain of ≥ 40%
+(**1.45 s**) AND ≥ 2 s. **Neither can be met** — even the upper bound is below
+half the threshold.
+- `deny(unsafe_code)` stays in place crate-wide.
+- **Revisit condition** (from #40): if the vector data no longer fits in RAM
+  (>70% of physical memory), mmap becomes a necessity rather than an
+  optimization.
+- **The real opportunity the measurement revealed lies elsewhere:** **63% of cold
+  start is rebuilding the derived indexes** (posting + numeric), at 2.28 s. In #34
+  we chose not to write them to disk so that metadata would be the single source;
+  the measurement now puts a number on the price of that decision. Snapshotting
+  them would be a gain roughly 4x larger than mmap's, and it requires no `unsafe`.
 
-## Aşama 7b/7c — WAL ve kurtarma — 2026-08-18
+**9c — metadata compaction for sealed segments: GO.**
+The metadata share is **51.5%** (934 MB) against a 25% threshold — more than
+double. Metadata is **larger** than vectors+graph (882 MB): it has stopped being
+a "second-class passenger" and has become the item that determines capacity.
+- The distribution: the id→metadata map 421 MB, Eq posting lists 353 MB, numeric
+  indexes 160 MB.
+- Against 1816 MB of computed size, **peak RSS was 3167 MB** (a 1351 MB
+  difference: allocator fragmentation, `Vec` capacity slack, and the two sources
+  plus the merged segment coexisting during a merge).
+- Note: the "sorted array + binary search" transformation 9c planned targets the
+  numeric indexes (160 MB); the measurement shows the real bloat is in the
+  **id→metadata map and the posting lists**. Repeating the string keys in every
+  record (a HashMap<String, MetaValue> per record) is the likely main waste —
+  9c's scope should be reviewed accordingly.
 
-### 36. HTTP 200 sözleşmesi politikaya göre tanımlıdır
-Yazma sırası **write-ahead**: (1) validasyon (dim/duplicate — mutasyon YOK),
-(2) WAL append + politika fsync'i, (3) belleğe uygula. Ters sırada
-"istemciye hata döndük ama kayıt bellekte kaldı ve sonraki checkpoint onu
-kalıcılaştırdı" durumu oluşurdu. `IndexError::Storage` döndüğünde mutasyon
-belleğe UYGULANMAMIŞTIR.
+### 43. Findings not tied to a threshold but worth recording
+- **Read scaling collapses at 1M:** a single thread does 1048 QPS while 8 threads
+  total 945 QPS (at 100K it scaled 8.7x). A memory-bandwidth wall. Phase 5's
+  contract "readers never block one another" still holds at the *lock* level; the
+  limit has moved from software to hardware. This is where int8 quantization (4x
+  less memory traffic) would earn its keep at 1M+.
+- **The fsync policy does not burden readers** (ratio 0.99–1.01): the first real
+  test of the phase 5 contract was passed.
+- **Filter latency degrades with scale:** in the clustered×distant s=0.3 cell,
+  p50 went from 3.9 ms (100K) to 92.7 ms (1M); recall holds (0.997) but the cost
+  of the scan arm is linear in the number of matches.
+- **The segment model speeds up building:** a single 1M graph takes 802 s, while
+  8 segments take 170 s (4.7x) — smaller graphs escape the super-linearity of
+  construction.
+- **Replay is not linear:** if the number of replayed records exceeds the sealing
+  threshold, an HNSW build is triggered inside recovery. Checkpoint frequency =
+  the ceiling on recovery time.
 
-200 (POST /vectors → 201, DELETE → 204) şu anlama gelir:
+## Phase 9 PRE-REGISTRATION — 2026-08-18 (written BEFORE the phase 8 measurement was run)
 
-| politika | 200 = | hayatta kalır | ölçülen |
+### 40. Go/no-go thresholds and acceptance criteria
+The rule: thresholds are written before the measurement and CANNOT BE CHANGED
+after the result is seen. All of them are **ratios against a baseline** measured
+in the same run; the baselines are defined here too, so that the argument about
+"which baseline to use" is settled in advance.
+
+#### 9a — moving merging to an independent task: DONE UNCONDITIONALLY
+Here the threshold is NOT a go/no-go gate but an **acceptance criterion**. The
+reason: a merge means rebuilding ~250K records and it blocks the writer task; the
+window extrapolated from the 100K measurements is 10–40 s, so any reasonable
+threshold will be exceeded by three orders of magnitude. Rather than spending
+budget on a gate whose answer is already known, the measurement documents the
+*rationale* for 9a while the threshold tests its *success*.
+
+- **Baseline:** the write p99 measured OUTSIDE the merge window, under the same
+  load.
+- **Acceptance (after 9a):** if the p99 of writes coinciding with the merge
+  window **does not exceed 50x** the baseline p99, 9a is successful. (50x ≈
+  100–150 ms: the upper bound of "slow but acceptable" for an HTTP write.) If it
+  is exceeded, 9a is **not accepted** and the cause is investigated.
+- **The REAL acceptance criterion is not latency but the tombstone race:** a
+  sealed segment takes no inserts, but it does take deletes (tombstones).
+  Tombstones landing on the source segments while a merge runs must be
+  diff-replayed into the merged segment at swap time, under the write lock. If
+  that race is wrong, then even with the window closed **data is silently lost**,
+  and no latency measurement would ever catch it. A test dedicated to that
+  scenario is 9a's primary acceptance condition.
+
+#### 9b — lazy loading via mmap (the gate for permitting unsafe)
+- **Baseline:** the 1M cold-start time and the search p50 (ef=50, unfiltered).
+- **Go (permission is requested) — BOTH conditions together:**
+  1. Cold start must shorten by **≥ 40%** **and** the absolute gain must be
+     **≥ 2 s** (a second anchor so the percentage does not become meaningless on
+     a small base);
+  2. The search p50 regression must **not exceed 10%**.
+- **No-go:** if either condition fails, `unsafe` is not enabled and
+  `deny(unsafe_code)` stays crate-wide. **Revisit condition:** if the vector data
+  no longer fits in RAM (>70% of physical memory), mmap becomes a necessity
+  rather than an optimization, and the threshold is redefined at that point.
+- **The recall rule (not a threshold):** mmap reads the same bytes by a different
+  path; a change in recall is not a matter of thresholds but **an indication of a
+  bug**. If a difference appears, no decision is made — **we stop and find the
+  error**.
+
+#### 9c — metadata compaction for sealed segments
+- **Baseline — the configuration is explicitly f32:** total index memory =
+  vectors + graph, **in f32 mode** (the system's default operating mode;
+  `QuantizedHnsw` is not integrated into the segment model). Under int8 the vector
+  share shrinks 4x, so the same metadata would automatically occupy a much larger
+  proportion — the threshold would yield two different numbers, so the baseline is
+  fixed.
+- **Measurement method:** the threshold is evaluated against the **computed**
+  structure sizes (metadata cannot be isolated within RSS); RSS is reported too,
+  and the difference (allocator fragmentation + Vec capacity slack) is information
+  in its own right.
+- **Go:** if metadata memory **exceeds 25%** of total index memory. Rationale:
+  above that ratio metadata stops being a second-class passenger beside the
+  vectors and becomes the item that determines capacity.
+- **No-go:** below 25% it is rejected. **Revisit condition:** if the number of
+  numeric fields grows beyond 3, or if we move to a 10M scale (where an absolute
+  memory ceiling comes into play), it is measured again.
+- If 9c is done, its own acceptance criteria: arm agreement must stay 100%,
+  filter recall must not change, and the O(n log n) conversion cost during sealing
+  must be measured.
+
+### 41. The phase 8 measurement protocol (so the thresholds are measurable)
+- **The merge window:** a few thousand ops are collected both BEFORE and AFTER
+  the window; otherwise the baseline p99 is nothing but noise. The merge is
+  triggered deliberately by sealing a 9th segment (ceiling 8).
+- **Memory:** the computed sizes (vectors, graph and the metadata structures
+  separately) are reported together with the process RSS.
+- **The 1M crash test:** phase 7's matrix ran on small data; at least one
+  truncation scenario is repeated with a 1M snapshot and a full WAL — this is
+  where it shows whether replay time continues linearly from 155 ms/100K.
+- **Mixed load:** 8 readers + 1 writer × 3 fsync policies. This is the first real
+  test of phase 5's "readers never stop" contract: if waiting on fsync burdens
+  reader QPS, the contract has weakened in practice.
+
+## Phase 7b/7c — WAL and recovery — 2026-08-18
+
+### 36. The HTTP 200 contract is defined per policy
+The write ordering is **write-ahead**: (1) validation (dimension/duplicate — NO
+mutation), (2) WAL append + the policy's fsync, (3) apply to memory. In the
+reverse order you would get "we returned an error to the client but the record
+stayed in memory and the next checkpoint made it permanent". When
+`IndexError::Storage` is returned, the mutation has NOT been applied to memory.
+
+A 200 (POST /vectors → 201, DELETE → 204) means:
+
+| policy | 200 = | survives | measured |
 |---|---|---|---|
-| `none` | bellek + WAL append (OS cache) | süreç çökmesi; **güç kesintisi DEĞİL** | 281.609 op/s |
-| `group:T` (varsayılan) | kaydı kapsayan fsync tamamlandı | güç kesintisi | 31.669 op/s (batch=64) |
-| `per_op` | kaydın kendi fsync'i tamamlandı | güç kesintisi | 499 op/s |
+| `none` | memory + WAL append (OS cache) | a process crash; **NOT a power loss** | 281,609 op/s |
+| `group:T` (default) | the fsync covering the record completed | a power loss | 31,669 op/s (batch=64) |
+| `per_op` | the record's own fsync completed | a power loss | 499 op/s |
 
-**Varsayılan `group:20`** — ölçüm gerekçesi: per_op'ta fsync ~2 ms ve
-throughput 499 op/s'ye çakılıyor; group aynı dayanıklılık vaadini 63x
-throughput ile veriyor. Bedeli, yanıtın batch penceresi kadar gecikmesi.
-Gerçek group commit için yazıcı task'i komutları batch'ler, batch sonunda
-TEK commit yapar ve yanıtları **ancak ondan sonra** gönderir; "fsync'i
-beklemeyen group" sözleşmeyi sessizce zayıflatırdı.
+**The default is `group:20`** — the measured rationale: under per_op an fsync
+takes ~2 ms and throughput slams into 499 op/s; group gives the same durability
+promise at 63x the throughput. The price is that the response is delayed by the
+batch window. For real group commit the writer task batches commands, performs a
+SINGLE commit at the end of the batch, and sends the responses **only after
+that**; a "group that does not wait for the fsync" would silently weaken the
+contract.
 
-### 37. Kurtarma: ilk tutarsızlıkta dur, dosyayı orada KES
-Replay kısmi kayıt / CRC uyuşmazlığı / mantıksız uzunlukta durur; hayalet op
-asla türetilmez. Kritik ayrıntı: sağlam önekin sonunda dosya `set_len` ile
-kesilir. Kesmezsek bir sonraki append bozuk kuyruğun üstüne yazar ve dosya
-kalıcı olarak tutarsız kalırdı (ikinci replay farklı sonuç verirdi — testli).
+### 37. Recovery: stop at the first inconsistency and TRUNCATE the file there
+Replay stops on a partial record / CRC mismatch / implausible length; a phantom
+op is never synthesized. The critical detail: the file is truncated with
+`set_len` at the end of the intact prefix. Without truncating, the next append
+would write on top of the corrupted tail and the file would stay permanently
+inconsistent (a second replay would give a different result — there is a test).
 
-Replay sırasında `self.wal` HENÜZ bağlı değildir; bu, "replay ettiğimi
-tekrar loglamak" hatasını yapısal olarak imkânsız kılar.
+During replay `self.wal` is NOT yet attached; that makes the "log what I just
+replayed" bug structurally impossible.
 
-### 38. Kaza testi yöntemi: deterministik kesme, süreç öldürme değil
-Op dizisi gerçek indekse uygulanır, WAL dosyası kayıt sınırında VE kayıt
-ortasında (başlık ortası, gövde ortası, son bayt eksik) budanır, indeks
-yeniden açılır. Taşınabilir (Windows dahil), tekrarlanabilir, kesme noktası
-tam kontrollü. Doğruluk ölçütü: kurtarılan durum == WAL'ın sağlam önekinin
-durumu (ne eksik ne fazla). proptest: rastgele op dizisi × rastgele kesme
-noktası, ayrıca tamamen rastgele baytlar → hiçbir noktada panic yok.
+### 38. The crash-test method: deterministic truncation, not killing a process
+A sequence of operations is applied to a real index, the WAL file is cut at
+record boundaries AND mid-record (mid-header, mid-body, one byte short), and the
+index
+is reopened. This is portable (Windows included), reproducible, and the cut
+point is under exact control. The correctness criterion: the recovered state ==
+the state of the WAL's intact prefix (nothing missing, nothing extra). With
+proptest: a random operation sequence × a random cut point, plus entirely random
+bytes → no panic at any point.
 
-### 39. WAL rotasyonu checkpoint'e bağlı
-Checkpoint önce buffer'ı mühürler (tüm veri segmentlere geçer), sonra YENİ
-WAL dosyasını açar, sonra manifest'i yazar. Manifest yeni WAL'ı işaret ettiği
-anda eskisinin tüm kayıtları zaten segmentlerde. Kesinti olursa eski manifest
-hâlâ eski WAL'ı işaret eder — tutarlı. WAL'da checkpoint işareti YOK: "bu
-noktadan öncesi segmentlerde" bilgisi dosya sınırının kendisi.
+### 39. WAL rotation is tied to checkpoints
+A checkpoint first seals the buffer (all data moves into segments), then opens a
+NEW WAL file, then writes the manifest. By the time the manifest points at the
+new WAL, every record of the old one is already in the segments. On an
+interruption the old manifest still points at the old WAL — consistent. There is
+NO checkpoint marker in the WAL: the information "everything before this point is
+in the segments" is the file boundary itself.
 
-## Aşama 7a — Soğuk kalıcılık — 2026-08-18
+## Phase 7a — cold persistence — 2026-08-18
 
-### 32. Segment dosyaları değişmez, adları generation taşır
-`segment-<gen>-<idx>.gvdb` bir kez yazılır, bir daha ASLA üzerine yazılmaz;
-sonraki checkpoint'ler onu yalnız manifest'ten referanslar. Üç kazanç:
-(1) her checkpoint sadece YENİ segmentleri yazar — 100K'da ilk checkpoint
-221ms, ikinci (yeni segment yok) 98ms; 1M'de checkpoint maliyetini belirleyen
-şey bu. (2) Windows dosya kilitleriyle uyumlu: açık handle'lı dosyaya asla
-yazmıyoruz. (3) Aşama 9b'nin mmap'i için önkoşul — haritalanan dosyanın
-değişmezliği zaten garanti.
+### 32. Segment files are immutable and their names carry the generation
+`segment-<gen>-<idx>.gvdb` is written once and NEVER overwritten; later
+checkpoints only reference it from the manifest. Three benefits: (1) every
+checkpoint writes only the NEW segments — at 100K the first checkpoint took
+221 ms and the second (no new segments) 98 ms; this is what determines checkpoint
+cost at 1M. (2) It is compatible with Windows file locking: we never write to a
+file with an open handle. (3) It is a precondition for phase 9b's mmap — the
+immutability of the mapped file is already guaranteed.
 
-### 33. Manifest tek gerçek kaynak, atomik takas, EN SON yazılır
-Yazma sırası: yeni segmentler → metadata snapshot → **manifest** → GC.
-Her an diskteki manifest, referansladığı tüm dosyalar var olacak şekilde
-tutarlı; kesinti hangi adımda olursa olsun ESKİ manifest geçerli kalır ve
-yeni dosyalar yetim kalır (sonraki GC toplar). GC manifest'ten sonra
-çalışır — ters sıra hâlâ referanslanan bir dosyayı silebilirdi.
+### 33. The manifest is the single source of truth, swapped atomically, written LAST
+The write order: new segments → metadata snapshot → **manifest** → GC. At every
+instant the manifest on disk is consistent with all the files it references;
+whichever step is interrupted, the OLD manifest stays valid and the new files are
+orphaned (a later GC collects them). GC runs after the manifest — the reverse
+order could delete a file that is still referenced.
 
-**Windows dizin fsync yok:** dosya içeriği `sync_all` ile fsync'li, rename
-atomik (MoveFileEx REPLACE_EXISTING), ama dizin girdisinin dayanıklılığı
-işletim sistemine bırakılmış (Rust std dizin handle'ı açmaz). Sonuç:
-"checkpoint diskte ama dizin girdisi kaybolmuş" senaryosu teorik olarak
-mümkün — kurtarma bu yüzden her zaman WAL replay'iyle tamamlanacak (7b).
+**No directory fsync on Windows:** file contents are fsynced with `sync_all` and
+the rename is atomic (MoveFileEx REPLACE_EXISTING), but the durability of the
+directory entry is left to the operating system (Rust std does not open a
+directory handle). Consequence: the scenario "the checkpoint is on disk but the
+directory entry was lost" is theoretically possible — which is why recovery will
+always be completed by a WAL replay (7b).
 
-### 34. Tombstone'lar manifest'te, türetilmiş yapılar diskte YOK
-- Tombstone'lar segment dosyasına yazılamaz (değişmezlik kuralı) ve WAL'a
-  bırakılamaz (checkpoint WAL'ı rotasyona sokar). Manifest zaten atomik ve
-  küçük; merge/compaction tombstone'ları düzenli temizliyor.
-- Eq posting-list'leri ve sayısal alan indeksleri **diske yazılmaz**:
-  metadata'dan tam olarak türetilebiliyorlar. Tek kaynak → tutarsızlık
-  riski yapısal olarak yok. Bedeli açılışta yeniden kurma (100K + 3 alan:
-  toplam soğuk başlangıç 242ms; 1M'de Aşama 8 ölçecek).
-- Metadata snapshot'ı tam yazım (artımlı değil): sıcak yolu WAL taşıyacak.
+### 34. Tombstones live in the manifest; derived structures are NOT on disk
+- Tombstones cannot be written into the segment file (the immutability rule) and
+  cannot be left to the WAL (a checkpoint rotates the WAL). The manifest is
+  already atomic and small; merging/compaction clears tombstones regularly.
+- Eq posting lists and numeric field indexes are **not written to disk**: they can
+  be derived exactly from the metadata. A single source → structurally no risk of
+  drift. The price is rebuilding them at startup (100K + 3 fields: total cold
+  start 242 ms; phase 8 will measure it at 1M).
+- The metadata snapshot is a full write (not incremental): the hot path will be
+  carried by the WAL.
 
-### 35. Disk temsili API temsilinden ayrı: `MetaValueRepr`
-`MetaValue` HTTP JSON şekli için `#[serde(untagged)]` — `{"renk":"mavi"}`
-gibi doğal gövdeler bunu gerektiriyor. Ama untagged deserialization
-`deserialize_any` ister ve bincode self-describing olmadığı için bunu
-DESTEKLEMEZ (sessizce değil, derleme/çalışma zamanı hatası). Disk ve WAL
-temsili bu yüzden ayrı ve etiketli bir enum. Ayrışma zaten sağlıklı: biri
-dış sözleşme, diğeri iç format; bağımsız evrilebilirler. Regresyon testi
-her MetaValue türünü roundtrip ediyor.
+### 35. The disk representation is separate from the API representation: `MetaValueRepr`
+`MetaValue` is `#[serde(untagged)]` for the HTTP JSON shape — natural bodies like
+`{"color":"blue"}` require it. But untagged deserialization needs
+`deserialize_any`, and since bincode is not self-describing it does NOT SUPPORT
+that (not silently — it is a compile/runtime error). The disk and WAL
+representation is therefore a separate, tagged enum. The separation is healthy
+anyway: one is an external contract, the other an internal format, and they can
+evolve independently. A regression test round-trips every MetaValue variant.
 
-## Range histogramı — 2026-08-18
+## The Range histogram — 2026-08-18
 
-### 31. Range tahmini: eşit-genişlik histogram [alt,üst] + sınırlı sayım
-- **Eşit genişlik 64 kova**, quantile değil: basit, O(1) güncelleme.
-  Çarpık dağılım riski ölçüldü (log-normal: üst/gerçek 49x'e kadar) ama
-  quantile'a geçilmedi çünkü tahmin hatası kol seçimine sızmıyor (aşağıda).
-  Quantile, ancak post-kolu ef'' ölçeklemesi çarpık veride ölçülebilir
-  latency kaybettirirse gündeme gelir — o ölçümde recall 0.999+ ve p50'ler
-  düzgün dağılımdan farksızdı.
-- **Tahmin tek sayı değil [alt, üst] aralığı** (kullanıcı tasarımı): tam
-  içerilen kovalar alt, sınır kovaları dahil üst. Kova-içi düzgünlük
-  varsayımı hiç yapılmıyor; belirsizlik açık taşınıyor ve planlayıcı hep
-  muhafazakâr tarafı kullanıyor (küçük kol için üst, ŝ için üst → hata
-  yönü latency'e, asla recall'a çarpmaz).
-- **Kritik ekleme — sınırlı sayım**: histogramın yanında değer-sıralı
-  BTreeMap (bits-sıralı f64). Küçük-kol kararı tahminle DEĞİL,
-  `enumerate_up_to(scan_limit)` ile kesin veriliyor; eşleşen id'ler tarama
-  koluna bedava çıkıyor. Kabul kriterindeki kol örtüşmesi bu sayede
-  yapısal %100 (ölçüm: 13/13, çarpık ve korelasyonlu hücreler dahil).
-- **VE bağlacı**: bağımsızlık varsayımı YOK; üst sınırların minimumu
-  (Fréchet). Korelasyonlu Eq∧Range hücresinde 2.25x şişkin ama muhafazakâr.
-- **Genişleme payı %12.5**: monoton değer akışında histogram yeniden
-  kurulumunu amorti eder (testli).
-- Bakım: insert/remove O(log distinct); 100K inşada +%4 (BENCHMARKS).
-- Bellek bedeli: sorted map id başına ~24B/sayısal alan — histogram-yalnız
-  tasarıma göre pahalı ama küçük-kol kesinliği + fallback enumerasyonunu
-  satın alıyor.
-
-
-## Segment tavan bekçisi — 2026-08-18
-
-### 30. Merge: minimal tavan bekçisi, en-küçük-iki, tavan 8
-segcurve ölçümü (BENCHMARKS): eğri doğrusala yakın (~+45µs/segment) ve
-eşit-recall karşılaştırmasında tam merge'in kazancı ~%20 — merge'in
-gerekçesi latency DEĞİL, sınırsız büyümeyi kesmek (40 segment ≈ 1.8ms
-olurdu; eğri doyuma ulaşmıyor). Politika:
-- **En küçük iki** segment birleştirilir (en-eski değil): yeniden inşa
-  maliyeti n'e bağlı — en ucuz merge, ve boyutlar dengelenir. HNSW merge'i
-  gerçek birleştirme değil yeniden inşadır (grafları birleştirmenin ucuz
-  yolu yok); yazma amplifikasyonu LSM'den pahalı → politika muhafazakâr.
-- Mekanizma mühürlemenin "iki girdi, bir çıktı" varyantı: kilitsiz inşa,
-  tek write-kilidi altında atomik takas (retain+push aynı kilitte — okuyucu
-  ya eski ikiliyi ya birleşiği görür, asla ikisini birden/hiçbirini değil).
-- Merge doğal compaction: tombstone'lular birleşiğe taşınmaz.
-- Tek-yazar sözleşmesi korunur: merge yazıcıyı inşa süresince meşgul eder
-  (100K/tavan-8'de toplam +3.9s), okuyucular hiç durmaz. Tepe bellek:
-  kalıcı + iki kaynak segment (takas anına dek; 10K'lık segmentte +2×9MB).
-- Tavan 8: segcurve'de 8 segment ≈ 385µs — kabul edilebilir taban; tavana
-  ancak mühürleme sonrası bakılır, mühürleme başına merge asla.
+### 31. Range estimation: an equal-width histogram [lower,upper] + bounded counting
+- **64 equal-width buckets**, not quantiles: simple, O(1) updates. The risk of a
+  skewed distribution was measured (log-normal: upper/truth up to 49x) but we did
+  not move to quantiles, because the estimation error does not leak into the arm
+  choice (see below). Quantiles only come up if the post-arm's ef'' scaling costs
+  measurable latency on skewed data — in that measurement recall was 0.999+ and
+  the p50s were indistinguishable from the uniform distribution.
+- **The estimate is an [lower, upper] interval rather than a single number** (the
+  user's design): fully contained buckets give the lower bound, including the
+  boundary buckets gives the upper. No within-bucket uniformity is ever assumed;
+  the uncertainty is carried openly and the planner always uses the conservative
+  side (the upper bound for the small arm, the upper bound for ŝ → errors push on
+  latency, never on recall).
+- **The critical addition — bounded counting**: alongside the histogram there is a
+  value-ordered BTreeMap (bit-ordered f64). The small-arm decision is made NOT
+  from an estimate but exactly, via `enumerate_up_to(scan_limit)`; the matching
+  ids fall out for free for the scan arm. This is what makes the arm agreement in
+  the acceptance criterion structurally 100% (measured: 13/13, including the
+  skewed and correlated cells).
+- **The AND conjunction**: NO independence assumption; the minimum of the upper
+  bounds (Fréchet). In the correlated Eq∧Range cell it is inflated 2.25x, but
+  conservatively.
+- **A 12.5% widening margin**: it amortizes histogram rebuilds under a monotone
+  value stream (there is a test).
+- Maintenance: insert/remove is O(log distinct); +4% on a 100K build (BENCHMARKS).
+- The memory price: the sorted map costs ~24B per id per numeric field —
+  expensive next to a histogram-only design, but it buys small-arm exactness plus
+  the fallback enumeration.
 
 
-## Filtre planlayıcısı — 2026-08-18
+## The segment ceiling guard — 2026-08-18
 
-### 28. Ölçüm bulgusu: kırılganlık recall'da değil latency'de (#26 revizyonu)
-Seçicilik süpürmesi (BENCHMARKS, filtre bölümü) hipotezin tersini gösterdi:
-gezinti-içi filtre recall'u KORUYOR (en kötü hücre 0.952) çünkü kabul kümesi
-dolana dek genişlemeye devam ediyor — bedeli, kümelenmiş eşleşme + uzak
-sorguda gezintinin tüm grafa yayılması (kabul/ziyaret oranı 0.19'dan 0.01'e
-çöküyor, p50 25µs→1.3ms). Eski ikili fallback (found < k) bu patolojiyi hiç
-yakalamıyordu (süpürmede 0 kez tetiklendi). Ölçekli ef kolu test edildi ve
-REDDEDİLDİ: recall zaten yüksek, sadece latency ekliyor.
-
-### 29. Üç kollu planlayıcı: tarama / post-filter (over-fetch) / gezinti-içi
-- **Kardinalite tahmini O(1)**: Eq için (alan, değer) → yaşayan id kümesi
-  posting-list'leri (insert/delete'te bakım; tutarlılık testli). O(n)
-  metadata sayımı planlayıcı için reddedildi: 100K'da 14.4ms — planlanan
-  aramanın yüzlerce katı. Range koşulları tahmine katılmaz.
-- **Kol 1 — tarama**: est ≤ max(16k, 0.05n) → graf hiç açılmaz, en küçük
-  posting listesinde exact top-k. Maliyet est ile sınırlı, sorgu konumundan
-  bağımsız (100K'da 12µs–1ms).
-- **Kol 2 — post-filter (over-fetch)**: est daha büyükse FİLTRESİZ graf
-  araması `ef'' = clamp(5k/ŝ, ef, 8ef)` ile, filtre sonuçlara uygulanır.
-  Kritik içgörü (100K ölçümü): gezinti-içi filtre kümelenmiş eşleşme + uzak
-  sorguda grafın tamamına yayılıyor (35ms) ve ölçekle sessiz recall düşüşü
-  başlıyordu (0.948, fallback hiç tetiklenmeden — visited/admitted çöküşü
-  tek sinyaldi). Filtresiz gezinti bu patolojiye YAPISAL olarak bağışık.
-  ŝ Eq-minimum üst sınırı; sonuç < 2k kalırsa (pencere ıskaladı ya da tahmin
-  şişkin — VE bağlacı korelasyonu) exact taramaya düşülür. β=5: β=3'te sonuç
-  sayısı yetip kalite kaçıyordu (0.979 hücresi), 2k eşiği bunu yakalamıyordu.
-- **Kol 3 — gezinti-içi**: yalnız Eq'suz (Range-only) filtrelerde, eski
-  found<k güvenlik ağıyla. Tahminsiz durumda tek seçenek.
-- Denenip REDDEDİLENLER: ölçekli ef (gezinti-içi ile — recall'u zaten
-  koruyordu, sadece latency ekledi); ziyaret bütçesi + tarama fallback'i
-  (10K'da çalıştı, 100K'da yanlış kesmeler 30K'lık taramalara mal oldu —
-  bütçe API'ı ölçüm enstrümantasyonu olarak duruyor).
-- Kalibre sonuç (10K): 21 hücrenin HEPSİNDE recall 1.000; en kötü hücre
-  1.03ms (tarama tabanı), eski en kötü 1.3ms + 0.952 recall idi.
+### 30. Merging: a minimal ceiling guard, the two smallest, ceiling 8
+The segcurve measurement (BENCHMARKS): the curve is close to linear
+(~+45µs/segment) and in an equal-recall comparison a full merge gains ~20% — so
+the rationale for merging is NOT latency but cutting off unbounded growth (40
+segments would be ≈1.8 ms; the curve does not saturate). The policy:
+- The **two smallest** segments are merged (not the oldest): rebuild cost scales
+  with n, so this is the cheapest merge and sizes stay balanced. An HNSW merge is
+  not a true merge but a rebuild (there is no cheap way to combine graphs); write
+  amplification is worse than in an LSM → the policy stays conservative.
+- The mechanism is the "two inputs, one output" variant of sealing: a lock-free
+  rebuild, then an atomic swap under a single write lock (retain+push under the
+  same lock — a reader sees either the old pair or the merged segment, never both
+  and never neither).
+- A merge is a natural compaction: tombstoned records are not carried over.
+- The single-writer contract is preserved: a merge keeps the writer busy for the
+  duration of the rebuild (+3.9 s in total at 100K/ceiling-8) while readers never
+  stop. Peak memory: steady state plus the two source segments (until the swap;
+  +2×9 MB for 10K segments).
+- Ceiling 8: in segcurve, 8 segments ≈ 385 µs — an acceptable baseline; the
+  ceiling is only checked after sealing, never a merge per sealing.
 
 
-## Metadata filtreleme — 2026-08-18
+## The filter planner — 2026-08-18
 
-### 26. Gezinti-içi filtre + brute-force fallback
-Üç seçenek vardı: post-filter (ara, sonra ele — düşük seçicilikte k'dan az
-sonuç), pre-filter (önce eşleşenleri bul, aralarında ara — graf bağlantılılığı
-kopar), gezinti-içi (eşleşmeyen node köprü olarak gezilir, sonuca girmez —
-tombstone mekanizmasının genellemesi). Üçüncüsü seçildi; `search_layer`'a
-opsiyonel slot predicate'i eklendi. Doğruluk garantisi: graf araması k'dan az
-sonuç bulursa filtreli doğrusal taramaya düşülür (aşırı seçici filtrede yavaş
-ama eksiksiz — testte tek-eşleşmeli senaryo bunu doğrular).
+### 28. A measurement finding: the fragility is in latency, not recall (a revision of #26)
+The selectivity sweep (BENCHMARKS, the filter section) showed the opposite of the
+hypothesis: in-traversal filtering PRESERVES recall (the worst cell is 0.952)
+because it keeps expanding until the admitted set is full — the price is that
+with clustered matches and a distant query the traversal spreads across the whole
+graph (the admit/visit ratio collapses from 0.19 to 0.01, p50 25µs→1.3ms). The
+old binary fallback (found < k) never caught that pathology (it fired 0 times in
+the sweep). A scaled-ef arm was tested and REJECTED: recall was already high, it
+only added latency.
 
-### 27. Metadata id düzeyinde, segmentlerden ayrı
-`SegmentedIndex.metadata: HashMap<VectorId, Metadata>` — segmentler immutable
-kalır, metadata silme/yeniden eklemede id ile akar (silme metadata'yı düşürür,
-eski metadata yeni kayda sızmaz). Filtre modeli bilinçli dar: Eq + Range'in
-VE bağlacı; VEYA/negasyon ihtiyaç doğarsa ağaca genişletilir.
+### 29. A three-arm planner: scan / post-filter (over-fetch) / in-traversal
+- **O(1) cardinality estimation**: for Eq, posting lists of (field, value) → the
+  set of live ids (maintained on insert/delete; consistency is tested). An O(n)
+  metadata count was rejected for the planner: 14.4 ms at 100K — hundreds of times
+  the search being planned. Range predicates do not take part in the estimate.
+- **Arm 1 — scan**: est ≤ max(16k, 0.05n) → the graph is never opened, exact
+  top-k over the smallest posting list. The cost is bounded by est and independent
+  of query position (12µs–1ms at 100K).
+- **Arm 2 — post-filter (over-fetch)**: if est is larger, an UNFILTERED graph
+  search with `ef'' = clamp(5k/ŝ, ef, 8ef)`, with the filter applied to the
+  results. The critical insight (the 100K measurement): in-traversal filtering
+  spreads across the entire graph with clustered matches and a distant query
+  (35 ms), and a silent recall decline was setting in with scale (0.948, without
+  the fallback ever firing — the visited/admitted collapse
+  was the only signal). Unfiltered traversal is STRUCTURALLY immune to that
+  pathology. ŝ is the Eq-minimum upper bound; if fewer than 2k results remain
+  (the window missed, or the estimate was inflated — AND-conjunction correlation)
+  it falls back to an exact scan. β=5: with β=3 the number of results sufficed
+  while quality slipped away (the 0.979 cell), and the 2k threshold did not catch
+  that.
+- **Arm 3 — in-traversal**: only for filters without Eq (Range-only), with the old
+  found<k safety net. The only option when there is no estimate.
+- TRIED AND REJECTED: scaled ef (together with in-traversal filtering — it was
+  already preserving recall, so this only added latency); a visit budget + scan
+  fallback (it worked at 10K, but at 100K the wrong cutoffs cost 30K-element scans
+  — the budget API remains as measurement instrumentation).
+- The calibrated result (10K): recall 1.000 in ALL 21 cells; the worst cell is
+  1.03 ms (the scan baseline), where the old worst was 1.3 ms with 0.952 recall.
+
+
+## Metadata filtering — 2026-08-18
+
+### 26. In-traversal filtering + a brute-force fallback
+There were three options: post-filter (search, then discard — fewer than k
+results at low selectivity), pre-filter (find the matches first and search among
+them — graph connectivity breaks), and in-traversal (a non-matching node is
+traversed as a bridge but never enters the results — a generalization of the
+tombstone mechanism). The third was chosen; an optional slot predicate was added
+to `search_layer`. The correctness guarantee: if the graph search finds fewer
+than k results it falls back to a filtered linear scan (slow but complete under a
+highly selective filter — a single-match scenario in the tests verifies this).
+
+### 27. Metadata lives at the id level, separate from the segments
+`SegmentedIndex.metadata: HashMap<VectorId, Metadata>` — the segments stay
+immutable while metadata flows by id through deletion and re-insertion (a
+deletion drops the metadata, so old metadata cannot leak into a new record). The
+filter model is deliberately narrow: the AND conjunction of Eq + Range;
+OR/negation would be extended into a tree if the need arose.
 
 
 ## SIMD — 2026-08-18
 
-### 25. Açık SIMD: `wide::f32x8`, unsafe'siz
-`std::simd` nightly istiyor, intrinsics unsafe istiyor; `wide` güvenli API
-ile ikisinden de kaçınıyor (`deny(unsafe_code)` korundu). Float toplama
-sırasının değişmesi bilinçli kabul: mesafeler yalnız karşılaştırılıyor,
-~1 ulp fark sonucu etkilemez. `target-cpu=native` .cargo/config.toml'da —
-binary taşınabilirliği yerine yerel performans (öğrenme projesi).
+### 25. Explicit SIMD: `wide::f32x8`, without unsafe
+`std::simd` requires nightly and intrinsics require unsafe; `wide` avoids both
+with a safe API (`deny(unsafe_code)` is preserved). The change in float summation
+order is accepted deliberately: distances are only compared, and a ~1 ulp
+difference does not affect the outcome. `target-cpu=native` is set in
+.cargo/config.toml — local performance over binary portability (this is a
+learning project).
 
 
-## Aşama 6 — 2026-08-18
+## Phase 6 — 2026-08-18
 
-### 22. Quantization mimarisi: f32 ile inşa, dondurup quantize et, ADC ile ara
-Graf f32 hassasiyetle kurulur (komşu seçimi tam hassasiyetten yararlanır),
-`QuantizedHnsw::from_hnsw` grafı kopyalayıp vektörleri u8 koda çevirir;
-f32 kaynağı düşürülünce bellekte yalnız kodlar kalır. Arama asimetrik
-(ADC): query f32, kodlar anlık dequantize — çift taraflı quantize hataya
-iki kez maruz kalırdı. Donmuş indekste insert/delete `Unsupported`:
-segment modelinde (Aşama 5) yazma zaten buffer'a gider, quantize indeks
-"mühürlü segmentin sıkıştırılmış hali" rolündedir.
+### 22. The quantization architecture: build in f32, freeze and quantize, search with ADC
+The graph is built at f32 precision (neighbour selection benefits from full
+precision); `QuantizedHnsw::from_hnsw` copies the graph and converts the vectors
+into u8 codes; once the f32 source is dropped, only the codes remain in memory.
+Search is asymmetric (ADC): the query stays f32 and the codes are dequantized on
+the fly — quantizing both sides would expose the result to the error twice. On a
+frozen index insert/delete return `Unsupported`: in the segment model (phase 5)
+writes go to the buffer anyway, and a quantized index plays the role of "the
+compressed form of a sealed segment".
 
-### 23. Rerank YOK (saf quantization)
-Seçenekler: (a) saf SQ — düşük bellek, makul recall; (b) SQ + diskten f32
-okuyup top-k'yı yeniden sırala — yüksek recall, IO bağımlılığı.
-**(a) seçildi.** Ölçüm: SIFT 100K'da kayıp 0.005–0.011, hedef 0.02'nin
-yarısı bile değil — rerank'in kazanacağı recall pratikte yok denecek kadar
-az, buna karşılık disk IO yolu, dosya yaşam döngüsü bağımlılığı ve p99
-belirsizliği eklenecekti. Rerank, recall bütçesi gerçekten sıkışırsa
-(ör. PQ'ya geçiş) yeniden değerlendirilir.
+### 23. NO rerank (pure quantization)
+The options: (a) pure SQ — low memory, reasonable recall; (b) SQ + reading f32
+from disk to re-rank the top-k — high recall, an IO dependency. **(a) was
+chosen.** The measurement: on SIFT 100K the loss is 0.005–0.011, not even half of
+the 0.02 target — the recall rerank would buy is practically nil, while it would
+add a disk IO path, a file-lifecycle dependency and p99 uncertainty. Rerank will
+be reconsidered if the recall budget genuinely tightens (e.g. a move to PQ).
 
-### 24. Per-dimension min/max kalibrasyon
-Global min/max yerine boyut başına: SIFT gibi boyutlar arası dinamik
-aralığı farklı veride hata payını boyut başına küçültür. Sabit boyut
-(max==min) scale=0 üretir; kod 0, decode min — NaN üretmez (testli).
-
-
-## Aşama 5 — 2026-08-18
-
-### 18. Eşzamanlılık: segment modeli (onaylanan strateji 2)
-COW/RCU yerine immutable segment + append-only buffer seçildi (kullanıcı
-onayıyla). Gerekçe: yazma başına O(n) kopya yok; compaction "mühürleme"ye
-dönüşüp arka plana alınabiliyor; gerçek vektör DB mimarisi. Sharded locking
-reddedildi çünkü kilit birimi (shard) ile erişim birimi (gezinti yolu)
-örtüşmüyor: her adım rastgele shard'a sıçrar, insert çift yönlü bağlantı +
-çok node'lu budama ile aynı anda çok kilit ister → deadlock ya da dev kilit.
-
-### 19. Kilit disiplini: pahalı iş asla kilit altında değil
-Okuyucu segment listesini `Vec<Arc<Segment>>` olarak klonlar (read kilidi
-mikrosaniyeler) ve HNSW aramasını kilitsiz yapar. Mühürleme (HNSW inşası,
-saniyeler) hiçbir kilit tutulmadan koşar; yayınlama sırası "önce segment
-ekle, sonra buffer'ı boşalt" — aradaki pencerede görülebilecek kopyaları
-arama id-bazlı tekilleştirme emer (veri kaybı yerine kopya tercih edildi).
-
-### 20. Tombstone'lar segment-YEREL
-Global silinmiş-küme, silinip yeniden eklenen id'de eski kopyayı hortlatırdı
-(reinsert kümeden çıkarınca segmentteki eski vektör yeniden görünür olurdu).
-Segment-yerel kümede eski kopya kendi segmentinde kalıcı gölgede kalır.
-
-### 21. Tek-yazar sözleşmesi
-Mutasyonlar `&self` üzerinden kilitli çalışır (`insert_shared`) ama duplicate
-kontrolü check-then-act olduğu için çoklu yazıcıda yarışabilir; sözleşme
-"çok okuyucu + tek yazıcı"dır (aşamanın kabul kriteriyle uyumlu). Çoklu
-yazıcı ileride id-uzayı bölüştürme ya da yazı kuyruğuyla eklenebilir.
+### 24. Per-dimension min/max calibration
+Per dimension rather than global: on data like SIFT, where the dynamic range
+differs across dimensions, this shrinks the error margin dimension by dimension.
+A constant dimension (max==min) yields scale=0; the code is 0 and decoding
+returns min — no NaN is produced (there is a test).
 
 
-## Aşama 4 — 2026-08-18
+## Phase 5 — 2026-08-18
 
-### 15. Silme: tombstone + gezinmede köprü, sonuçta dışlama
-Silinen node graftan sökülmez (kenar onarımı pahalı ve bağlantılılığı
-riske atar); `deleted` bayrağıyla işaretlenir. `search_layer` tombstone'ları
-GEZMEYE devam eder (komşuları keşfedilir, köprü görevi sürer) ama sonuç
-kümesine almaz. İnşa sırasında yeni node'lar tombstone'lara bağlanabilir —
-compaction toptan temizler.
+### 18. Concurrency: the segment model (approved strategy 2)
+Immutable segments plus an append-only buffer were chosen over COW/RCU (with the
+user's approval). The rationale: no O(n) copy per write; compaction becomes
+"sealing" and can move to the background; it is the architecture real vector
+databases use. Sharded locking was rejected because the unit of locking (a shard)
+does not coincide with the unit of access (a traversal path): every step jumps to
+a random shard, and an insert needs many locks at once for bidirectional linking
+plus multi-node pruning → either deadlock or one giant lock.
 
-### 16. Entry point silinirse: yaşayan en yüksek seviyeli node yeni giriş
-Tombstone waypoint olarak işleyebilirdi ama tüm aramaların ölü node'dan
-başlaması kırılganlık ekler; silme anında `pick_new_entry` çalışır.
-Tüm elemanlar silinirse entry None olur; sonraki insert sıfırdan kurar.
+### 19. Lock discipline: expensive work is never done under a lock
+A reader clones the segment list as a `Vec<Arc<Segment>>` (a read lock held for
+microseconds) and performs the HNSW search lock-free. Sealing (an HNSW build,
+taking seconds) runs holding no lock at all; the publication order is "append the
+segment first, drain the buffer after" — any duplicates visible in the window
+between are absorbed by the id-based deduplication in search (a duplicate was
+preferred over data loss).
 
-### 17. Compaction: eşikli tam yeniden inşa
-Tombstone oranı `tombstone_threshold`'u (varsayılan 0.3) aşınca delete
-otomatik compaction tetikler: yaşayanlar taze indekse yeniden insert edilir.
-Yerinde slot geri kazanımı yerine tam inşa: basit, doğruluğu garanti,
-ve HNSW inşası zaten hızlı (10K → ~2 s). Bedeli: compaction anlık duraklama
-yaratır — Aşama 5'in eşzamanlılık modeli bunu arka plana alabilir.
+### 20. Tombstones are segment-LOCAL
+A global deleted-set would resurrect the old copy of an id that is deleted and
+re-inserted (removing it from the set would make the old vector in the segment
+visible again). With a segment-local set the old copy stays permanently shadowed
+in its own segment.
 
-
-## Aşama 3 — 2026-08-18
-
-### 11. Dosya formatı: magic + versiyon + bincode meta + ham f32 bölümü + CRC32
-Vektör verisi meta'nın DIŞINDA, 4 byte'a hizalı ham bölümde tutulur —
-memmap ile kopyasız erişilebilsin diye. CRC32 dosyanın tamamını kapsar;
-checksum meta parse'ından ÖNCE doğrulanır (bozuk baytı deserializer'a
-hiç göstermemek fuzz yüzeyini küçültür). Yazma geçici dosya + atomik
-rename ile: yarım yazım asıl dosyayı asla bozamaz.
-
-### 12. memmap2 lazy load BEKLEMEDE: unsafe izni gerekiyor
-`memmap2::Mmap::map` bir `unsafe fn` (harita yaşarken dosya değişirse UB) ve
-crate `#![deny(unsafe_code)]` ile derleniyor. Kural gereği kaldırmadan önce
-kullanıcıya soruldu; onay gelene dek `load(path, lazy)` iki yolda da güvenli
-tam-okuma yapar. `VectorStorage::Mmap` altyapısı hazır (bytemuck cast,
-copy-on-write insert), izinle tek satırlık aktivasyon kaldı.
-
-### 13. RNG durumu diske yazılmaz
-Yükleme sonrası seviye RNG'si `seed ^ n`'den yeniden türetilir. Yüklenmiş
-indekse yapılan insert'ler deterministiktir ama kesintisiz inşayla birebir
-aynı graf olmayabilir — arama doğruluğu bundan etkilenmez, kabul edildi.
-
-### 14. load_from_bytes ayrı yüzey
-Fuzz hedefi, testler ve dosya yolu aynı parse kodunu paylaşır; `rebuild`
-her slot/entry referansını sınır kontrolünden geçirir — bozuk ama crc'si
-tutan (kasıtlı üretilmiş) dosyada bile panic yerine Err.
+### 21. The single-writer contract
+Mutations work through `&self` under locks (`insert_shared`), but because the
+duplicate check is check-then-act it can race with multiple writers; the contract
+is "many readers + one writer" (consistent with the phase's acceptance criteria).
+Multiple writers could later be added by partitioning the id space or with a write
+queue.
 
 
-## Aşama 2 — 2026-08-18
+## Phase 4 — 2026-08-18
 
-### 7. HNSW komşu seçimi: Algorithm 4 heuristic + keepPrunedConnections
-Naif top-M yerine makaledeki heuristic: aday, seçili bir komşuya query'den
-daha yakınsa elenir. Bu, küme içi gereksiz kenarları kırpıp kümeler arası
-köprüleri korur; recall'un veri kümelenmesine dayanıklılığı buradan gelir.
-Elenenlerle M'e tamamlama (keepPrunedConnections) açık — düşük dereceli
-node kalmasın diye.
+### 15. Deletion: a tombstone that bridges during traversal and is excluded from results
+A deleted node is not removed from the graph (repairing edges is expensive and
+risks connectivity); it is marked with a `deleted` flag. `search_layer` keeps
+TRAVERSING tombstones (their neighbours are explored, so they go on serving as
+bridges) but never admits them into the result set. During construction new nodes
+may link to tombstones — compaction clears them wholesale.
 
-### 8. Budama sonrası graf yönlüdür
-`shrink_links` bir node'un listesini kırptığında karşı taraftaki kenar
-silinmez (hnswlib ile aynı davranış). Çift yönlülüğü zorlamak her budamada
-karşı listeleri de taramayı gerektirir ve pratik fayda sağlamaz; testler
-sadece derece limitini ve komşu geçerliliğini doğrular.
+### 16. If the entry point is deleted: the highest-level live node becomes the new entry
+A tombstone could have worked as a waypoint, but having every search start from a
+dead node adds fragility; `pick_new_entry` runs at deletion time. If every element
+is deleted, entry becomes None and the next insert builds from scratch.
 
-### 9. Seviye ataması ve parametre varsayılanları
-`level = floor(-ln(U) * mL)`, `mL = 1/ln(M)` (makale 4.1 optimumu),
-`M_max0 = 2M`. Varsayılan M=16, ef_c=200. Süpürme sonucu tatlı nokta:
-M=16 + ef_search 25–50 (BENCHMARKS.md Aşama 2 tablosu).
-
-### 10. `search_layer`'da visited için `Vec<bool>`
-HashSet yerine slot başına bayrak: 100K node'da sorgu başına tek 100KB
-allocation, dallanma başına hash maliyeti yok. Eşzamanlılık aşamasında
-sorgu-yerel kaldığı için paylaşım sorunu yaratmaz.
+### 17. Compaction: a full rebuild triggered by a threshold
+When the tombstone ratio exceeds `tombstone_threshold` (default 0.3), a delete
+triggers an automatic compaction: the live records are re-inserted into a fresh
+index. A full rebuild rather than in-place slot reclamation: simple, correctness
+guaranteed, and HNSW construction is fast anyway (10K → ~2 s). The price: a
+compaction causes a momentary pause — phase 5's concurrency model can move it to
+the background.
 
 
-## Aşama 0 — 2026-08-18
+## Phase 3 — 2026-08-18
 
-### 1. `VectorIndex::insert` imzası: `&mut self`
-**Karar:** Trait'te mutasyonlar `&mut self` alır; interior mutability yok.
+### 11. The file format: magic + version + bincode meta + a raw f32 section + CRC32
+The vector data is kept OUTSIDE meta, in a raw section aligned to 4 bytes — so it
+can be accessed without copying via mmap. The CRC32 covers the whole file, and
+the checksum is verified BEFORE meta is parsed (never showing a corrupt byte to
+the deserializer shrinks the fuzz surface). Writing goes through a temporary file
+plus an atomic rename: a half-write can never corrupt the real file.
 
-**Gerekçe:** İndeks algoritmaları (özellikle HNSW insert) tek-yazar varsayımıyla
-en basit ve en test edilebilir halinde yazılır. Aşama 5'teki eşzamanlılık,
-trait'in içine `RwLock`/atomics gömerek değil, indeksin **üstüne** bir katman
-sarılarak eklenecek (COW/arc-swap ya da immutable segment modeli — o aşamada
-karşılaştırılıp seçilecek). `&self + interior mutability` seçseydik her
-implementasyon lock granülaritesi düşünmek zorunda kalır, tek-thread'li
-brute-force bile gereksiz senkronizasyon taşırdı. `&mut self` + dış katman,
-"algoritma" ile "eşzamanlılık politikası"nı ayrıştırır; Aşama 5'te strateji
-değiştirmek trait'i kırmaz.
+### 12. memmap2 lazy loading is ON HOLD: it needs permission for unsafe
+`memmap2::Mmap::map` is an `unsafe fn` (UB if the file changes while the mapping
+is alive) and
+the crate is compiled with `#![deny(unsafe_code)]`. Per the rule, the user was
+asked before lifting it; until approval, `load(path, lazy)` performs a safe full
+read on both paths. The `VectorStorage::Mmap` infrastructure is ready (bytemuck
+cast, copy-on-write insert) and activation is a one-liner once permitted.
 
-### 2. Cosine normalizasyon politikası: insert/query anında normalize, aramada dot product
-**Karar:** `Metric::Cosine` ile kurulan indeks, vektörü insert anında ve
-query'yi arama başında bir kez normalize eder; sıcak mesafe döngüsü `-dot` çalıştırır.
+### 13. RNG state is not written to disk
+After loading, the level RNG is re-derived from `seed ^ n`. Inserts into a loaded
+index are deterministic, but the graph may not be bit-identical to one built
+without interruption — search correctness is unaffected, and this was accepted.
 
-**Gerekçe:** HNSW bir aramada binlerce mesafe hesabı yapar; her hesapta iki norm
-çıkarmak (sqrt dahil) maliyeti ~3x'e katlar. Normalizasyon vektör başına bir kez
-ödenir ve sonuç sıralaması birebir aynıdır. Bedeli: orijinal (normalize edilmemiş)
-vektör indeksten geri okunamaz — bu bir arama motoru için kabul edilebilir;
-gerekirse orijinaller Aşama 3'ün kalıcılık katmanında ayrıca saklanabilir.
-Sıfır vektör edge case'i: normalize edilmeden bırakılır (NaN üretilmez),
-her şeye benzerliği 0 sayılır.
+### 14. `load_from_bytes` is a separate surface
+The fuzz target, the tests and the file path share the same parsing code;
+`rebuild` bounds-checks every slot/entry reference — so even a corrupt file whose
+crc happens to match (deliberately constructed) yields Err rather than a panic.
 
-### 3. Mesafe sözleşmesi: "küçük = daha yakın", L2 karesi, benzerlikler negatiflenir
-**Gerekçe:** Tek yönlü sıralama sözleşmesi sayesinde top-k/heap/recall kodu
-metrikten bağımsız tek kez yazılır. `sqrt` monoton olduğundan L2'de atlanır.
 
-### 4. Graf temsili: index tabanlı (`Vec<Vec<usize>>`), Rc/RefCell yok
-**Gerekçe:** (Aşama 2'de uygulanacak, şimdiden bağlayıcı.) Slot indeksli düz
-vektörler hem borrow-checker sürtünmesini sıfırlar hem cache dostudur hem de
-Aşama 3'te serileştirmesi trivialdir.
+## Phase 2 — 2026-08-18
 
-### 5. Ölçüm altyapısı indekslerden bağımsız
-`eval::exact_top_k` trait'in dışında sade bir doğrusal taramadır ve proje boyunca
-ground truth üreticisi olarak kalır. Aşama 1'in brute-force indeksi bile buna
-karşı test edilir; referans ile test edilen şey aynı kod olursa test anlamsızlaşır.
+### 7. HNSW neighbour selection: the Algorithm 4 heuristic + keepPrunedConnections
+The paper's heuristic instead of a naive top-M: a candidate is discarded if it is
+closer to an already-selected neighbour than it is to the query. This prunes
+redundant intra-cluster edges while preserving inter-cluster bridges; that is
+where recall's robustness to data clustering comes from. Topping up to M with the
+discarded ones (keepPrunedConnections) is enabled — so no node is left with a low
+degree.
 
-### 6. Tekrarlanabilirlik: `StdRng::seed_from_u64(42)`
-Tüm rastgelelik (veri üretimi, ileride HNSW seviye ataması) sabit varsayılan
-seed'li `StdRng`'den gelir; benchmark'lar deterministiktir.
+### 8. After pruning, the graph is directed
+When `shrink_links` prunes a node's list, the opposite edge is not deleted (the
+same behaviour as hnswlib). Enforcing bidirectionality would require scanning the
+opposite lists on every prune and brings no practical benefit; the tests verify
+only the degree limit and neighbour validity.
+
+### 9. Level assignment and default parameters
+`level = floor(-ln(U) * mL)`, `mL = 1/ln(M)` (the optimum from §4.1 of the
+paper), `M_max0 = 2M`. Defaults: M=16, ef_c=200. The sweet spot from the sweep:
+M=16 with ef_search 25–50 (the phase 2 table in BENCHMARKS.md).
+
+### 10. A `Vec<bool>` for `visited` in `search_layer`
+A flag per slot rather than a HashSet: at 100K nodes that is a single 100KB
+allocation per query with no per-branch hashing cost. Since it stays query-local
+through the concurrency phase, it creates no sharing problem.
+
+
+## Phase 0 — 2026-08-18
+
+### 1. The `VectorIndex::insert` signature: `&mut self`
+**Decision:** mutations in the trait take `&mut self`; no interior mutability.
+
+**Rationale:** index algorithms (HNSW insert in particular) are written in their
+simplest, most testable form under a single-writer assumption. The concurrency of
+phase 5 will be added not by burying `RwLock`/atomics inside the trait but by
+wrapping a layer **on top** of the index (COW/arc-swap or an immutable segment
+model — to be compared and chosen in that phase). Had we chosen `&self` +
+interior mutability, every implementation would have to reason about lock
+granularity, and even the single-threaded brute-force index would carry
+unnecessary synchronization. `&mut self` plus an outer layer separates "the
+algorithm" from "the concurrency policy"; changing strategy in phase 5 does not
+break the trait.
+
+### 2. The cosine normalization policy: normalize at insert/query time, use a dot product in search
+**Decision:** an index built with `Metric::Cosine` normalizes a vector once at
+insert time and the query once at the start of a search; the hot distance loop
+runs `-dot`.
+
+**Rationale:** an HNSW search computes thousands of distances; taking two norms
+(including a sqrt) in each would roughly triple the cost. Normalization is paid
+once per vector and the resulting ordering is identical. The price: the original
+(un-normalized) vector cannot be read back from the index — acceptable for a
+search engine; if needed, the originals could be stored separately in phase 3's
+persistence layer. The zero-vector edge case: it is left un-normalized (no NaN is
+produced) and its similarity to everything is taken as 0.
+
+### 3. The distance contract: "smaller = closer", squared L2, similarities negated
+**Rationale:** a single directional ordering contract lets the top-k/heap/recall
+code be written once, independent of the metric. Since `sqrt` is monotone, it is
+skipped for L2.
+
+### 4. Graph representation: index-based (`Vec<Vec<usize>>`), no Rc/RefCell
+**Rationale:** (to be implemented in phase 2, binding from now on.) Flat vectors
+with slot indexes remove all borrow-checker friction, are cache-friendly, and are
+trivial to serialize in phase 3.
+
+### 5. The measurement infrastructure is independent of the indexes
+`eval::exact_top_k` is a plain linear scan outside the trait and remains the
+ground-truth generator for the whole project. Even phase 1's brute-force index is
+tested against it; if the reference and the thing under test were the same code,
+the test would be meaningless.
+
+### 6. Reproducibility: `StdRng::seed_from_u64(42)`
+All randomness (data generation and, later, HNSW level assignment) comes from a
+`StdRng` with a fixed default seed; benchmarks are deterministic.
