@@ -1,2 +1,30 @@
+# Derleme çıktıları
 /target
+
+# Veri kümeleri ve ölçüm dizinleri (SIFT ~1 GB, checkpoint'ler ~800 MB).
+# Depoda ASLA olmamalı: yeniden üretilebilirler ve geçmişi kalıcı şişirirler.
 /data
+
+# Ölçüm dizinleri kök dışında da üretilebilir (report modları kendi
+# dizinlerini açıyor); dosya biçimlerini adla da yakala.
+*.gvdb
+MANIFEST
+*.wal
+
+# Profil çıktıları (release'de debug = true olduğu için profil alınabiliyor)
+perf.data
+perf.data.old
+*.profraw
+*.profdata
+flamegraph.svg
+
+# IDE / editör
+/.vscode
+/.idea
+*.iml
+*.swp
+
+# İşletim sistemi / OneDrive artıkları
+Thumbs.db
+desktop.ini
+.DS_Store
