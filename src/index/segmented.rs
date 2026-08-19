@@ -37,7 +37,7 @@ use crate::storage::{self, Manifest, SegmentRef, StorageError};
 use crate::types::{SearchResult, VectorId};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
 
 /// Segmentin diskteki karşılığı. Dosya adı yazıldığı generation'ı taşır ve
@@ -72,7 +72,9 @@ pub struct SegmentedIndex {
     /// geçici olarak devre dışı bırakmak gerekiyor (aksi halde "fsync
     /// politikası" ölçümü sessizce "HNSW inşası" ölçümüne dönüşür).
     seal_threshold: AtomicUsize,
-    segments: RwLock<Vec<Arc<Segment>>>,
+    /// `Arc` — merge arka plan thread'ine klonlanabilmesi için (9a-1).
+    /// Auto-deref sayesinde `self.segments.read()` çağrıları değişmedi.
+    segments: Arc<RwLock<Vec<Arc<Segment>>>>,
     buffer: RwLock<BruteForceIndex>,
     /// Sorgu genişliği (mühürlü segmentlerde).
     ef_search: usize,
@@ -109,8 +111,11 @@ pub struct SegmentedIndex {
     /// için: merge ayrı task'e alınsa bile MÜHÜRLEME yazıcıda kalır, yani
     /// iki pencere ayrı ayrı bilinmeli (birini diğerine yazmamak için).
     last_seal_us: AtomicU64,
-    last_merge_us: AtomicU64,
-    merge_count: AtomicU64,
+    /// Merge istatistikleri arka plan thread'inden güncellendiği için Arc.
+    merge_stats: Arc<MergeStats>,
+    /// Aynı anda en fazla bir merge; tavan yeniden aşılırsa worker döngüsü
+    /// devam eder (sıraya alma) — yeni thread doğurulmaz.
+    merge_in_flight: Arc<AtomicBool>,
     /// Açılışta yapılan WAL replay'inin raporu (gözlem / /stats).
     replay_report: RwLock<ReplayReport>,
 }
@@ -152,6 +157,88 @@ impl Default for PlannerConfig {
     }
 }
 
+/// Merge istatistikleri (arka plan thread'i günceller, okuyucular gözlemler).
+#[derive(Debug, Default)]
+struct MergeStats {
+    last_us: AtomicU64,
+    count: AtomicU64,
+}
+
+/// En küçük (canlı sayıya göre) iki segmenti tek segmentte yeniden inşa eder.
+/// **Arka plan thread'inde** koşar (9a-1) — `&self` yerine paylaşılan segment
+/// listesini alır, böylece yazıcı task'i bloke olmaz.
+///
+/// KRİTİK YARIŞ (bu fonksiyonun asıl zorluğu): mühürlü segment insert almaz
+/// ama **delete alır**. İnşa saniyeler sürerken kaynak segmentlere yeni
+/// tombstone düşebilir; inşa onları görmediği için o kayıtlar birleşiğe CANLI
+/// olarak kopyalanır. Takas anında, write kilidi altında, kaynakların GÜNCEL
+/// tombstone'ları ile inşa başındaki snapshot'ın FARKI birleşiğe uygulanır
+/// (diff-replay). Bu adım atlanırsa silinmiş kayıtlar sessizce geri gelir ve
+/// hiçbir latency ölçümü bunu yakalamaz.
+///
+/// Kilit disiplini: `delete_vector_only` tombstone'u `segments` READ kilidini
+/// tutarken yazar; takas `segments` WRITE kilidi alır. İkisi karşılıklı
+/// dışlamalı olduğu için "diff'i okudum, sonra yeni tombstone geldi, sonra
+/// takas ettim" penceresi YOKTUR.
+fn merge_smallest_pair_bg(
+    segments: &Arc<RwLock<Vec<Arc<Segment>>>>,
+    dim: usize,
+    metric: Metric,
+    hnsw_params: &HnswParams,
+) {
+    // 1. Kurbanları seç + tombstone SNAPSHOT'ını al (read kilidi kısa).
+    let (a, b, a_snap, b_snap) = {
+        let segs = segments.read().expect("kilit");
+        if segs.len() < 2 {
+            return;
+        }
+        let live = |s: &Arc<Segment>| s.index.len() - s.tombstones.read().expect("kilit").len();
+        let mut order: Vec<usize> = (0..segs.len()).collect();
+        order.sort_by_key(|&i| live(&segs[i]));
+        let a = segs[order[0]].clone();
+        let b = segs[order[1]].clone();
+        let a_snap = a.tombstones.read().expect("kilit").clone();
+        let b_snap = b.tombstones.read().expect("kilit").clone();
+        (a, b, a_snap, b_snap)
+    };
+
+    // 2. Kilitsiz yeniden inşa (asıl maliyet; okuyucular ve yazıcı çalışmaya
+    //    devam eder). Snapshot'taki tombstone'lular taşınmaz.
+    let mut params = hnsw_params.clone();
+    let total = a.index.len() + b.index.len();
+    params.seed = params.seed.wrapping_add(total as u64).wrapping_add(1);
+    let mut merged = HnswIndex::new(dim, metric, params);
+    for (seg, snap) in [(&a, &a_snap), (&b, &b_snap)] {
+        for (id, v) in seg.index.live_entries() {
+            if !snap.contains(&id) {
+                merged
+                    .insert(id, v)
+                    .expect("merge insert'i başarısız olamaz");
+            }
+        }
+    }
+
+    // 3. Atomik takas + diff-replay, TEK write kilidi altında.
+    let mut segs = segments.write().expect("kilit");
+    // Kaynaklar hâlâ listede mi? (Başka bir merge onları almış olabilir.)
+    if !segs.iter().any(|s| Arc::ptr_eq(s, &a)) || !segs.iter().any(|s| Arc::ptr_eq(s, &b)) {
+        return; // takas iptal: inşa boşa gitti ama tutarlılık korundu
+    }
+    // İnşa sırasında düşen YENİ tombstone'lar birleşiğe taşınır.
+    let mut carried: HashSet<VectorId> = HashSet::new();
+    for (seg, snap) in [(&a, &a_snap), (&b, &b_snap)] {
+        let now = seg.tombstones.read().expect("kilit");
+        carried.extend(now.difference(snap).copied());
+    }
+    let merged = Arc::new(Segment {
+        index: merged,
+        tombstones: RwLock::new(carried),
+        stored: RwLock::new(None), // birleşik yeni dosyaya yazılacak
+    });
+    segs.retain(|s| !Arc::ptr_eq(s, &a) && !Arc::ptr_eq(s, &b));
+    segs.push(merged);
+}
+
 /// MetaValue'nun sayısal izdüşümü (Range indeksine girenler).
 fn numeric_value(v: &MetaValue) -> Option<f64> {
     match v {
@@ -190,7 +277,7 @@ impl SegmentedIndex {
             metric,
             hnsw_params,
             seal_threshold: AtomicUsize::new(seal_threshold),
-            segments: RwLock::new(Vec::new()),
+            segments: Arc::new(RwLock::new(Vec::new())),
             buffer: RwLock::new(BruteForceIndex::new(dim, metric)),
             ef_search,
             metadata: RwLock::new(HashMap::new()),
@@ -203,8 +290,8 @@ impl SegmentedIndex {
             last_checkpoint: AtomicU64::new(0),
             wal: RwLock::new(None),
             last_seal_us: AtomicU64::new(0),
-            last_merge_us: AtomicU64::new(0),
-            merge_count: AtomicU64::new(0),
+            merge_stats: Arc::new(MergeStats::default()),
+            merge_in_flight: Arc::new(AtomicBool::new(false)),
             replay_report: RwLock::new(ReplayReport::default()),
         }
     }
@@ -673,12 +760,57 @@ impl SegmentedIndex {
         // BENCHMARKS'ta ölçülü).
         self.last_seal_us
             .store(t_seal.elapsed().as_micros() as u64, Ordering::Relaxed);
-        while self.segments.read().expect("kilit").len() > self.max_segments {
-            let t_merge = std::time::Instant::now();
-            self.merge_smallest_pair();
-            self.last_merge_us
-                .store(t_merge.elapsed().as_micros() as u64, Ordering::Relaxed);
-            self.merge_count.fetch_add(1, Ordering::Relaxed);
+        // 9a-1: merge artık yazıcıyı BLOKE ETMEZ — arka plan thread'ine gider.
+        self.spawn_merge_if_needed();
+    }
+
+    /// Tavan aşıldıysa arka planda merge başlatır. Zaten bir merge
+    /// çalışıyorsa yeni thread doğurulmaz: worker döngüsü tavana inene kadar
+    /// devam eder, yani yeni tetikler doğal olarak sıraya alınır.
+    fn spawn_merge_if_needed(&self) {
+        if self.segments.read().expect("kilit").len() <= self.max_segments {
+            return;
+        }
+        // "Aynı anda en fazla bir merge" — CAS ile.
+        if self.merge_in_flight.swap(true, Ordering::SeqCst) {
+            return; // çalışan worker yeni durumu görecek
+        }
+        let segments = Arc::clone(&self.segments);
+        let stats = Arc::clone(&self.merge_stats);
+        let in_flight = Arc::clone(&self.merge_in_flight);
+        let (dim, metric, max_segments) = (self.dim, self.metric, self.max_segments);
+        let params = self.hnsw_params.clone();
+        std::thread::spawn(move || {
+            loop {
+                while segments.read().expect("kilit").len() > max_segments {
+                    let t = std::time::Instant::now();
+                    merge_smallest_pair_bg(&segments, dim, metric, &params);
+                    stats
+                        .last_us
+                        .store(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    stats.count.fetch_add(1, Ordering::Relaxed);
+                }
+                in_flight.store(false, Ordering::SeqCst);
+                // Bayrağı bırakırken yeni segment eklenmiş olabilir: çift
+                // kontrol. Bayrağı geri alamazsak başka bir worker devraldı.
+                if segments.read().expect("kilit").len() <= max_segments
+                    || in_flight.swap(true, Ordering::SeqCst)
+                {
+                    break;
+                }
+            }
+        });
+    }
+
+    /// Arka planda merge var mı?
+    pub fn merge_in_flight(&self) -> bool {
+        self.merge_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Testler/ölçüm için: arka plan merge'i bitene kadar bekler.
+    pub fn wait_for_merge(&self) {
+        while self.merge_in_flight.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
 
@@ -687,13 +819,14 @@ impl SegmentedIndex {
         self.last_seal_us.load(Ordering::Relaxed)
     }
 
-    /// Son merge süresi (µs) ve toplam merge sayısı.
+    /// Son merge süresi (µs) ve toplam merge sayısı. 9a-1'den sonra bu süre
+    /// ARKA PLAN thread'inde geçen süredir — yazıcı o sırada bloke değildir.
     pub fn last_merge_us(&self) -> u64 {
-        self.last_merge_us.load(Ordering::Relaxed)
+        self.merge_stats.last_us.load(Ordering::Relaxed)
     }
 
     pub fn merge_count(&self) -> u64 {
-        self.merge_count.load(Ordering::Relaxed)
+        self.merge_stats.count.load(Ordering::Relaxed)
     }
 
     /// WAL politikasını değiştirir (aynı dosyaya devam eder). Ölçümde üç
@@ -735,50 +868,6 @@ impl SegmentedIndex {
             .map(|(k, fi)| k.len() + fi.memory_bytes())
             .sum();
         (meta_bytes, post_bytes, num_bytes)
-    }
-
-    /// En küçük (canlı sayıya göre) iki segmenti tek segmentte yeniden inşa
-    /// eder. Merge doğal compaction: tombstone'lular yeni segmente taşınmaz,
-    /// merged segmentin tombstone kümesi boş başlar.
-    fn merge_smallest_pair(&self) {
-        // 1. Kurbanları seç (read kilidi kısa; Arc klonları inşa boyunca yaşar).
-        let (a, b) = {
-            let segments = self.segments.read().expect("kilit");
-            if segments.len() < 2 {
-                return;
-            }
-            let live = |s: &Arc<Segment>| s.index.len() - s.tombstones.read().expect("kilit").len();
-            let mut order: Vec<usize> = (0..segments.len()).collect();
-            order.sort_by_key(|&i| live(&segments[i]));
-            (segments[order[0]].clone(), segments[order[1]].clone())
-        };
-        // 2. Kilitsiz yeniden inşa. Tek yazıcı sözleşmesi: bu sırada delete
-        // gelemez, tombstone kümeleri donmuş sayılır.
-        let mut params = self.hnsw_params.clone();
-        let total = a.index.len() + b.index.len();
-        params.seed = params.seed.wrapping_add(total as u64).wrapping_add(1);
-        let mut merged = HnswIndex::new(self.dim, self.metric, params);
-        for seg in [&a, &b] {
-            let tombs = seg.tombstones.read().expect("kilit");
-            for (id, v) in seg.index.live_entries() {
-                if !tombs.contains(&id) {
-                    merged
-                        .insert(id, v)
-                        .expect("merge insert'i başarısız olamaz");
-                }
-            }
-        }
-        let merged = Arc::new(Segment {
-            index: merged,
-            tombstones: RwLock::new(HashSet::new()),
-            stored: RwLock::new(None), // birleşik yeni dosyaya yazılacak
-        });
-        // 3. Atomik takas: iki kaynağı çıkar, birleşiği ekle. Arc kimliğiyle
-        // eşle — indeksler inşa sırasında kaymış olabilir (tek yazıcıda
-        // kaymaz ama kimlik eşleme varsayım taşımaz).
-        let mut segments = self.segments.write().expect("kilit");
-        segments.retain(|s| !Arc::ptr_eq(s, &a) && !Arc::ptr_eq(s, &b));
-        segments.push(merged);
     }
 
     /// Paylaşımlı (&self) silme — tek yazıcı thread'inden.
@@ -1512,6 +1601,119 @@ mod tests {
         assert_eq!(res[0].id, VectorId(7));
     }
 
+    // ---- 9a-1: arka plan merge + tombstone yarışı ----
+
+    /// 9a-1'in ASIL kabul kriteri: merge SÜRERKEN kaynak segmentlere düşen
+    /// tombstone'lar kaybolmamalı. Merge inşası kaynakların o anki canlı
+    /// kayıtlarını kopyalar; inşa sırasında silinen kayıtlar birleşiğe canlı
+    /// olarak geçer ve diff-replay onları tombstone'lamazsa **sessizce geri
+    /// gelir**. Latency ölçümü bunu asla yakalamaz.
+    #[test]
+    fn merge_carries_tombstones_created_during_build() {
+        // Merge'i uzun tutmak için görece büyük segmentler; silmeleri merge
+        // penceresine denk getirmek için yazıcı thread'i merge başladıktan
+        // sonra siler.
+        let vecs = random_vectors(3_000, 16, 42);
+        let mut idx = SegmentedIndex::new(16, Metric::L2, HnswParams::default(), 500);
+        idx.set_max_segments(4);
+        let idx = Arc::new(idx);
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert_shared(VectorId(i as u64), v).unwrap();
+        }
+        // Bu noktada 6 segment mühürlendi, tavan 4 → merge arka planda başladı.
+        // Merge sürerken sil: kurbanlar en küçük iki segment, hangi id'lerin
+        // onlara düştüğünü bilmediğimiz için geniş bir aralığı siliyoruz.
+        let mut deleted: Vec<VectorId> = Vec::new();
+        let mut i = 0u64;
+        let mut during_merge = 0usize; // yarışın gerçekten tetiklendiğini doğrular
+        while idx.merge_in_flight() && i < 400 {
+            during_merge += 1;
+            let id = VectorId(i);
+            if idx.delete_shared(id).is_ok() {
+                deleted.push(id);
+            }
+            i += 1;
+        }
+        // Merge devam etmiyorsa da en az birkaç silme yapalım (yarış her
+        // koşuda tetiklenmeyebilir; test yine de doğruluğu sınar).
+        for extra in i..(i + 50).min(3_000) {
+            let id = VectorId(extra);
+            if idx.delete_shared(id).is_ok() {
+                deleted.push(id);
+            }
+        }
+        idx.wait_for_merge();
+
+        assert!(!deleted.is_empty(), "hiç silme yapılamadı");
+        assert!(
+            during_merge > 0,
+            "merge penceresi yakalanamadı — yarış SINANMADI, test sessizce zayıflamış"
+        );
+        // 1) Silinenlerin HİÇBİRİ aramada dönmemeli.
+        let all: HashSet<VectorId> = idx
+            .search_shared(&vecs[0], 3_000)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        for id in &deleted {
+            assert!(
+                !all.contains(id),
+                "silinen {id:?} merge sonrası geri geldi (diff-replay kaçağı)"
+            );
+        }
+        // 2) len tutarlı olmalı.
+        assert_eq!(idx.len(), 3_000 - deleted.len(), "canlı sayı tutarsız");
+        // 3) Silinmeyenler hâlâ bulunabilmeli.
+        let deleted_set: HashSet<VectorId> = deleted.iter().copied().collect();
+        let survivor = (0..3_000u64)
+            .map(VectorId)
+            .find(|id| !deleted_set.contains(id))
+            .expect("hayatta kalan yok");
+        let res = idx.search_shared(&vecs[survivor.0 as usize], 1);
+        assert_eq!(res[0].id, survivor, "hayatta kalan kayıt kayboldu");
+    }
+
+    /// Merge arka planda çalışırken aramalar durmamalı ve tutarlı sonuç
+    /// vermeli (okuyucular ya eski ikiliyi ya birleşiği görür).
+    #[test]
+    fn searches_stay_consistent_during_background_merge() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let vecs = random_vectors(2_500, 8, 42);
+        let mut idx = SegmentedIndex::new(8, Metric::L2, HnswParams::default(), 400);
+        idx.set_max_segments(3);
+        let idx = Arc::new(idx);
+        for (i, v) in vecs.iter().enumerate() {
+            idx.insert_shared(VectorId(i as u64), v).unwrap();
+        }
+        let stop = AtomicBool::new(false);
+        let mismatch = AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..3 {
+                let (idx, stop, mismatch) = (&idx, &stop, &mismatch);
+                let vecs = &vecs;
+                sc.spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        // Her sorgunun kendi vektörü ilk sırada dönmeli
+                        for probe in [7usize, 500, 1200, 2400] {
+                            let r = idx.search_shared(&vecs[probe], 1);
+                            if r.is_empty() || r[0].id != VectorId(probe as u64) {
+                                mismatch.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+            idx.wait_for_merge();
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert_eq!(
+            mismatch.load(Ordering::Relaxed),
+            0,
+            "merge sırasında arama tutarsız sonuç verdi"
+        );
+        assert_eq!(idx.len(), 2_500);
+    }
+
     // ---- Kalıcılık: soğuk yol testleri (Aşama 7a) ----
 
     fn meta_of(i: usize) -> Metadata {
@@ -1742,6 +1944,7 @@ mod tests {
             }
             idx.checkpoint().unwrap();
             // merge'ler tavanı korumuş olmalı
+            idx.wait_for_merge(); // 9a-1: merge arka planda, bekle
             assert!(idx.shape().0 <= 4);
             let g = idx.checkpoint().unwrap();
             (idx.len(), g)
@@ -1782,8 +1985,12 @@ mod tests {
         for (i, v) in vecs.iter().enumerate() {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
         }
+        // 9a-1: merge artık arka planda. Mühürleme merge'den hızlı olduğu
+        // için segment sayısı GEÇİCİ olarak tavanı aşabilir; yazma durunca
+        // worker tavana indirir. Tavan kontrolü bu yüzden bekleyerek yapılır.
+        idx.wait_for_merge();
         let (n_seg, _) = idx.shape();
-        assert!(n_seg <= 4, "tavan aşıldı: {n_seg}");
+        assert!(n_seg <= 4, "merge bitince tavan korunmalı: {n_seg}");
         assert_eq!(idx.len(), 1_200, "merge kayıt kaybetti");
         // doğruluk: exact referansla örtüşme
         let queries = random_vectors(20, 8, 43);
@@ -1821,6 +2028,7 @@ mod tests {
         for (i, v) in vecs.iter().enumerate().skip(300) {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
         }
+        idx.wait_for_merge(); // merge arka planda (9a-1)
         let (n_seg, _) = idx.shape();
         assert!(n_seg <= 3);
         assert_eq!(idx.len(), 599); // 600 - 1 kalıcı silme

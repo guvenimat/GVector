@@ -758,7 +758,7 @@ fn main() {
     let (base, queries, label) = match mode {
         "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter"
         | "segcurve" | "mergecost" | "rangefilter" | "durability" | "wal" | "fullscale"
-        | "int8scale" | "coldprofile" => {
+        | "int8scale" | "coldprofile" | "mergewindow" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -795,6 +795,119 @@ fn main() {
 
     if mode == "filter" {
         filter_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "mergewindow" {
+        // 9a-1 ölçümü: merge arka plana alındıktan sonra yazıcının bloke
+        // olduğu pencere ne kadar? Ön-kayıtlı eşik (DECISIONS #40): merge
+        // penceresine denk gelen yazmaların p99'u, taban p99'un 50 katını
+        // aşmamalı. ÖLÇÜM KOŞULU Aşama 8 ile aynı tutulur (WAL group:20,
+        // döngü içinde commit YOK) — fsync'li ölçüm eşiği 9a ne kadar iyi
+        // olursa olsun otomatik aşardı.
+        use vector_gvector::index::segmented::SegmentedIndex;
+        use vector_gvector::meta::Metadata;
+        use vector_gvector::storage::wal::SyncPolicy;
+
+        let dir = std::path::PathBuf::from("data/fullscale");
+        if !dir.join("MANIFEST").exists() {
+            eprintln!("data/fullscale yok — önce `report -- fullscale 1000000 99` koş");
+            return;
+        }
+        let idx = SegmentedIndex::open_durable(
+            dir.clone(),
+            dim,
+            metric,
+            HnswParams::default(),
+            125_000,
+            SyncPolicy::Group { window_ms: 20 },
+        )
+        .expect("aç");
+        let (seg0, buf0) = idx.shape();
+        println!(
+            "başlangıç: {seg0} segment + {buf0} buffer, {} kayıt, tavan 8",
+            idx.len_shared()
+        );
+
+        // Warmup: birkaç bin yazma (taban p99'un ısınmış ölçülmesi için).
+        // Id tabanı mevcut kayıt sayısına göre kayar: dizin kalıcı olduğu
+        // için sabit taban ikinci koşuda DuplicateId panic'i veriyordu.
+        let base_id = 100_000_000u64 + idx.len_shared() as u64 * 4;
+        for i in 0..5_000usize {
+            idx.insert_with_meta(
+                VectorId(base_id + i as u64),
+                &base[i % base.len()],
+                Metadata::new(),
+            )
+            .expect("warmup insert");
+        }
+
+        // Ölçüm: mühürleme eşiğini aşacak kadar yazma → seal + (arka plan) merge.
+        let extra = idx.seal_threshold() + 5_000;
+        println!("{extra} yazma ölçülüyor (pencere öncesi+sonrası örnekleme dahil)...");
+        let mut lats: Vec<std::time::Duration> = Vec::with_capacity(extra);
+        let t_all = Instant::now();
+        for i in 0..extra {
+            let id = VectorId(base_id + 1_000_000 + i as u64);
+            let t = Instant::now();
+            idx.insert_with_meta(id, &base[i % base.len()], Metadata::new())
+                .expect("insert");
+            lats.push(t.elapsed());
+        }
+        let wall = t_all.elapsed();
+        idx.commit_wal().expect("commit");
+
+        let mut sorted = lats.clone();
+        sorted.sort();
+        let pct = |p: f64| sorted[((sorted.len() as f64 * p) as usize).min(sorted.len() - 1)];
+        let max_lat = *sorted.last().unwrap();
+        // Taban: en uzun 3 çağrı (seal/merge tetikleyenler) hariç p99
+        let cut = sorted.len().saturating_sub(3);
+        let base_p99 = sorted[(cut as f64 * 0.99) as usize];
+        let ratio = max_lat.as_secs_f64() / base_p99.as_secs_f64().max(1e-9);
+
+        println!();
+        println!("| ölçüm | değer |");
+        println!("|-------|-------|");
+        println!("| toplam süre (yazıcı thread) | {wall:.2?} |");
+        println!("| taban p50 | {:?} |", pct(0.5));
+        println!("| taban p99 (seal/merge çağrıları hariç) | {base_p99:?} |");
+        println!("| **en uzun tek yazma** | **{max_lat:.3?}** |");
+        println!(
+            "| son mühürleme (yazıcıyı bloke eden) | {:?} |",
+            std::time::Duration::from_micros(idx.last_seal_us())
+        );
+        println!(
+            "| ön-kayıtlı eşik 50x | **{}** |",
+            if ratio <= 50.0 {
+                "GEÇTİ"
+            } else {
+                "GEÇMEDİ"
+            }
+        );
+        // Merge istatistikleri ANCAK worker bitince anlamlı: ölçüm anında
+        // merge hâlâ arka planda koşuyor olabilir (ilk koşuda 0 görünmüştü).
+        let merge_running_at_end = idx.merge_in_flight();
+        idx.wait_for_merge();
+        println!(
+            "| son merge (ARKA PLAN, yazıcıyı bloke ETMEZ) | {:?} |",
+            std::time::Duration::from_micros(idx.last_merge_us())
+        );
+        println!("| merge sayısı | {} |", idx.merge_count());
+        println!(
+            "| ölçüm biterken merge çalışıyor muydu | {} |",
+            if merge_running_at_end {
+                "EVET (örtüşme doğrulandı)"
+            } else {
+                "hayır"
+            }
+        );
+        let (seg1, buf1) = idx.shape();
+        println!();
+        println!(
+            "merge bitince: {seg1} segment + {buf1} buffer, {} kayıt",
+            idx.len_shared()
+        );
         return;
     }
 

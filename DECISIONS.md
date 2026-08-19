@@ -1,5 +1,55 @@
 # Mimari Kararlar
 
+## Aşama 9a-1 — merge arka planda — 2026-08-19
+
+### 46. Merge yazıcı task'inden ayrıldı; kalan pencere tamamen mühürleme
+Uygulama: `segments` alanı `Arc<RwLock<...>>` oldu (auto-deref sayesinde
+mevcut çağrılar değişmedi), merge `merge_smallest_pair_bg` serbest
+fonksiyonuna taşındı ve `spawn_merge_if_needed` ile arka plan thread'inde
+koşuyor. "Aynı anda en fazla bir merge" bir CAS bayrağıyla; tavan yeniden
+aşılırsa worker döngüsü devam ediyor (yeni thread doğmuyor, tetikler
+doğal olarak sıraya giriyor).
+
+**Ölçüm (BENCHMARKS, iki koşu):** yazıcının bloke olduğu en uzun pencere
+**80.5 s → 28.5/30.6 s (2.8x daralma)**; kalan sürenin TAMAMI mühürleme.
+Merge artık 53–54 s sürüyor ama **arka planda** ("ölçüm biterken merge
+çalışıyor muydu: EVET" ile örtüşme doğrulandı).
+
+- **Ön-kayıtlı 50x eşiği GEÇİLMEDİ** (oran ~2.8–3.6 milyon x). Bu ön-kayıtta
+  zaten öngörülmüştü: "9a-1'de geçilmez, raporlanır". Eşik 9a-2 sonrası
+  sınanacak; şu anki tek engel mühürleme.
+- **Dürüst bedel:** mühürlemenin kendisi 20.8 s → 28–30 s'ye çıktı (%40).
+  Sebep merge'in artık paralel koşup CPU paylaşması. "Arka plana almak
+  bedava değil" — net kazanç yine de 80.5 → 29 s.
+
+### 47. ASIL kabul kriteri: tombstone diff-replay yarışı (geçti)
+Mühürlü segment insert almaz ama **delete alır**. Merge inşası saniyeler
+sürerken kaynaklara yeni tombstone düşerse, o kayıtlar birleşiğe CANLI
+kopyalanır ve silinmiş kayıtlar **sessizce geri gelir** — hiçbir latency
+ölçümü bunu yakalamaz. Çözüm: inşa başında tombstone SNAPSHOT'ı alınır,
+takas anında write kilidi altında güncel tombstone'larla FARK hesaplanıp
+birleşiğe taşınır (diff-replay).
+
+Yarış penceresi **yapısal olarak** kapalı: `delete_vector_only` tombstone'u
+`segments` READ kilidini tutarken yazar, takas WRITE kilidi alır → ikisi
+karşılıklı dışlamalı. "Diff'i okudum, sonra tombstone geldi, sonra takas
+ettim" durumu oluşamaz.
+
+Test (`merge_carries_tombstones_created_during_build`) yarışın gerçekten
+tetiklendiğini `during_merge > 0` ile doğruluyor — aksi halde test sessizce
+zayıflardı. Ayrıca merge sırasında arama tutarlılığı ve merge ortasında
+çökme kurtarması ayrı testlerde.
+
+### 48. Yeni davranış: segment sayısı geçici olarak tavanı aşabilir
+Merge asenkron olduğu için mühürleme merge'den hızlıysa segment sayısı
+tavanın üstüne çıkıyor (ölçümde 9–11 segment gözlendi); yazma durunca
+worker tavana indiriyor. Bu, Lucene benzeri sistemlerde de normaldir.
+**Ertelenen iş:** sürekli yüksek yazma hızında birikme sınırsız olabilir;
+gerekirse backpressure (ör. segment sayısı 2×tavanı aşarsa yazmayı
+yavaşlatma) eklenir. Yeniden bakma koşulu: kalıcı yazma yükü altında
+segment sayısı 2×tavanı aşarsa.
+
+
 ## Aşama 8a — int8 ölçeklenmesi — 2026-08-19
 
 ### 44. DÜZELTME: "1M'de okuma ölçeklenmiyor" bulgusu (#43) YANLIŞTI

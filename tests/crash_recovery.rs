@@ -300,3 +300,73 @@ proptest! {
         prop_assert!(idx.is_ok() || idx.is_err());
     }
 }
+
+/// 9a-1: merge ARKA PLANDA sürerken süreç ölürse, kurtarma eski (kaynak)
+/// segmentlerle tutarlı olmalı. Merge çıktısı henüz hiçbir checkpoint'e
+/// yazılmadığı için manifest kaynakları işaret eder; kaynaklar aynı veriyi
+/// içerdiğinden kayıp olmaz — merge yalnız bir yeniden düzenlemedir.
+#[test]
+fn crash_during_background_merge_recovers_from_source_segments() {
+    let vecs = random_vectors(1_200, DIM, 11);
+    let dir = temp_dir("crash-during-merge");
+    let (expected_live, merge_was_running) = {
+        let mut idx = SegmentedIndex::open_durable(
+            dir.clone(),
+            DIM,
+            Metric::L2,
+            HnswParams::default(),
+            200,
+            SyncPolicy::PerOp,
+        )
+        .unwrap();
+        idx.set_max_segments(3);
+        // İlk yarı + checkpoint: bu veri segment dosyalarında.
+        for (i, v) in vecs.iter().take(600).enumerate() {
+            idx.insert_with_meta(VectorId(i as u64), v, meta_for(i as u64))
+                .unwrap();
+        }
+        idx.wait_for_merge();
+        idx.checkpoint().unwrap();
+        // İkinci yarı: tavanı aşar → merge arka planda başlar. Checkpoint YOK,
+        // yani bu kayıtlar yalnız WAL'da.
+        for (i, v) in vecs.iter().enumerate().skip(600) {
+            idx.insert_with_meta(VectorId(i as u64), v, meta_for(i as u64))
+                .unwrap();
+        }
+        idx.delete_shared(VectorId(5)).unwrap(); // segmentteki kayıt
+        idx.delete_shared(VectorId(900)).unwrap(); // WAL'daki kayıt
+        idx.flush_wal().unwrap();
+        let running = idx.merge_in_flight();
+        let live = idx.len();
+        // "Çökme": checkpoint yapmadan bırak. Arka plan merge'i yarıda kalır.
+        drop(idx);
+        (live, running)
+    };
+    assert_eq!(expected_live, 1_198);
+
+    let idx = SegmentedIndex::open_durable(
+        dir,
+        DIM,
+        Metric::L2,
+        HnswParams::default(),
+        200,
+        SyncPolicy::PerOp,
+    )
+    .expect("merge ortasında kesilen dizin açılmalı");
+    assert_eq!(
+        idx.len(),
+        1_198,
+        "merge ortasında kesme kayıt kaybetti (merge_was_running={merge_was_running})"
+    );
+    let all: HashSet<u64> = idx
+        .search_shared(&[0.0; DIM], 2_000)
+        .iter()
+        .map(|r| r.id.0)
+        .collect();
+    assert!(!all.contains(&5), "silinen segment kaydı geri geldi");
+    assert!(!all.contains(&900), "silinen WAL kaydı geri geldi");
+    // Sağ kalanlar bulunabilmeli
+    for probe in [0u64, 300, 700, 1_199] {
+        assert!(all.contains(&probe), "kayıt {probe} kayboldu");
+    }
+}

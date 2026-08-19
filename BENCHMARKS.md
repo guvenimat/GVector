@@ -1,5 +1,38 @@
 # Benchmark Kayıtları
 
+## Aşama 9a-1 — merge arka plana alındı — 2026-08-19 (SIFT 1M, tam sistem)
+
+Ölçüm protokolü 8a'daki gibi: izole süreç, warmup (5.000 yazma), iki ayrı
+koşuda tekrar. Ölçüm koşulu Aşama 8 ile aynı (WAL group:20, döngü içinde
+commit yok) — ön-kayıtlı 50x eşiği fsync'siz taban üzerinden tanımlı.
+
+| ölçüm | Aşama 8 (merge senkron) | 9a-1 (merge arka planda) |
+|---|---|---|
+| **yazıcının bloke olduğu en uzun pencere** | **80.5 s** | **28.5 s / 30.6 s** |
+| — bileşenleri | mühürleme 20.8 s + merge 59.7 s | yalnız mühürleme 28.5 / 30.6 s |
+| merge süresi | (yazıcıda) 59.7 s | (arka planda) 53.5 s / 54.0 s |
+| merge sayısı | 1 | 2 / 4 |
+| taban yazma p50 | 600 ns | 1.2 µs / 1.3 µs |
+| taban yazma p99 | 7.8 µs | 10.1 µs / 8.4 µs |
+| oran (max / taban p99) | 10.3 M x | 2.8 M x / 3.6 M x |
+| ön-kayıtlı 50x eşiği | geçilmedi | **geçilmedi (beklenen)** |
+
+"Ölçüm biterken merge çalışıyor muydu: **EVET**" — yani merge ile yazma
+akışının örtüştüğü doğrulandı; merge artık gerçekten paralel koşuyor.
+
+**Okumalar:**
+- Yazıcının bloke olduğu süre **80.5 s → ~29 s (2.8x daralma)**; kalan
+  sürenin tamamı **mühürleme**, yani 9a-2'nin hedefi ölçümle doğrulandı.
+- Dürüst bir bedel: mühürlemenin KENDİSİ 20.8 s → 28–30 s'ye çıktı (%40).
+  Sebep, merge'in artık paralel koşup CPU paylaşması. Net kazanç yine de
+  büyük (80.5 → 29), ama "merge'i arka plana almak bedava" değil.
+- 50x eşiği bu adımda geçilmedi ve bu **ön-kayıtta zaten öngörülmüştü**
+  ("9a-1'de geçilmez, raporlanır"). Eşik 9a-2'den sonra tekrar sınanacak.
+- Segment sayısı geçici olarak tavanı aşıyor (koşu başlangıçlarında 9 ve 10;
+  mühürleme merge'den hızlı). Yazma durunca worker tavana indiriyor
+  (her iki koşu 8 segmentle bitti).
+
+
 ## Aşama 8a — int8 çoklu-okuyucu ölçeklenmesi — 2026-08-19
 
 Makine: **AMD Ryzen 7 7800X3D, 8 fiziksel / 16 mantıksal çekirdek, L3 = 96 MB**
@@ -104,11 +137,17 @@ ama s=0.3 hücresinde latency 100K'daki 3.9 ms'den 92.7 ms'ye çıktı (23x, ver
 | `per_op` | 937 | **0.99** | 200 | 8.55 ms |
 
 **Aşama 5 sözleşmesi sınavı geçildi:** fsync politikası okuyuculara ölçülebilir
-bir yük bindirmiyor (oran 0.99–1.01). Ama ikinci bir bulgu var: 1M'de okuma
-**hiç ölçeklenmiyor** — tek thread 1048 QPS (954 µs), 8 thread toplam 945 QPS.
-100K'da 8.7x ölçekleniyordu. Neden: 882 MB'lık veri üzerinde rastgele erişim,
-8 thread bellek bant genişliği duvarına çarpıyor. Bu, int8 quantization'ın
-(4x az bellek trafiği) 1M+ ölçekte neden değerli olacağının kanıtı.
+bir yük bindirmiyor (oran 0.99–1.01). Bu ORANSAL sonuç geçerliliğini koruyor.
+
+> ⚠️ **DÜZELTME (2026-08-19, DECISIONS #44):** Bu tablodaki **mutlak QPS
+> değerleri geçersizdir** ve buradan çıkarılan "1M'de okuma hiç ölçeklenmiyor"
+> sonucu **YANLIŞTI**. İzole ölçüm (Aşama 8a) f32'nin 1M'de **5.4–6.1x**
+> ölçeklendiğini gösterdi. Hata kaynağı: bu tablo, 5 dakikadır çalışan,
+> 1M inşa + 130K yazma + merge + üç soğuk başlangıç yapmış, RSS'i 3.1 GB'a
+> çıkmış bir süreçte `fullscale`'in son bölümü olarak alınmıştı. Aynı
+> şüpheyle bu koşunun diğer MUTLAK rakamları da (merge penceresi, soğuk
+> başlangıç bileşenleri) izole ölçümle teyit edilmelidir; merge penceresi
+> 9a-1'de teyit edildi (yukarıdaki bölüm).
 
 ### Kaza testi (1M snapshot + dolu WAL)
 
