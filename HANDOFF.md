@@ -1,84 +1,86 @@
-# Devir Notu — proje KAPANDI (v0.1.0, 2026-08-19)
+# Handoff note — project CLOSED (v0.1.0, 2026-08-19)
 
-Bu dosya, oturum değiştiğinde kaybolmaması gereken **bağlamı** taşır.
-Kararların gerekçeleri `DECISIONS.md`'de, ölçümler `BENCHMARKS.md`'de,
-yapılmayanlar `NOT-DONE.md`'de, ölçüm dersleri `METHODOLOGY.md`'de.
+This file carries the **context** that must not be lost when a session ends.
+Rationale lives in `DECISIONS.md`, measurements in `BENCHMARKS.md`, what was
+not done in `NOT-DONE.md`, and measurement lessons in `METHODOLOGY.md`.
 
-## Durum
+## Status
 
-Aşama 0–10 tamamlandı, **v0.1.0 etiketlendi**. Proje kapanış durumunda:
-yeni özellik geliştirilmiyor. Devam edilecekse aşağıdaki backlog'dan
-seçilir.
+Phases 0–10 are complete and **v0.1.0 is tagged**. The project is in a closed
+state: no new features are being developed. If work resumes, it should be
+picked from the backlog below.
 
-| aşama | durum |
+| phase | status |
 |---|---|
-| 0–7 | bitti (HNSW, kalıcılık, WAL, filtreler, planlayıcı, segment tavanı) |
-| 8 + 8a | bitti — 8'in hatalı bulgusu #44'te düzeltildi; int8 reddedildi (#45) |
-| 9a-1, 9a-2 | bitti — pencere 80.5 s → 0–2 µs; tek worker + backpressure (#53) |
-| 9b | NO-GO — `deny(unsafe_code)` açılmadı |
-| 9c | bitti — metadata 934 → 618 MB (#64, #65) |
-| 9d | ertelendi |
-| 10 | bitti — README, NOT-DONE, METHODOLOGY, CHANGELOG, v0.1.0 |
+| 0–7 | done (HNSW, persistence, WAL, filters, planner, merge ceiling) |
+| 8 + 8a | done — phase 8's wrong finding corrected in #44; int8 rejected (#45) |
+| 9a-1, 9a-2 | done — window 80.5 s → 0–2 µs; single worker + backpressure (#53) |
+| 9b | NO-GO — `deny(unsafe_code)` was not lifted |
+| 9c | done — metadata 934 → 618 MB (#64, #65) |
+| 9d | deferred |
+| 10 | done — README, NOT-DONE, METHODOLOGY, CHANGELOG, v0.1.0 |
 
-## Backlog (yeniden bakma koşullarıyla)
+## Backlog (with revisit conditions)
 
-| kalem | yeniden bakma koşulu |
+| item | revisit condition |
 |---|---|
-| **Segment birikmesi** (#62) — sistemin tek sınırsız büyüyen boyutu; mühürleme 25 s'de üretiyor, merge 54 s'de eksiltiyor | sürekli yazma yükü öngörülen kullanımın parçası olursa |
-| **Sayısal alanlar için Eq posting'ini kaldırmak** (#68) — tekrarın kaldırılması; kalan metadata payının iki büyük kalemi aynı kökten besleniyor | metadata belleği yeniden sınırlayıcı olursa |
-| **Sayısal indekslerin sıkıştırılması** (#67) — 197 MB | bellek sınırlayıcı olursa VE kesin-sayım kolunun regresyon testleri güçlendirilebilirse |
-| **9d — türetilmiş indeks snapshot'ı** | soğuk başlangıç süresi kullanıcıya görünür olursa (çok kullanıcılı / sık yeniden başlatma) |
-| **mmap / unsafe (9b)** (#40) | vektör verisi RAM'e sığmaz hale gelirse |
-| **`metadata_memory_bytes()` düzeltmesi** (#66) | `/stats` rakamıyla kapasite planlaması yapılacaksa (şu an gerçeğin ~%77'sini gösteriyor) |
-| **#61'in ikincil kalemine eşik** — backpressure bekleme dağılımı | veri `accumulation` modundan toplanır, `mergewindow` üretmiyor |
+| **Segment accumulation** (#62) — the one unbounded dimension left; sealing produces one every 25 s, merging removes one every 54 s | if sustained write load becomes part of the intended usage |
+| **Drop Eq postings for numeric fields** (#68) — removal of a duplication; the two largest remaining metadata items share one root cause | if metadata memory becomes constraining again |
+| **Compact the numeric indexes** (#67) — 197 MB | if memory becomes constraining **and** the regression tests for the exact-counting arm can be strengthened in the same round |
+| **9d — snapshotting derived indexes** | if cold-start time becomes visible to users (multi-user / frequent restarts) |
+| **mmap / unsafe (9b)** (#40) | if vector data no longer fits in RAM |
+| **Fix `metadata_memory_bytes()`** (#66) | if anyone plans capacity from the `/stats` number (it currently shows ~77% of actual) |
+| **A threshold for #61's secondary item** — backpressure stall distribution | data comes from the `accumulation` mode; `mergewindow` does not produce it |
 
-## Sözleşmeler (gerileme yasak)
+## Contracts (no regressions allowed)
 
-Tek yazar (mpsc → tek yazıcı task) · okuyucular mühürleme/merge sırasında
-durmaz · HTTP 200 = politikanın vaat ettiği dayanıklılık (#36, varsayılan
-group:20) · seed=42 · 1M recall ef=100 ≥ 0.99 · kol örtüşmesi %100 ·
-filtre boş/eşdeğer-boşsa `search_shared` kısayolu · `#![deny(unsafe_code)]` ·
-clippy uyarısız + fmt + tüm testler yeşil (şu an **118 unit + 6 kaza**).
+Single writer (mpsc → one writer task) · readers never stop during
+sealing/merging · HTTP 200 = the durability the policy promises (#36, default
+group:20) · seed=42 · 1M recall at ef=100 ≥ 0.99 · arm agreement 100% ·
+`search_shared` shortcut when the filter is empty or equivalent-to-empty ·
+`#![deny(unsafe_code)]` · clippy clean + rustfmt + all tests green (currently
+**118 unit + 6 crash**).
 
-## Ön-kayıt kuralı
+## The pre-registration rule
 
-Eşik, onu değerlendirecek ölçüm koşulmadan ÖNCE yazılır ve sonradan
-değiştirilmez. Karşılanmayan eşik "karşılanmadı" olarak durur; gerekiyorsa
-yanına kusur kaydı yazılır. Eşik yazarken şu soru DA sorulur:
-**"Bu kriter, başka hangi kriterle çelişebilir?"** (#63 — 9a-2'de kriter 2'yi
-geçiren mekanizma kriter 1'i geçilemez hale getirdi.)
+A threshold is written **before** the measurement that will evaluate it, and is
+not changed afterwards. A threshold that is not met stays "not met"; if
+warranted, a defect record is written beside it. When writing a threshold, also
+ask: **"Which other criterion could this one conflict with?"** (#63 — in 9a-2
+the mechanism that passed criterion 2 made criterion 1 impossible to pass.)
 
-## Bu projede öğrenilmiş tuzaklar
+## Pitfalls learned in this project
 
-Uzun hâli `METHODOLOGY.md`'de. Kısa liste:
+The long form is in `METHODOLOGY.md`. Short list:
 
-1. **Ölçüm izole süreçte yapılır** — uzun koşunun sonuna eklenen ölçüm
-   ölçtüğünü sandığın şeyi ölçmez (#44). Taze süreç, warmup, 3 tekrar
-   medyanı, iki koşuda doğrulama.
-2. **Ölçüm çıktısını grep'leyerek okuma** — panic gizlenir, pipe `exit 0`
-   döner.
-3. **Eşzamanlılık testleri yarışın tetiklendiğini ölçmeli**
+1. **Measure in an isolated process** — a measurement appended to the end of a
+   long run does not measure what you think (#44). Fresh process, warmup,
+   median of 3, confirmation across two runs.
+2. **Never read measurement output through `grep`** — panics are hidden and the
+   pipe returns `exit 0`.
+3. **Concurrency tests must assert the race was triggered**
    (`during_merge > 0`, `stalls > 0`, `max_queue > 0`).
-4. **`data/fullscale` kalıcıdır** — ölçüm modları id çakışmasına karşı
-   korunmalı; karşılaştırmadan önce dizin sıfırdan kurulmalı (koşular
-   biriktikçe 1M → 1.64M oluyor).
-5. **Eşik ile karar ayrı şeylerdir** — eşik geçse bile dayandığı varsayım
-   çürüdüyse karar farklı olabilir (#45).
-6. **Resmi SIFT ground truth yalnız tam 1M taban için geçerli.**
-7. **bincode untagged serde'yi deserialize edemez** (#35).
-8. **Rust kilit tuzakları** (#54): iki kilidi tek ifadede alma (geçiciler
-   satır sonuna kadar yaşar); `while let` scrutinee'si GÖVDE boyunca yaşar
-   (`let ... else` kullan). Kilit sırası: **segments → sealing → buffer**.
-   Deadlock'un belirtisi asılmadır — CI'da timeout var (#55).
+4. **`data/fullscale` is persistent** — measurement modes must guard against id
+   collisions, and the directory must be rebuilt before any comparison (runs
+   accumulate: 1M → 1.64M).
+5. **A threshold and a decision are different things** — a threshold can pass
+   while the assumption underneath it collapses (#45).
+6. **The official SIFT ground truth is valid only for the full 1M base.**
+7. **bincode cannot deserialize untagged serde** (#35).
+8. **Rust locking pitfalls** (#54): never take two locks in one expression
+   (temporaries live to the end of the statement); a `while let` scrutinee
+   lives for the whole **body** (use `let ... else`). Lock order:
+   **segments → sealing → buffer**. The symptom of a deadlock is a hang — CI
+   has timeouts for that reason (#55).
 
-## Yeniden koşulabilir ölçümler
+## Re-runnable measurements
 
 ```
-cargo run --release --bin report -- sweep 10000 128         # hızlı başlangıç
-cargo run --release --bin report -- fullscale 1000000 99    # 1M uçtan uca (~10 dk)
-cargo run --release --bin report -- memverify 1000000 99    # metadata belleği (gerçek RSS)
-cargo run --release --bin report -- accumulation 1000000 99 # birikme + backpressure (10 dk)
-cargo run --release --bin report -- mergewindow 1000000 99  # yazma latency penceresi
-cargo run --release --bin report -- postingcost 200000 99   # posting id sırası duyarlılığı
-cargo run --release --bin report -- rangefilter 100000 99   # kol örtüşmesi + Range tahmini
+cargo run --release --bin report -- sweep 10000 128         # quick start
+cargo run --release --bin report -- fullscale 1000000 99    # 1M end to end (~10 min)
+cargo run --release --bin report -- memverify 1000000 99    # metadata memory (real RSS)
+cargo run --release --bin report -- accumulation 1000000 99 # accumulation + backpressure (10 min)
+cargo run --release --bin report -- mergewindow 1000000 99  # write latency window
+cargo run --release --bin report -- postingcost 200000 99   # posting id-order sensitivity
+cargo run --release --bin report -- rangefilter 100000 99   # arm agreement + Range estimation
 ```

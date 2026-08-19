@@ -1,83 +1,87 @@
-# Yapılmayanlar, karşılanmamış eşikler ve bilinen sınırlar
+# What was not done, unmet thresholds, and known limits
 
-Bu dosya kasten "kötü haberler" dosyasıdır. Bir sistemin neyi yapmadığını
-ve hangi eşiği tutturamadığını bilmek, neyi yaptığını bilmek kadar önemli.
-Kayıtların uzun hâli `DECISIONS.md`'de.
+This file is deliberately the "bad news" file. Knowing what a system does not
+do, and which thresholds it failed to meet, matters as much as knowing what it
+does. The long form of each record is in `DECISIONS.md`.
 
-## Karşılanmamış kabul eşikleri
+## Unmet acceptance thresholds
 
-Ön-kayıt kuralı gereği bu eşikler **ölçümden önce** yazıldı ve sonradan
-değiştirilmedi. Karşılanmayan sonuç "karşılanmadı" olarak duruyor.
+Under the pre-registration rule these thresholds were written **before** the
+measurement that would evaluate them, and were never changed afterwards. A
+threshold that was not met **stays** "not met".
 
-| eşik | sonuç | yanındaki kusur kaydı |
+| threshold | result | defect record alongside it |
 |---|---|---|
-| **#40 kriter 1** — mühürleme/merge penceresine denk gelen yazmaların p99'u taban p99'un 50 katını aşmamalı | **karşılanmadı** (609x / 943x; `with_capacity` sonrası 426x) | #60: eşik, backpressure'ın VAR OLMADIĞI bir sistemde tanımlandı. O tarihte uzun yazma daima kusur belirtisiydi; backpressure eklendikten sonra uzun yazma sistemin DOĞRU çalıştığının kanıtı da olabiliyor. Metrik iki farklı nedeni aynı sayıda topluyor. |
-| **#49** — 2 dk yükte segment+mühürlenen sayısı dengelensin (≤+%20, zirve ≤12) | **karşılanmadı** (+%90, zirve 35) | #58: metrik iki FARKLI REJİMDEKİ sayıyı topluyor — segment sayısı zaten merge tavanıyla bağlı, kuyruk ise o tarihte sınırsızdı. |
-| **#59 ikincil** — segment sayısı merge tavanı+4 içinde kalsın | **karşılanmadı** (10 dk'da zirve 16) | #62: bu 9a-2'nin değil merge tavanı mekanizmasının testi; ayrı kalem. |
-| **#61 birincil** — backpressure dışındaki en uzun yazma / taban p99 | group:20'de **426x**, sync kapalıyken **12x** | Kalan sıçramanın tamamı fsync (üç kanıtla izole edildi). Hangi politikanın kabulü belirlediği ön-kayıtta yazılmamıştı — boşluk kaydedildi. |
+| **#40 criterion 1** — p99 of writes coinciding with the sealing/merge window must not exceed 50x the baseline p99 | **not met** (609x / 943x; 426x after `with_capacity`) | #60: the threshold was defined in a system where backpressure **did not exist**. Back then a long write was always the symptom of a defect; after backpressure was added, a long write can also be proof that the system is working *correctly*. The metric now sums two different causes into one number. |
+| **#49** — under 2 min of load, segment+sealing count must stabilize (≤+20%, peak ≤12) | **not met** (+90%, peak 35) | #58: the metric adds two numbers from **different regimes** — segment count is already bounded by the merge ceiling, whereas the queue was unbounded at the time. |
+| **#59 secondary** — segment count must stay within merge ceiling + 4 | **not met** (peak 16 over 10 min) | #62: this tests the merge ceiling mechanism, not 9a-2; tracked as a separate item. |
+| **#61 primary** — longest write excluding backpressure / baseline p99 | **426x** under group:20, **12x** with sync off | The entire residual spike is fsync (isolated with three independent pieces of evidence). The pre-registration never stated which policy decides acceptance — that gap is recorded. |
 
-Geçen eşikler de var ve onlar `BENCHMARKS.md`'de: #59 birincil (kuyruk 10
-dakika boyunca 3'te sabit), 1M recall ≥0.99, kol örtüşmesi %100, 9c'nin
-bellek düşüşü.
+Thresholds that *were* met are in `BENCHMARKS.md`: #59 primary (queue held at
+3 for a full 10 minutes), 1M recall ≥0.99, arm agreement 100%, and the 9c
+memory reduction.
 
-## Denendi ve reddedildi
+## Tried and rejected
 
-- **Ölçekli ef kolu** — planlayıcıya üçüncü bir kol olarak eklenmesi
-  düşünüldü, ölçüldü, reddedildi: recall zaten bozulmuyordu, yani kolun
-  çözeceği bir problem yoktu.
-- **int8 quantization'ın segment modeline entegrasyonu (8a)** — ön-kayıtlı
-  eşik geçti ama **eşiğin dayandığı varsayım çürüdü**: int8 çok thread'de
-  f32'den yavaş çıktı. Eşik ile karar ayrı şeylerdir; eşik geçse bile
-  varsayım çürüdüyse karar farklı olabilir.
-- **Gezinti-içi filtrenin varsayılan yol olması** — 100K ölçümünde
-  kümelenmiş eşleşme + uzak sorguda gezintinin grafın tamamına yayıldığı
-  (35 ms'e kadar) ve ölçekle sessiz recall düşüşü başladığı görüldü.
-  Yerine filtresiz gezinti + over-fetch geldi; o yol bu patolojiye
-  yapısal olarak bağışık.
+- **Scaled-ef arm** — considered as a third planner arm, measured, rejected:
+  recall was not degrading in the first place, so the arm had no problem to
+  solve.
+- **Integrating int8 quantization into the segment model (8a)** — the
+  pre-registered threshold passed, but **the assumption underneath it was
+  falsified**: int8 turned out slower than f32 under multiple threads. A
+  threshold and a decision are different things; a threshold can pass while
+  the assumption it rested on collapses.
+- **In-traversal filtering as the default path** — a 100K measurement showed
+  the traversal spreading across the entire graph (up to 35 ms) for clustered
+  matches with a distant query, and a silent recall decline setting in with
+  scale. It was replaced by unfiltered traversal + over-fetch, which is
+  structurally immune to that pathology.
 
-## Ölçüldü, kazanç yetersiz bulundu, ertelendi
+## Measured, gain judged insufficient, deferred
 
-- **Agresif/tiered merge** — eşit-recall karşılaştırmasında kazanç ~%20.
-  Merge tavanı bu yüzden latency gerekçesiyle değil, sınırsız büyümeyi
-  kesmek için var.
-- **Quantile histogram** — mevcut eşit-genişlik histogramının hatası çarpık
-  dağılımda 49x'e çıkıyor, ama **hiçbir kol kararını değiştirmiyor**
-  (küçük kol kararı kesin sayımla veriliyor). Hata büyük, etkisi yok.
-- **mmap / `unsafe` açılması (9b)** — soğuk başlangıçta mmap'in tavanı
-  0.6 s, eşiğin altında. `#![deny(unsafe_code)]` açılmadı. **Yeniden bakma
-  koşulu:** vektör verisi RAM'e sığmaz hale gelirse.
-- **Türetilmiş indekslerin snapshot'lanması (9d)** — beklenen kazanç ~1.5 s
-  soğuk başlangıç; tek kullanıcılı bir sistemde görünmez. Ertelendi.
-- **Sayısal indekslerin sıkıştırılması (9c)** — 197 MB, metadata toplamının
-  ~%16'sı. Gerekçe **bellek payı değil risk/kazanç**: o yapı filtre
-  planlayıcısının kesin-sayım kolunu besliyor, yani projedeki en incelikli
-  doğruluk mekanizmasının altında duruyor. Kapanışa giderken en riskli
-  bileşene el atmak yanlış zamanlama.
-- **Sayısal alanlar için Eq posting'inin kaldırılması** — 9c'den sonra
-  yazılan sonraki adım. Sayısal bir alanın her ayrık değeri HEM bir posting
-  anahtarı HEM bir `BTreeMap` girdisi üretiyor; Range zaten sayısal
-  indeksten karşılanıyor. Bu bir optimizasyon değil, tekrarın kaldırılması
-  olurdu. Ertelendi.
+- **Aggressive/tiered merge** — the gain is ~20% in an equal-recall
+  comparison. That is why the merge ceiling exists to bound growth rather than
+  to buy latency.
+- **Quantile histogram** — the current equal-width histogram is off by up to
+  49x on a skewed distribution, but it **changes no arm decision** (the
+  small-arm decision comes from an exact count). Large error, no effect.
+- **mmap / enabling `unsafe` (9b)** — the ceiling on cold-start improvement
+  from mmap is 0.6 s, below the threshold. `#![deny(unsafe_code)]` stays.
+  **Revisit condition:** if vector data no longer fits in RAM.
+- **Snapshotting derived indexes (9d)** — expected gain ~1.5 s of cold start;
+  invisible in a single-user system. Deferred.
+- **Compacting the numeric indexes (9c)** — 197 MB, about 16% of the metadata
+  total. The reason is **not the memory share but the risk/reward**: that
+  structure feeds the exact-counting arm of the filter planner, i.e. it sits
+  underneath the most delicate correctness mechanism in the project. Reaching
+  for the riskiest component on the way to closing out is the wrong timing.
+- **Dropping Eq postings for numeric fields** — the next step written after
+  9c. Every distinct value of a numeric field produces **both** a posting key
+  **and** a `BTreeMap` entry; Range is already served from the numeric index.
+  This would be the removal of a duplication, not an optimization. Deferred.
 
-## Bilinen sınırlar (çalışıyor ama böyle çalışıyor)
+## Known limits (it works, but this is how it works)
 
-- **Segment birikmesi — sistemin tek sınırsız büyüyen boyutu.** Mühürleme
-  ~25 s'de bir segment üretiyor, merge ~54 s'de bir eksiltiyor. Sürekli
-  yüksek yazma yükünde segment sayısı büyür (10 dakikada 0 → 16). Bu, 9a'nın
-  kendi başarısının yan etkisi: mühürleme hızlandı, merge hızlanmadı.
-  Çözüm ayrı bir tasarım işi (paralel merge, ya da merge'in üç segmenti
-  birden alması). **Yeniden bakma koşulu:** sürekli yazma yükü öngörülen
-  kullanımın parçası olursa. Hedeflenen senaryolarda (RAG, iç araç) sürekli
-  5K op/s yazma yok — gerçek ama şu an teorik bir sorun.
-- **`metadata_memory_bytes()` sistematik olarak eksik gösteriyor** (ölçülen
-  0.77x, üç kalemde de aynı yönde). Aynı fonksiyon `/stats`'ta kullanılıyor,
-  yani kapasite planlaması yapan biri gerçek kullanımın ~%77'sini görür.
-- **Sıralı posting listeleri id sırasına duyarlı.** Artan sırada ekleme
-  O(1), rastgele sırada O(n) kaydırma — 200K'lık tek listede 8.8x fark.
-  Ölçüldü ve kabul edildi; 1M'lik tek bir liste ~30 s eder.
-- **Filtrede VEYA / negasyon yok.** Yalnız koşulların VE bağlacı. İhtiyaç
-  çıkarsa ağaç yapısına genişletilir.
-- **Silme tombstone ile; alan geri kazanımı merge'e bağlı.** Çok silme
-  yapılan bir kullanımda merge tetiklenene kadar disk ve bellek şişer.
-- **Tek düğüm, tek yazar.** Yazma throughput'unun tavanı tek yazıcı
-  task'idir; ölçeklenme yatay değil dikeydir.
+- **Segment accumulation — the one dimension of the system that still grows
+  without bound.** Sealing produces a segment about every 25 s; merging
+  removes one about every 54 s. Under sustained heavy write load the segment
+  count grows (0 → 16 over ten minutes). This is a side effect of 9a's own
+  success: sealing got faster, merging did not. The fix is a separate design
+  task (parallel merge, or merging three segments at once). **Revisit
+  condition:** if sustained write load becomes part of the intended usage. In
+  the target scenarios (RAG, internal tooling) there is no sustained 5K op/s
+  write stream — a real problem, but currently a theoretical one.
+- **`metadata_memory_bytes()` systematically under-reports** (measured 0.77x,
+  in the same direction for all three items). The same function is used by
+  `/stats`, so anyone doing capacity planning sees about 77% of actual usage.
+- **Sorted posting lists are sensitive to id ordering.** Insertion in
+  ascending order is O(1); in random order it costs an O(n) shift — an 8.8x
+  difference for a single 200K list. Measured and accepted; a single 1M-entry
+  list would take roughly 30 s.
+- **No OR / negation in filters.** Only the AND conjunction of predicates. It
+  would be extended to a tree structure if the need arose.
+- **Deletion is by tombstone; space reclamation depends on merging.** Under a
+  delete-heavy workload, disk and memory stay inflated until a merge is
+  triggered.
+- **Single node, single writer.** Write throughput is capped by the single
+  writer task; scaling is vertical, not horizontal.
