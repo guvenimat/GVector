@@ -1,5 +1,54 @@
 # Mimari Kararlar
 
+## Aşama 9a-2 ÖN-KAYIT — 2026-08-19 (uygulama ve ölçüm YAPILMADAN önce)
+
+### 49. 9a-2'nin İKİ kabul kriteri var: latency VE birikme
+9a-2 mühürlemeyi de arka plana alıyor. Bu, latency eşiğini geçirirken
+sistemin **başka bir boyutunu sınırsız hale getirme riski** taşıyor:
+yazıcı artık hiçbir uzun işi beklemeyecek, yani yazmaları sınırsız hızda
+kabul edecek; arka plandaki inşa işleri ise sabit hızda ilerleyecek.
+
+Birikme matematiği (mevcut ölçümlerden): yazıcı ~100K op/s ile 125K'lık
+buffer'ı **~1.3 s**'de doldurur; mühürleme **~25 s** sürer. Bu oran
+korunursa mühürleme kuyruğu monoton büyür → segment sayısı artar, arama
+yavaşlar, bellek şişer. Bu, #30'da kapatılan "sınırsız büyüyen tek boyut"
+probleminin farklı bir kapıdan geri dönüşüdür.
+
+**Kriter 1 — latency (ön-kayıtlı #40, değişmez):** mühürleme/merge
+penceresine denk gelen yazmaların p99'u, taban p99'un **50 katını
+aşmamalı**. Ölçüm koşulu Aşama 8 ve 9a-1 ile aynı (WAL group:20, döngü
+içinde commit yok; izole süreç, warmup, iki koşu).
+
+**Kriter 2 — birikme (YENİ, bu ön-kayıtla sabitleniyor):** yazıcı TAM
+HIZDA, kesintisiz **en az 2 dakika** yazarken segment sayısı 5 saniyede
+bir örneklenir. Sonuç:
+- **DENGELENİYOR** (son üçte birin ortalaması, ilk üçte birin
+  ortalamasını en fazla %20 aşıyor) **VE** hiçbir örnekte tavan+4'ü
+  (tavan 8 → **12**) aşmıyor → 9a-2 backpressure'sız KABUL EDİLİR.
+- **MONOTON BÜYÜYOR** ya da tavan+4 aşılıyor → **backpressure 9a-2'nin
+  parçasıdır ve AYNI arc'ta yapılır**; onsuz 9a-2 kabul edilmez.
+  (Bu artık "yeniden bakma koşulu" değil, kabul kriteri.)
+- Birikme sırasında zirve RSS de raporlanır.
+
+Backpressure yapılırsa biçimi: segment sayısı 2×tavanı aşınca yazma
+yolunda kısa bir bekleme (Lucene'in `IndexWriter` stall'ü gibi) —
+yazmayı reddetmek değil, yavaşlatmak. Tek yazar sözleşmesi korunur.
+
+### 50. 9a-2'nin yapısal riski: "iki buffer" durumu
+Mühürleme arka plana geçince mühürlenmekte olan buffer ile yeni yazma
+buffer'ı bir süre birlikte yaşar. Bu ÜÇ kaynağı da etkiler:
+- **Arama:** segments + mühürlenen buffer + yeni buffer gezilmeli.
+- **Delete:** kayıt hangi kaynaktaysa oraya (mühürlenende tombstone).
+- **Duplicate-id (en sinsisi):** mühürlenmekte olan buffer'daki bir id
+  yeni buffer'a ikinci kez eklenirse ve kontrol yalnız yeni buffer'a
+  bakıyorsa, çakışma ancak mühürleme bittikten SONRA ortaya çıkar —
+  o noktada iki kopya da kalıcıdır.
+
+Testler 9a-1'in kalıbıyla yazılır: yarışın gerçekten oluştuğu
+(**"iki buffer durumu gözlendi"**) test içinde doğrulanır, aksi halde
+test sessizce zayıflar.
+
+
 ## Aşama 9a-1 — merge arka planda — 2026-08-19
 
 ### 46. Merge yazıcı task'inden ayrıldı; kalan pencere tamamen mühürleme
