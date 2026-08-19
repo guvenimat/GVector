@@ -795,12 +795,11 @@ fn main() {
                     (base, queries, format!("SIFT alt küme n={n}"))
                 }
                 Err(_) => {
-                    eprintln!(
-                        "UYARI: data/sift bulunamadı → rastgele vektörlerle koşuluyor.
-                         Rastgele veride recall rakamları SIFT sonuçlarıyla karşılaştırılamaz
-                         (rastgele yüksek boyutlu veri ANN için en kötü durumdur).
-                         Gerçek ölçüm için SIFT-1M'i data/sift/ altına açın."
-                    );
+                    eprintln!("UYARI: data/sift bulunamadı → rastgele vektörlerle koşuluyor.");
+                    eprintln!("  Rastgele veride recall rakamları SIFT sonuçlarıyla");
+                    eprintln!("  karşılaştırılamaz: rastgele yüksek boyutlu veri ANN için");
+                    eprintln!("  en kötü durumdur. Gerçek ölçüm için SIFT-1M'i data/sift/");
+                    eprintln!("  altına açın.");
                     let dim = 128;
                     (
                         random_vectors(n, dim, DEFAULT_SEED),
