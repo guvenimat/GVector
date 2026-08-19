@@ -133,8 +133,7 @@ Endpoints: `POST /vectors`, `DELETE /vectors/:id`, `POST /search`,
 - **`METHODOLOGY.md`** — the measurement lessons this project produced.
 - **`HANDOFF.md`** — handoff note: status, open items, pitfalls.
 
-## Note on language
+## License
 
-The documentation is in English; **code comments are in Turkish**, because
-that is the language the project was built in and the comments carry the
-reasoning behind each algorithmic choice.
+Licensed under the Apache License, Version 2.0 — see [LICENSE](LICENSE) and
+[NOTICE](NOTICE). Apache-2.0 was chosen over MIT for its explicit patent grant.
