@@ -758,7 +758,7 @@ fn main() {
     let (base, queries, label) = match mode {
         "sift" | "sweep" | "persist" | "delete" | "concurrent" | "quant" | "sift1m" | "filter"
         | "segcurve" | "mergecost" | "rangefilter" | "durability" | "wal" | "fullscale"
-        | "int8scale" | "coldprofile" | "mergewindow" => {
+        | "int8scale" | "coldprofile" | "mergewindow" | "accumulation" => {
             let n: usize = args.get(1).and_then(|a| a.parse().ok()).unwrap_or(10_000);
             let n_query: usize = args.get(2).and_then(|a| a.parse().ok()).unwrap_or(100);
             let mut f = std::io::BufReader::new(
@@ -795,6 +795,126 @@ fn main() {
 
     if mode == "filter" {
         filter_sweep(&base, &queries, k, metric);
+        return;
+    }
+
+    if mode == "accumulation" {
+        // 9a-2 KRİTER 2 (ön-kayıt #49): sürekli TAM HIZ yazma altında segment
+        // sayısı dengeleniyor mu, yoksa monoton büyüyor mu?
+        //
+        // Eşik (ölçümden önce sabitlendi): son üçte birin ortalaması ilk üçte
+        // birinkini en fazla %20 aşacak VE hiçbir örnek tavan+4'ü (12)
+        // aşmayacak → backpressure'sız kabul. Aksi halde backpressure aynı
+        // arc'ta yapılır.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use vector_gvector::index::segmented::SegmentedIndex;
+        use vector_gvector::meta::Metadata;
+        use vector_gvector::storage::wal::SyncPolicy;
+
+        // WAL KAPALI: birikme ölçümü yazma yolunun İÇ dinamiğini ölçüyor;
+        // WAL açıkken ilk denemede 120 s'de 4.3 GB log yazıldı ve disk/bellek
+        // ölçümü boğdu. Süre 60 s: birikme eğilimi ilk saniyelerde görünüyor.
+        let secs: u64 = 60;
+        let seal = 125_000usize;
+        let dir = std::path::PathBuf::from("data/accum");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut idx = SegmentedIndex::open_durable(
+            dir.clone(),
+            dim,
+            metric,
+            HnswParams::default(),
+            seal,
+            SyncPolicy::None,
+        )
+        .expect("aç");
+        idx.set_max_segments(8);
+        let idx = Arc::new(idx);
+        println!("{secs} s boyunca TAM HIZ yazma; seal={seal}, tavan=8, örnekleme 5 s");
+        println!();
+        println!("| t (s) | segment | mühürlenen | buffer | toplam kayıt | yazma op/s |");
+        println!("|-------|---------|------------|--------|--------------|------------|");
+
+        let stop = AtomicBool::new(false);
+        let written = AtomicUsize::new(0);
+        let mut samples: Vec<usize> = Vec::new();
+        std::thread::scope(|sc| {
+            let w = &written;
+            let st = &stop;
+            let ix = &idx;
+            sc.spawn(move || {
+                let mut i = 0usize;
+                while !st.load(Ordering::Relaxed) {
+                    let id = VectorId(i as u64);
+                    if ix
+                        .insert_with_meta(id, &base[i % base.len()], Metadata::new())
+                        .is_ok()
+                    {
+                        w.fetch_add(1, Ordering::Relaxed);
+                    }
+                    i += 1;
+                }
+            });
+            let mut last = 0usize;
+            for t in 1..=(secs / 5) {
+                std::thread::sleep(std::time::Duration::from_secs(5));
+                let (segs, buf) = idx.shape();
+                let sealing = idx.sealing_count();
+                let total = written.load(Ordering::Relaxed);
+                samples.push(segs + sealing); // birikme = segment + mühürlenen
+                println!(
+                    "| {} | {segs} | {sealing} | {buf} | {} | {:.0} |",
+                    t * 5,
+                    idx.len_shared(),
+                    (total - last) as f64 / 5.0
+                );
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                last = total;
+            }
+            stop.store(true, Ordering::Relaxed);
+        });
+
+        let third = samples.len() / 3;
+        let avg = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len().max(1) as f64;
+        let first_avg = avg(&samples[..third]);
+        let last_avg = avg(&samples[samples.len() - third..]);
+        let peak = *samples.iter().max().unwrap_or(&0);
+        let growth = if first_avg > 0.0 {
+            (last_avg / first_avg - 1.0) * 100.0
+        } else {
+            0.0
+        };
+        println!();
+        println!("| kriter | değer | eşik | sonuç |");
+        println!("|--------|-------|------|-------|");
+        println!(
+            "| ilk 1/3 ort. → son 1/3 ort. | {first_avg:.1} → {last_avg:.1} ({growth:+.0}%) | ≤ +%20 | {} |",
+            if growth <= 20.0 { "OK" } else { "AŞILDI" }
+        );
+        println!(
+            "| zirve (segment+mühürlenen) | {peak} | ≤ 12 (tavan+4) | {} |",
+            if peak <= 12 { "OK" } else { "AŞILDI" }
+        );
+        let verdict = growth <= 20.0 && peak <= 12;
+        println!();
+        println!(
+            "KRİTER 2 SONUCU: {}",
+            if verdict {
+                "DENGELENIYOR → 9a-2 backpressure'sız kabul edilebilir"
+            } else {
+                "BİRİKİYOR → backpressure 9a-2'nin parçası (ön-kayıt #49)"
+            }
+        );
+        // NOT: kasten `wait_for_background()` YOK. Biriken kuyruğu boşaltmak
+        // ölçümün kendisinden kat kat uzun sürer (ilk denemede süreç yarım
+        // saatlik kuyrukla asıldı) — ve zaten sorulan soru "birikiyor mu",
+        // cevabı kuyruğun büyüklüğü.
+        println!(
+            "ölçüm sonu: {} segment + {} mühürlenen (kuyruk boşaltılmadı)",
+            idx.shape().0,
+            idx.sealing_count()
+        );
         return;
     }
 

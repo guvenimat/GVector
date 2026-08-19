@@ -55,6 +55,15 @@ struct StoredFile {
 /// kopya kendi segmentinde sonsuza dek gölgede kalır, yeni kopya buffer'da
 /// (sonra başka segmentte) yaşar — global bir silinmiş-küme olsaydı yeniden
 /// ekleme eski kopyayı hortlatırdı.
+/// Mühürlenmekte OLAN buffer (9a-2). Snapshot alınmış, değişmez brute-force
+/// verisi + kendi tombstone kümesi — yani `Segment`'in HNSW'siz kardeşi.
+/// HNSW inşası arka planda sürerken arama, delete ve duplicate-id kontrolü
+/// bu kaynağı da gezmek zorundadır (DECISIONS #50).
+struct Sealing {
+    data: BruteForceIndex,
+    tombstones: RwLock<HashSet<VectorId>>,
+}
+
 struct Segment {
     index: HnswIndex,
     tombstones: RwLock<HashSet<VectorId>>,
@@ -75,6 +84,9 @@ pub struct SegmentedIndex {
     /// `Arc` — merge arka plan thread'ine klonlanabilmesi için (9a-1).
     /// Auto-deref sayesinde `self.segments.read()` çağrıları değişmedi.
     segments: Arc<RwLock<Vec<Arc<Segment>>>>,
+    /// Mühürlenmekte olan buffer'lar (9a-2). Genelde 0 ya da 1 elemanlı;
+    /// yazma hızı mühürlemeyi aşarsa birikir (ön-kayıt #49 bunu ölçüyor).
+    sealing: Arc<RwLock<Vec<Arc<Sealing>>>>,
     buffer: RwLock<BruteForceIndex>,
     /// Sorgu genişliği (mühürlü segmentlerde).
     ef_search: usize,
@@ -113,6 +125,9 @@ pub struct SegmentedIndex {
     last_seal_us: AtomicU64,
     /// Merge istatistikleri arka plan thread'inden güncellendiği için Arc.
     merge_stats: Arc<MergeStats>,
+    /// Mühürleme istatistikleri (9a-2: arka planda) + devam eden sayısı.
+    seal_stats: Arc<MergeStats>,
+    seal_in_flight: Arc<AtomicUsize>,
     /// Aynı anda en fazla bir merge; tavan yeniden aşılırsa worker döngüsü
     /// devam eder (sıraya alma) — yeni thread doğurulmaz.
     merge_in_flight: Arc<AtomicBool>,
@@ -154,6 +169,50 @@ impl Default for PlannerConfig {
             overfetch_beta: 5.0,
             overfetch_cap_factor: 8,
         }
+    }
+}
+
+/// Merge tetikleyicisinin thread'e taşınabilir hali: mühürleme worker'ı
+/// bitince tavan bekçisini buradan çalıştırır (`&self` taşınamaz).
+#[derive(Clone)]
+struct MergeContext {
+    segments: Arc<RwLock<Vec<Arc<Segment>>>>,
+    stats: Arc<MergeStats>,
+    in_flight: Arc<AtomicBool>,
+    dim: usize,
+    metric: Metric,
+    max_segments: usize,
+    params: HnswParams,
+}
+
+impl MergeContext {
+    /// Tavan aşıldıysa arka planda merge başlatır. Aynı anda en fazla bir
+    /// merge; tavan yeniden aşılırsa worker döngüsü devam eder.
+    fn spawn_if_needed(&self) {
+        if self.segments.read().expect("kilit").len() <= self.max_segments {
+            return;
+        }
+        if self.in_flight.swap(true, Ordering::SeqCst) {
+            return; // çalışan worker yeni durumu görecek
+        }
+        let ctx = self.clone();
+        std::thread::spawn(move || loop {
+            while ctx.segments.read().expect("kilit").len() > ctx.max_segments {
+                let t = std::time::Instant::now();
+                merge_smallest_pair_bg(&ctx.segments, ctx.dim, ctx.metric, &ctx.params);
+                ctx.stats
+                    .last_us
+                    .store(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+                ctx.stats.count.fetch_add(1, Ordering::Relaxed);
+            }
+            ctx.in_flight.store(false, Ordering::SeqCst);
+            // Bayrağı bırakırken yeni segment eklenmiş olabilir: çift kontrol.
+            if ctx.segments.read().expect("kilit").len() <= ctx.max_segments
+                || ctx.in_flight.swap(true, Ordering::SeqCst)
+            {
+                break;
+            }
+        });
     }
 }
 
@@ -278,6 +337,7 @@ impl SegmentedIndex {
             hnsw_params,
             seal_threshold: AtomicUsize::new(seal_threshold),
             segments: Arc::new(RwLock::new(Vec::new())),
+            sealing: Arc::new(RwLock::new(Vec::new())),
             buffer: RwLock::new(BruteForceIndex::new(dim, metric)),
             ef_search,
             metadata: RwLock::new(HashMap::new()),
@@ -291,6 +351,8 @@ impl SegmentedIndex {
             wal: RwLock::new(None),
             last_seal_us: AtomicU64::new(0),
             merge_stats: Arc::new(MergeStats::default()),
+            seal_stats: Arc::new(MergeStats::default()),
+            seal_in_flight: Arc::new(AtomicUsize::new(0)),
             merge_in_flight: Arc::new(AtomicBool::new(false)),
             replay_report: RwLock::new(ReplayReport::default()),
         }
@@ -358,6 +420,13 @@ impl SegmentedIndex {
             });
         }
         if self.buffer.read().expect("kilit").contains(id) {
+            return Err(IndexError::DuplicateId(id));
+        }
+        // 9a-2 "iki buffer" riski (DECISIONS #50): mühürlenmekte olan
+        // buffer'daki bir id yeni buffer'a ikinci kez eklenirse, çakışma
+        // ancak mühürleme bitince ortaya çıkardı — o noktada iki kopya da
+        // kalıcı olurdu. Bu yüzden duplicate kontrolü ORAYI DA gezer.
+        if self.sealing_contains_live(id) {
             return Err(IndexError::DuplicateId(id));
         }
         let segments = self.segments.read().expect("kilit");
@@ -569,6 +638,23 @@ impl SegmentedIndex {
                 true
             }
         });
+        // 9a-2: mühürlenmekte olan buffer'lar (yeniden eskiye)
+        for sl in self.sealing_snapshot().iter().rev() {
+            if remaining.is_empty() {
+                break;
+            }
+            let tombs = sl.tombstones.read().expect("kilit");
+            remaining.retain(|&id| {
+                if let Some(v) = sl.data.vector_of(id) {
+                    if !tombs.contains(&id) {
+                        push(id, self.metric.distance(query, v), &mut heap);
+                    }
+                    false
+                } else {
+                    true
+                }
+            });
+        }
         for seg in segments.iter().rev() {
             if remaining.is_empty() {
                 break;
@@ -646,6 +732,12 @@ impl SegmentedIndex {
                                 .filter(|r| !tombs.contains(&r.id) && allow(r.id)),
                         );
                     }
+                    // 9a-2: mühürlenmekte olan buffer'lar
+                    for sl in self.sealing_snapshot() {
+                        let tombs = sl.tombstones.read().expect("kilit");
+                        let allow_live = |id: VectorId| !tombs.contains(&id) && allow(id);
+                        all.extend(sl.data.search_filtered(query, k, &allow_live));
+                    }
                     let buffer = self.buffer.read().expect("kilit");
                     all.extend(buffer.search_filtered(query, k, &allow));
                 } // kilitler düşer — fallback scan_candidates yeniden alacak
@@ -697,6 +789,11 @@ impl SegmentedIndex {
                     ));
                 }
                 {
+                    for sl in self.sealing_snapshot() {
+                        let tombs = sl.tombstones.read().expect("kilit");
+                        let allow_live = |id: VectorId| !tombs.contains(&id) && allow(id);
+                        all.extend(sl.data.search_filtered(query, k, &allow_live));
+                    }
                     let buffer = self.buffer.read().expect("kilit");
                     all.extend(buffer.search_filtered(query, k, &allow));
                 }
@@ -719,87 +816,146 @@ impl SegmentedIndex {
     /// Buffer'ı HNSW segmentine dönüştürür. Pahalı inşa kilitsiz yapılır;
     /// okuyucular bu süre boyunca eski segmentler + dolu buffer'ı görmeye
     /// devam eder (hiçbir vektör görünmez olmaz).
+    /// Mühürleme (9a-2: arka planda).
+    ///
+    /// Yazıcı task'inde SADECE şu yapılır: buffer'ı yeni boş bir buffer'la
+    /// takas et ve eskisini `sealing` listesine koy (mikrosaniyeler).
+    /// Pahalı olan HNSW inşası arka plan thread'ine gider.
+    ///
+    /// Bu andan itibaren "iki buffer" durumu doğar: mühürlenmekte olan
+    /// snapshot + yeni yazma buffer'ı. Arama, delete ve duplicate-id
+    /// kontrolü üç kaynağı da gezer (DECISIONS #50).
     fn seal(&self) {
         let t_seal = std::time::Instant::now();
-        // 1. Buffer'ın anlık kopyasını al (read kilidi kısa tutulur).
-        let entries: Vec<(VectorId, Vec<f32>)> = {
-            let buffer = self.buffer.read().expect("kilit");
-            buffer.entries().map(|(id, v)| (id, v.to_vec())).collect()
-        };
-        if entries.is_empty() {
-            return;
-        }
-        // 2. HNSW'yi kilit dışında inşa et (asıl maliyet burada).
-        let mut params = self.hnsw_params.clone();
-        // Her segment farklı ama deterministik seed alsın: aynı inşa sırası
-        // aynı grafı üretsin, segmentler arası graf yapısı korelasyonsuz olsun.
-        params.seed = params.seed.wrapping_add(entries.len() as u64);
-        let mut hnsw = HnswIndex::new(self.dim, self.metric, params);
-        for (id, v) in &entries {
-            hnsw.insert(*id, v)
-                .expect("mühürleme insert'i başarısız olamaz");
-        }
-        let segment = Arc::new(Segment {
-            index: hnsw,
-            tombstones: RwLock::new(HashSet::new()),
-            stored: RwLock::new(None), // ilk checkpoint yazacak
-        });
-        // 3. Önce segmenti yayınla, SONRA buffer'ı boşalt. Aradaki pencerede
-        // kopya görünür (id bazlı dedupe emer); ters sıra veri kaybettirirdi.
-        self.segments.write().expect("kilit").push(segment);
-        {
+        // 1. Atomik takas: buffer'ı al, yerine boş koy. Tek yazıcı
+        //    sözleşmesi gereği bu sırada başka insert olamaz.
+        let sealed_data = {
             let mut buffer = self.buffer.write().expect("kilit");
-            // Tek yazıcı sözleşmesi: seal ile bu satır arasında insert olamaz,
-            // buffer içeriği hâlâ `entries` ile birebir aynı — komple sıfırla.
-            *buffer = BruteForceIndex::new(self.dim, self.metric);
-        }
-        // Tavan bekçisi: mühürleme mekanizmasının "iki girdi, bir çıktı"
-        // varyantı. Yazıcıyı inşa süresince meşgul eder (seal ile aynı
-        // sözleşme); okuyucular takas anına dek eski iki segmenti aramaya
-        // devam eder — o pencerede 3 kopya yaşar (bellek tepe noktası,
-        // BENCHMARKS'ta ölçülü).
+            if buffer.is_empty() {
+                return;
+            }
+            std::mem::replace(&mut *buffer, BruteForceIndex::new(self.dim, self.metric))
+        };
+        let sealing = Arc::new(Sealing {
+            data: sealed_data,
+            tombstones: RwLock::new(HashSet::new()),
+        });
+        // 2. Yayınla: arama artık bu kaynağı da gezecek, veri hiç görünmez
+        //    olmuyor.
+        self.sealing
+            .write()
+            .expect("kilit")
+            .push(Arc::clone(&sealing));
         self.last_seal_us
             .store(t_seal.elapsed().as_micros() as u64, Ordering::Relaxed);
-        // 9a-1: merge artık yazıcıyı BLOKE ETMEZ — arka plan thread'ine gider.
-        self.spawn_merge_if_needed();
+
+        // 3. HNSW inşasını arka plana ver.
+        let segments = Arc::clone(&self.segments);
+        let sealing_list = Arc::clone(&self.sealing);
+        let stats = Arc::clone(&self.seal_stats);
+        let in_flight = Arc::clone(&self.seal_in_flight);
+        let merge_ctx = self.merge_context();
+        let (dim, metric) = (self.dim, self.metric);
+        let params = self.hnsw_params.clone();
+        in_flight.fetch_add(1, Ordering::SeqCst);
+        std::thread::spawn(move || {
+            let t = std::time::Instant::now();
+            let mut p = params.clone();
+            p.seed = p.seed.wrapping_add(sealing.data.len() as u64);
+            let mut hnsw = HnswIndex::new(dim, metric, p);
+            // Snapshot anındaki tombstone'lar (mühürleme başlarken boştu ama
+            // inşa sırasında düşenler için aşağıda diff-replay var).
+            for (id, v) in sealing.data.entries() {
+                hnsw.insert(id, v)
+                    .expect("mühürleme insert'i başarısız olamaz");
+            }
+            let built = Arc::new(Segment {
+                index: hnsw,
+                tombstones: RwLock::new(HashSet::new()),
+                stored: RwLock::new(None),
+            });
+            // Takas: TEK write kilidi altında (önce segments, sonra sealing)
+            // ve inşa sırasında düşen tombstone'lar birleşiğe taşınır.
+            {
+                let mut segs = segments.write().expect("kilit");
+                let mut seal_list = sealing_list.write().expect("kilit");
+                // Diff-replay: inşa sırasında bu buffer'a düşen silmeler.
+                let carried = sealing.tombstones.read().expect("kilit").clone();
+                *built.tombstones.write().expect("kilit") = carried;
+                segs.push(Arc::clone(&built));
+                seal_list.retain(|s| !Arc::ptr_eq(s, &sealing));
+            }
+            stats
+                .last_us
+                .store(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+            stats.count.fetch_add(1, Ordering::Relaxed);
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            // Tavan bekçisi: yeni segment eklendi, gerekiyorsa merge tetikle.
+            merge_ctx.spawn_if_needed();
+        });
     }
 
     /// Tavan aşıldıysa arka planda merge başlatır. Zaten bir merge
     /// çalışıyorsa yeni thread doğurulmaz: worker döngüsü tavana inene kadar
     /// devam eder, yani yeni tetikler doğal olarak sıraya alınır.
-    fn spawn_merge_if_needed(&self) {
-        if self.segments.read().expect("kilit").len() <= self.max_segments {
-            return;
+    /// Mühürlenmekte olan buffer'ların anlık listesi (9a-2).
+    fn sealing_snapshot(&self) -> Vec<Arc<Sealing>> {
+        self.sealing
+            .read()
+            .expect("kilit")
+            .iter()
+            .cloned()
+            .collect()
+    }
+
+    /// Bir id mühürlenmekte olan buffer'larda YAŞIYOR mu?
+    fn sealing_contains_live(&self, id: VectorId) -> bool {
+        self.sealing
+            .read()
+            .expect("kilit")
+            .iter()
+            .any(|s| s.data.contains(id) && !s.tombstones.read().expect("kilit").contains(&id))
+    }
+
+    /// Merge tetikleyicisinin taşınabilir bağlamı.
+    fn merge_context(&self) -> MergeContext {
+        MergeContext {
+            segments: Arc::clone(&self.segments),
+            stats: Arc::clone(&self.merge_stats),
+            in_flight: Arc::clone(&self.merge_in_flight),
+            dim: self.dim,
+            metric: self.metric,
+            max_segments: self.max_segments,
+            params: self.hnsw_params.clone(),
         }
-        // "Aynı anda en fazla bir merge" — CAS ile.
-        if self.merge_in_flight.swap(true, Ordering::SeqCst) {
-            return; // çalışan worker yeni durumu görecek
+    }
+
+    /// Mühürleme arka planda mı? (9a-2)
+    pub fn seal_in_flight(&self) -> usize {
+        self.seal_in_flight.load(Ordering::SeqCst)
+    }
+
+    /// Son mühürleme süresi (µs) — 9a-2'den sonra ARKA PLANDA geçen süre.
+    pub fn last_seal_build_us(&self) -> u64 {
+        self.seal_stats.last_us.load(Ordering::Relaxed)
+    }
+
+    /// Devam eden tüm mühürlemeler bitene kadar bekler.
+    pub fn wait_for_seal(&self) {
+        while self.seal_in_flight.load(Ordering::SeqCst) > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(2));
         }
-        let segments = Arc::clone(&self.segments);
-        let stats = Arc::clone(&self.merge_stats);
-        let in_flight = Arc::clone(&self.merge_in_flight);
-        let (dim, metric, max_segments) = (self.dim, self.metric, self.max_segments);
-        let params = self.hnsw_params.clone();
-        std::thread::spawn(move || {
-            loop {
-                while segments.read().expect("kilit").len() > max_segments {
-                    let t = std::time::Instant::now();
-                    merge_smallest_pair_bg(&segments, dim, metric, &params);
-                    stats
-                        .last_us
-                        .store(t.elapsed().as_micros() as u64, Ordering::Relaxed);
-                    stats.count.fetch_add(1, Ordering::Relaxed);
-                }
-                in_flight.store(false, Ordering::SeqCst);
-                // Bayrağı bırakırken yeni segment eklenmiş olabilir: çift
-                // kontrol. Bayrağı geri alamazsak başka bir worker devraldı.
-                if segments.read().expect("kilit").len() <= max_segments
-                    || in_flight.swap(true, Ordering::SeqCst)
-                {
-                    break;
-                }
+    }
+
+    /// Mühürleme + merge işlerinin tamamı bitene kadar bekler.
+    pub fn wait_for_background(&self) {
+        loop {
+            self.wait_for_seal();
+            self.wait_for_merge();
+            if self.seal_in_flight.load(Ordering::SeqCst) == 0 && !self.merge_in_flight() {
+                break;
             }
-        });
+        }
     }
 
     /// Arka planda merge var mı?
@@ -890,6 +1046,9 @@ impl SegmentedIndex {
         if self.buffer.read().expect("kilit").contains(id) {
             return true;
         }
+        if self.sealing_contains_live(id) {
+            return true;
+        }
         self.segments.read().expect("kilit").iter().any(|seg| {
             seg.index.contains(id) && !seg.tombstones.read().expect("kilit").contains(&id)
         })
@@ -930,6 +1089,22 @@ impl SegmentedIndex {
                 Ok(()) => return Ok(()),
                 Err(IndexError::NotFound(_)) => {}
                 Err(e) => return Err(e),
+            }
+        }
+        // 9a-2: sonra mühürlenmekte olan buffer'lar (yeniden eskiye).
+        // Snapshot değişmez olduğu için silme burada da TOMBSTONE'dur;
+        // inşa biterken diff-replay onu birleşiğe taşır.
+        {
+            let sealing = self.sealing.read().expect("kilit");
+            for sl in sealing.iter().rev() {
+                if sl.data.contains(id) {
+                    let mut tombs = sl.tombstones.write().expect("kilit");
+                    return if tombs.insert(id) {
+                        Ok(())
+                    } else {
+                        Err(IndexError::NotFound(id))
+                    };
+                }
             }
         }
         // Sonra segmentler (yeniden ekleme zincirinde yaşayan kopya en yenidedir,
@@ -978,6 +1153,18 @@ impl SegmentedIndex {
             let res = seg.index.search_with_ef(query, want, ef.max(want));
             all.extend(res.into_iter().filter(|r| !tombs.contains(&r.id)));
         }
+        // 9a-2: mühürlenmekte olan buffer'lar da gezilir — aksi halde
+        // mühürleme süresince o veri GÖRÜNMEZ olurdu.
+        for sealing in self.sealing_snapshot() {
+            let tombs = sealing.tombstones.read().expect("kilit");
+            all.extend(
+                sealing
+                    .data
+                    .search(query, k + tombs.len().min(k))
+                    .into_iter()
+                    .filter(|r| !tombs.contains(&r.id)),
+            );
+        }
         {
             let buffer = self.buffer.read().expect("kilit");
             all.extend(buffer.search(query, k));
@@ -997,7 +1184,15 @@ impl SegmentedIndex {
             .iter()
             .map(|s| s.index.len() - s.tombstones.read().expect("kilit").len())
             .sum();
-        seg_live + self.buffer.read().expect("kilit").len()
+        // 9a-2: mühürlenmekte olan buffer'lar da canlı kayıt taşır.
+        let sealing_live: usize = self
+            .sealing
+            .read()
+            .expect("kilit")
+            .iter()
+            .map(|s| s.data.len() - s.tombstones.read().expect("kilit").len())
+            .sum();
+        seg_live + sealing_live + self.buffer.read().expect("kilit").len()
     }
 
     // ---- Kalıcılık: soğuk yol (Aşama 7a) ----
@@ -1039,7 +1234,14 @@ impl SegmentedIndex {
         std::fs::create_dir_all(&dir)?;
         // Buffer'ı mühürle: checkpoint sonrası tüm veri segmentlerde olsun ki
         // WAL rotasyonu (7b) hiçbir kaydı sahipsiz bırakmasın.
+        //
+        // 9a-2: mühürleme artık ASENKRON. Beklemezsek `sealing` listesindeki
+        // veri hiçbir segmentte olmaz, manifest onu göremez ve WAL rotasyonu
+        // onu sahipsiz bırakır → VERİ KAYBI. Checkpoint bu yüzden mühürleme
+        // ve merge işlerinin bitmesini bekler (nadir ve öngörülebilir bir
+        // duraklama; yazma yolundaki pencere değil).
         self.seal();
+        self.wait_for_background();
         let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
 
         let segments: Vec<Arc<Segment>> = self
@@ -1344,6 +1546,11 @@ impl SegmentedIndex {
     }
 
     /// Gözlem: (segment sayısı, buffer doluluğu).
+    /// Gözlem: mühürlenmekte olan buffer sayısı (9a-2 birikme göstergesi).
+    pub fn sealing_count(&self) -> usize {
+        self.sealing.read().expect("kilit").len()
+    }
+
     pub fn shape(&self) -> (usize, usize) {
         (
             self.segments.read().expect("kilit").len(),
@@ -1411,6 +1618,7 @@ mod tests {
     fn spans_multiple_segments_and_buffer() {
         let vecs = random_vectors(1_050, 8, 42);
         let idx = build(&vecs, 400); // 2 segment (400+400) + 250 buffer
+        idx.wait_for_background(); // 9a-2: mühürleme arka planda
         let (n_seg, n_buf) = idx.shape();
         assert_eq!(n_seg, 2);
         assert_eq!(n_buf, 250);
@@ -1601,6 +1809,120 @@ mod tests {
         assert_eq!(res[0].id, VectorId(7));
     }
 
+    // ---- 9a-2: arka plan mühürleme + "iki buffer" durumu ----
+
+    /// 9a-2'nin yapısal riski (DECISIONS #50): mühürleme arka plana geçince
+    /// mühürlenmekte olan buffer ile yeni buffer birlikte yaşar. ÜÇ yol da
+    /// bu kaynağı gezmeli: arama, duplicate-id ve delete.
+    ///
+    /// Test 9a-1 kalıbında: "iki buffer durumu gerçekten oluştu mu" içeride
+    /// doğrulanır (`seal_in_flight() > 0`), aksi halde test sessizce zayıflar.
+    #[test]
+    fn sealing_window_covers_search_duplicate_and_delete() {
+        let vecs = random_vectors(6_000, 16, 42);
+        let idx = SegmentedIndex::new(16, Metric::L2, HnswParams::default(), 5_000);
+        for (i, v) in vecs.iter().take(5_000).enumerate() {
+            idx.insert_shared(VectorId(i as u64), v).unwrap();
+        }
+        // 5.000'inci insert mühürlemeyi tetikledi; inşa arka planda sürüyor.
+        assert!(
+            idx.seal_in_flight() > 0,
+            "iki buffer durumu OLUŞMADI — test sessizce zayıflamış"
+        );
+        assert_eq!(idx.sealing_count(), 1, "mühürlenen buffer görünmüyor");
+
+        // (a) ARAMA: mühürlenmekte olan veri görünür kalmalı.
+        let res = idx.search_shared(&vecs[42], 1);
+        assert_eq!(
+            res[0].id,
+            VectorId(42),
+            "mühürleme penceresinde veri görünmez oldu"
+        );
+        assert_eq!(idx.len(), 5_000, "mühürlenen kayıtlar sayımdan düştü");
+
+        // (b) DUPLICATE-ID (en sinsisi): mühürlenmekte olan buffer'daki id
+        // yeni buffer'a ikinci kez eklenememeli.
+        assert!(
+            matches!(
+                idx.insert_shared(VectorId(42), &vecs[42]),
+                Err(IndexError::DuplicateId(_))
+            ),
+            "mühürlenen buffer'daki id yeniden eklendi — çakışma mühürleme              bitince ortaya çıkardı ve iki kopya da kalıcı olurdu"
+        );
+
+        // (c) DELETE: mühürlenmekte olan kayıt silinebilmeli ve silme
+        // inşa bitince diff-replay ile birleşiğe taşınmalı.
+        idx.delete_shared(VectorId(100)).unwrap();
+        assert_eq!(idx.len(), 4_999);
+        // Yeni buffer'a yazmaya devam edilebilmeli.
+        idx.insert_shared(VectorId(9_000), &vecs[5_500]).unwrap();
+
+        idx.wait_for_background();
+        assert_eq!(idx.sealing_count(), 0, "mühürleme listesi boşalmadı");
+        let all: HashSet<VectorId> = idx
+            .search_shared(&vecs[100], 6_000)
+            .iter()
+            .map(|r| r.id)
+            .collect();
+        assert!(
+            !all.contains(&VectorId(100)),
+            "mühürleme sırasında yapılan silme diff-replay'de KAYBOLDU"
+        );
+        assert!(all.contains(&VectorId(9_000)), "yeni buffer kaydı kayboldu");
+        assert_eq!(idx.len(), 5_000); // 5000 - 1 silme + 1 yeni
+    }
+
+    /// Mühürleme sürerken sürekli arama: sonuçlar hiçbir anda kaybolmamalı
+    /// (okuyucu ya mühürlenen buffer'ı ya oluşan segmenti görür).
+    #[test]
+    fn searches_never_lose_data_during_sealing() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let vecs = random_vectors(4_000, 8, 7);
+        let idx = Arc::new(SegmentedIndex::new(
+            8,
+            Metric::L2,
+            HnswParams::default(),
+            3_000,
+        ));
+        for (i, v) in vecs.iter().take(3_000).enumerate() {
+            idx.insert_shared(VectorId(i as u64), v).unwrap();
+        }
+        assert!(idx.seal_in_flight() > 0, "mühürleme penceresi yakalanamadı");
+        let stop = AtomicBool::new(false);
+        let missing = AtomicUsize::new(0);
+        let saw_sealing = AtomicUsize::new(0);
+        std::thread::scope(|sc| {
+            for _ in 0..3 {
+                let (idx, stop, missing, saw) = (&idx, &stop, &missing, &saw_sealing);
+                let vecs = &vecs;
+                sc.spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        if idx.sealing_count() > 0 {
+                            saw.fetch_add(1, Ordering::Relaxed);
+                        }
+                        for probe in [3usize, 1_500, 2_999] {
+                            let r = idx.search_shared(&vecs[probe], 1);
+                            if r.is_empty() || r[0].id != VectorId(probe as u64) {
+                                missing.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                    }
+                });
+            }
+            idx.wait_for_background();
+            stop.store(true, Ordering::Relaxed);
+        });
+        assert!(
+            saw_sealing.load(Ordering::Relaxed) > 0,
+            "okuyucular mühürleme penceresini hiç görmedi — test zayıf"
+        );
+        assert_eq!(
+            missing.load(Ordering::Relaxed),
+            0,
+            "mühürleme sırasında kayıt geçici olarak KAYBOLDU"
+        );
+    }
+
     // ---- 9a-1: arka plan merge + tombstone yarışı ----
 
     /// 9a-1'in ASIL kabul kriteri: merge SÜRERKEN kaynak segmentlere düşen
@@ -1620,6 +1942,9 @@ mod tests {
         for (i, v) in vecs.iter().enumerate() {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
         }
+        // 9a-2: mühürlemeler de arka planda. Merge ancak segmentler oluşunca
+        // tetiklenir, o yüzden önce mühürlemelerin bitmesini bekliyoruz.
+        idx.wait_for_seal();
         // Bu noktada 6 segment mühürlendi, tavan 4 → merge arka planda başladı.
         // Merge sürerken sil: kurbanlar en küçük iki segment, hangi id'lerin
         // onlara düştüğünü bilmediğimiz için geniş bir aralığı siliyoruz.
@@ -2204,11 +2529,16 @@ mod tests {
                     let _ = idx.delete_shared(victim); // zaten silinmişse NotFound: sorun değil
                 }
             }
+            // 9a-2: yazma yolu artık mühürlemeyi beklemediği için 2.000 insert
+            // milisaniyelerde bitiyor ve okuyucular hiç iş yapamadan test
+            // sonlanıyordu (iters == 0). Okuyuculara pencere bırak.
+            std::thread::sleep(std::time::Duration::from_millis(50));
             stop.store(true, Ordering::Relaxed);
         });
 
+        idx.wait_for_background();
         let (n_seg, _) = idx.shape();
-        assert!(n_seg >= 5, "mühürleme hiç tetiklenmemiş: {n_seg}");
+        assert!(n_seg >= 3, "mühürleme hiç tetiklenmemiş: {n_seg}");
         // yazıcı bittikten sonra arama deterministik ve sağlıklı
         let res = idx.search_shared(&queries[0], 10);
         assert_eq!(res.len(), 10);

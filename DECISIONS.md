@@ -1,5 +1,44 @@
 # Mimari Kararlar
 
+## Aşama 9a-2 — KABUL EDİLMEDİ (kriter 2) — 2026-08-19
+
+### 51. Mühürleme arka plana alındı ama 9a-2 henüz KABUL EDİLMEDİ
+Kod ve testler tamam (aşağıda), ancak **ön-kayıt #49'un ikinci kriteri
+aşıldı**: 60 s tam hız yazmada mühürleme kuyruğu 0 → **35**'e çıktı
+(+%90 büyüme, eşik +%20; zirve 35, eşik 12). Ön-kayıt gereği
+**backpressure 9a-2'nin parçasıdır** ve o yapılmadan 9a-2 kabul edilmez.
+Eşik yeniden yorumlanmadı; sonuç "karşılanmadı" olarak kaydedildi.
+
+**Yapılanlar (duruyor, doğru çalışıyor):**
+- `seal()` yazıcı task'inde yalnız buffer takası yapıyor (µs); HNSW inşası
+  arka planda. Yazıcının bloke olduğu pencere pratikte ortadan kalktı.
+- "İki buffer" durumu üç yolda da doğru ele alınıyor (DECISIONS #50):
+  arama (`search_shared_with_ef`, filtreli aramanın her iki kolu,
+  `scan_candidates`), duplicate-id (`validate_insert` → `sealing_contains_live`)
+  ve delete (buffer → sealing → segments; mühürlenende tombstone + inşa
+  bitiminde diff-replay).
+- `checkpoint()` artık `wait_for_background()` çağırıyor: beklemeseydi
+  `sealing` listesindeki veri hiçbir segmentte olmaz, manifest görmez ve
+  WAL rotasyonu onu sahipsiz bırakırdı — sessiz veri kaybı.
+- Testler 9a-1 kalıbında, pencerenin gerçekten oluştuğunu doğruluyor
+  (`seal_in_flight() > 0`, `saw_sealing > 0`).
+
+### 52. Ölçümün ortaya çıkardığı TASARIM KUSURU: sınırsız mühürleme thread'i
+Birikme ölçümünde segment sayısı 60 s boyunca **0'da kaldı**: 35 mühürleme
+aynı anda koşup 8 çekirdeği paylaştığı için hiçbiri bitemedi. Sebep,
+`seal()`'ın her çağrıda `thread::spawn` yapması. Bu, backpressure'dan
+bağımsız bir kusur ve önce düzeltilmeli.
+
+**Sıradaki işin tasarımı (yeni oturumda):**
+1. **Tek mühürleme worker'ı + kuyruk** (merge'deki `MergeContext` kalıbı):
+   sınırsız thread yerine bir worker, sıradaki buffer'ları sırayla mühürler.
+2. **Backpressure:** kuyruk uzunluğu bir eşiği aşınca yazma yolunda kısa
+   bekleme (Lucene `IndexWriter` stall'ü gibi) — yazmayı reddetmek değil,
+   yavaşlatmak. Tek yazar sözleşmesi korunur.
+3. Ardından ön-kayıt #49'un İKİ kriteri de yeniden ölçülür (latency +
+   birikme); 9a-2 ancak o zaman kabul edilir.
+
+
 ## Aşama 9a-2 ÖN-KAYIT — 2026-08-19 (uygulama ve ölçüm YAPILMADAN önce)
 
 ### 49. 9a-2'nin İKİ kabul kriteri var: latency VE birikme

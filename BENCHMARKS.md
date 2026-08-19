@@ -1,5 +1,35 @@
 # Benchmark Kayıtları
 
+## Aşama 9a-2 — birikme ölçümü (ön-kayıt #49, KRİTER 2) — 2026-08-19
+
+60 s kesintisiz TAM HIZ yazma; seal=125K, tavan=8, WAL kapalı (ilk deneme
+WAL açıkken 120 s'de **4.3 GB** log yazıp ölçümü boğdu).
+
+| t (s) | segment | mühürlenen (kuyruk) | yazma op/s |
+|---|---|---|---|
+| 5 | 0 | 10 | 273.337 |
+| 15 | 0 | 21 | 102.022 |
+| 30 | 0 | 28 | 52.253 |
+| 45 | 0 | 33 | 28.738 |
+| 60 | 0 | **35** | **11.709** |
+
+| kriter | değer | eşik | sonuç |
+|---|---|---|---|
+| ilk 1/3 → son 1/3 ortalaması | 17.8 → 33.8 (**+%90**) | ≤ +%20 | **AŞILDI** |
+| zirve (segment + mühürlenen) | **35** | ≤ 12 | **AŞILDI** |
+
+**KRİTER 2 SONUCU: BİRİKİYOR → backpressure 9a-2'nin parçasıdır (ön-kayıt #49).**
+
+Üç ek bulgu:
+1. **Segment sayısı 60 saniye boyunca 0'da kaldı** — yani *hiçbir* mühürleme
+   tamamlanamadı. 35 mühürleme aynı anda çalışıp 8 çekirdeği paylaşıyor.
+2. **Yazma hızı 273K → 11.7K op/s'ye çöktü** (23x). Sistem kendini zaten
+   yavaşlatıyor, ama bunu *bellek baskısıyla* yapıyor — tasarlanmış bir
+   backpressure değil, kontrolsüz bir çökme.
+3. **Bellek:** 35 mühürlenen buffer × 125K kayıt ≈ 2.3 GB; ilk denemede
+   süreç 7.9 GB RSS'e çıktı.
+
+
 ## Aşama 9a-1 — merge arka plana alındı — 2026-08-19 (SIFT 1M, tam sistem)
 
 Ölçüm protokolü 8a'daki gibi: izole süreç, warmup (5.000 yazma), iki ayrı

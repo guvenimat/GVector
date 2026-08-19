@@ -13,7 +13,7 @@ tavanı, 1M gerçeklik ölçümü). Devam eden arc: **ölçümün yönlendirdiğ
 |---|---|
 | 8a — int8 ölçeklenme ölçümü | **bitti** — int8 performans gerekçesiyle REDDEDİLDİ (#45) |
 | 9a-1 — merge arka plana | **bitti** — pencere 80.5 s → ~29 s (#46–#48) |
-| 9a-2 — mühürleme arka plana | **kod + testler bitti**, ölçüm sürüyor (ön-kayıt #49) |
+| 9a-2 — mühürleme arka plana | kod+testler bitti ama **KABUL EDİLMEDİ**: kriter 2 aşıldı → önce tek-worker + backpressure (#51, #52) |
 | 9c — metadata sıkıştırma | sırada (kapsam planda revize edildi) |
 | 9d — türetilmiş indeks snapshot'ı | 9c'den SONRA (sıra gerekçesi planda) |
 | 10 — README + v0.1.0 | en son |
@@ -62,6 +62,16 @@ clippy uyarısız + fmt + tüm testler yeşil (şu an **115 unit + 6 kaza**).
    exact taramayla üretilmeli.
 7. **bincode untagged serde'yi deserialize edemez** — disk/WAL temsili ayrı
    ve etiketli (`MetaValueRepr`, #35).
+
+## SIRADAKİ İŞ (net)
+
+1. `seal()` her çağrıda `thread::spawn` yapıyor → 35 eşzamanlı mühürleme,
+   hiçbiri bitmiyor (#52). **Tek worker + kuyruk** yap (merge'deki
+   `MergeContext` kalıbı hazır örnek).
+2. **Backpressure:** kuyruk eşiği aşılınca yazma yolunda kısa bekleme.
+3. Ön-kayıt #49'un İKİ kriterini de yeniden ölç (`mergewindow` +
+   `accumulation`); 9a-2 ancak ikisi de geçerse kabul.
+4. Sonra 9c → 9d → 10 (plan dosyasındaki sıra).
 
 ## Yeniden koşulabilir ölçümler
 
