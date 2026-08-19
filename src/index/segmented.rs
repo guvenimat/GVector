@@ -1724,7 +1724,8 @@ impl SegmentedIndex {
         if let Some(file) = &manifest.metadata_file {
             let bytes = storage::read_verified(&dir, file, manifest.metadata_crc)?;
             // The derived structures (posting lists, numeric indexes) are
-            // yeniden kurulur — diske yazılmadılar, tek kaynak metadata.
+            // rebuilt here — they are never written to disk, and metadata is
+            // their only source.
             for (id, meta) in storage::decode_metadata(&bytes, &dir.join(file))? {
                 idx.index_metadata(id, meta);
             }
@@ -1743,11 +1744,10 @@ impl SegmentedIndex {
         Ok(idx)
     }
 
-    /// WAL replay + logu append modunda bağlama.
+    /// WAL replay plus attaching the log in append mode.
     ///
-    /// Replay sırasında `self.wal` HENÜZ None olduğu için kayıtlar yeniden
-    /// yazılmaz; bu, "replay ettiğimi tekrar loglamak" hatasını yapısal
-    /// olarak imkânsız kılar.
+    /// During replay `self.wal` is STILL None, so records are not written again;
+    /// that makes the "log what I just replayed" bug structurally impossible.
     fn recover_wal(
         &self,
         dir: &std::path::Path,
@@ -1762,8 +1762,8 @@ impl SegmentedIndex {
                     self.apply_insert(VectorId(id), &vector, wal::record_meta(meta))?;
                 }
                 WalRecord::Delete { id } => {
-                    // Replay'de "yok" durumu rotasyon sınırında meşru olabilir:
-                    // sessizce geç, hayalet op üretme.
+                    // During replay a "not found" can be legitimate at a rotation
+                    // boundary: skip it silently, never synthesize a phantom op.
                     let _ = self.apply_delete(VectorId(id));
                 }
             }
@@ -1773,7 +1773,7 @@ impl SegmentedIndex {
         Ok(())
     }
 
-    /// Toplam indeks belleği (vektör + graf, tüm segmentler; byte).
+    /// Total index memory (vectors + graph, across all segments; bytes).
     pub fn memory_bytes(&self) -> usize {
         self.segments
             .read()
@@ -1787,12 +1787,14 @@ impl SegmentedIndex {
             + self.buffer.read().expect("kilit").memory_bytes()
     }
 
-    /// Ölçüm için: her mühürlü segmentin int8 (quantize) kopyasını üretir.
-    /// `Segment` tipini dışa sızdırmamak için dönüşüm burada yapılır.
+    /// For measurement: produces an int8 (quantized) copy of every sealed
+    /// segment. The conversion happens here so the `Segment` type is not leaked
+    /// outside.
     ///
-    /// NOT: bu bir ÖLÇÜM yoludur, üretim yolu değil — quantize segmentler
-    /// `SegmentedIndex`'e entegre DEĞİL (tombstone'lar, buffer ve planlayıcı
-    /// f32 tarafında kalır). Entegrasyon kararı 8a ölçümüne bağlı.
+    /// NOTE: this is a MEASUREMENT path, not a production one — quantized
+    /// segments are NOT integrated into `SegmentedIndex` (tombstones, the buffer
+    /// and the planner stay on the f32 side). The integration decision depends on
+    /// the 8a measurement.
     pub fn quantize_segments(&self) -> Vec<crate::index::quant::QuantizedHnsw> {
         self.segments
             .read()
@@ -1802,8 +1804,9 @@ impl SegmentedIndex {
             .collect()
     }
 
-    /// Gözlem: (segment sayısı, buffer doluluğu).
-    /// Gözlem: mühürlenmekte olan buffer sayısı (9a-2 birikme göstergesi).
+    /// Observability: (segment count, buffer occupancy).
+    /// Observability: the number of buffers being sealed (the 9a-2 accumulation
+    /// indicator).
     pub fn sealing_count(&self) -> usize {
         self.sealing.read().expect("kilit").len()
     }
@@ -1816,7 +1819,8 @@ impl SegmentedIndex {
     }
 }
 
-/// Trait uyumu: tek thread'li kullanım için &mut imzalar paylaşımlı
+/// Trait conformance: for single-threaded use, the &mut signatures delegate to
+/// the shared
 /// implementasyona delege eder.
 impl VectorIndex for SegmentedIndex {
     fn insert(&mut self, id: VectorId, vector: &[f32]) -> Result<(), IndexError> {
@@ -1875,12 +1879,12 @@ mod tests {
     fn spans_multiple_segments_and_buffer() {
         let vecs = random_vectors(1_050, 8, 42);
         let idx = build(&vecs, 400); // 2 segment (400+400) + 250 buffer
-        idx.wait_for_background(); // 9a-2: mühürleme arka planda
+        idx.wait_for_background(); // 9a-2: sealing runs in the background
         let (n_seg, n_buf) = idx.shape();
         assert_eq!(n_seg, 2);
         assert_eq!(n_buf, 250);
         assert_eq!(idx.len(), 1_050);
-        // doğruluk: exact referansla yüksek örtüşme
+        // correctness: high agreement with the exact reference
         let queries = random_vectors(20, 8, 43);
         let mut hits = 0;
         for q in &queries {
@@ -1918,7 +1922,7 @@ mod tests {
     fn delete_from_buffer_and_segment() {
         let vecs = random_vectors(500, 4, 42);
         let idx = build(&vecs, 300);
-        // buffer'dan gerçek silme
+        // a real deletion from the buffer
         idx.delete_shared(VectorId(400)).unwrap();
         // segmentten tombstone silme
         idx.delete_shared(VectorId(5)).unwrap();
@@ -1940,12 +1944,12 @@ mod tests {
         idx.delete_shared(VectorId(5)).unwrap();
         idx.insert_shared(VectorId(5), &[9.0; 4]).unwrap();
         assert_eq!(idx.len(), 300);
-        // yeni vektör bulunur, eski kopya gölgede kalır
+        // the new vector is found, the old copy stays shadowed
         let res = idx.search(&[9.0; 4], 1);
         assert_eq!(res[0].id, VectorId(5));
         let old = idx.search(&vecs[5].clone(), 3);
-        // eski konumda id 5 dönerse bu hortlamış eski kopyadır — dönmemeli
-        // (yeni vektör [9;4] eski konumdan uzak)
+        // if id 5 comes back at the old position it is a resurrected old copy —
+        // it must not (the new vector [9;4] is far from the old position)
         assert!(old.iter().all(|r| r.id != VectorId(5)));
     }
 
@@ -1965,8 +1969,9 @@ mod tests {
 
     use crate::meta::{MetaValue, Predicate};
 
-    /// Çift id'li kayıtlar iki kategoriye bölünür; filtreli arama yalnız
-    /// istenen kategoriyi döndürmeli ve brute-force filtreli referansla örtüşmeli.
+    /// Records are split into two categories by id parity; a filtered search must
+    /// return only the requested category and agree with the filtered brute-force
+    /// reference.
     #[test]
     fn filtered_search_matches_reference() {
         let vecs = random_vectors(1_000, 8, 42);
@@ -1975,7 +1980,7 @@ mod tests {
         for (i, v) in vecs.iter().enumerate() {
             let meta: Metadata = [(
                 "grup".to_string(),
-                MetaValue::Str(if i % 2 == 0 { "çift" } else { "tek" }.into()),
+                MetaValue::Str(if i % 2 == 0 { "even" } else { "odd" }.into()),
             )]
             .into();
             idx.insert_with_meta(VectorId(i as u64), v, meta).unwrap();
@@ -1984,7 +1989,7 @@ mod tests {
         let filter = Filter {
             must: vec![Predicate::Eq {
                 key: "grup".into(),
-                value: MetaValue::Str("çift".into()),
+                value: MetaValue::Str("even".into()),
             }],
         };
         let allow = |id: VectorId| id.0.is_multiple_of(2);
@@ -1993,10 +1998,7 @@ mod tests {
         for q in &queries {
             let res = idx.search_filtered(q, 10, &filter);
             assert_eq!(res.len(), 10);
-            assert!(
-                res.iter().all(|r| r.id.0.is_multiple_of(2)),
-                "filtre kaçağı"
-            );
+            assert!(res.iter().all(|r| r.id.0.is_multiple_of(2)), "filter leak");
             let truth: Vec<_> = bf
                 .search_filtered(q, 10, &allow)
                 .iter()
@@ -2006,16 +2008,16 @@ mod tests {
         }
         assert!(
             hits as f64 / 200.0 >= 0.95,
-            "filtreli recall düşük: {hits}/200"
+            "filtered recall too low: {hits}/200"
         );
     }
 
-    /// #53: mühürleme TEK worker'la yapılır ve kuyruk tüketilir.
+    /// #53: sealing runs on a SINGLE worker and the queue is drained.
     ///
-    /// İki şeyi birden ölçer: (a) hiçbir anda birden fazla mühürleme
-    /// çalışmıyor — eski tasarımda 35 tanesi aynı anda koşuyordu (#52);
-    /// (b) kuyruk gerçekten oluştu (yoksa test hiçbir şey kanıtlamaz) ve
-    /// sonunda boşaldı, veri kaybı olmadan.
+    /// Measures two things at once: (a) at no point is more than one sealing
+    /// running — in the old design 35 ran concurrently (#52); (b) a queue really
+    /// did form (otherwise the test proves nothing) and was eventually drained,
+    /// with no data loss.
     #[test]
     fn sealing_worker_is_single_and_queue_drains() {
         let n = 8_000;
@@ -2031,47 +2033,50 @@ mod tests {
         }
         assert!(
             max_in_flight <= 1,
-            "birden fazla mühürleme worker'ı: {max_in_flight}"
+            "more than one sealing worker: {max_in_flight}"
         );
-        assert!(max_queue > 0, "mühürleme kuyruğu hiç oluşmadı: test zayıf");
+        assert!(
+            max_queue > 0,
+            "no sealing queue ever formed: the test is weak"
+        );
         idx.wait_for_background();
-        assert_eq!(idx.sealing_count(), 0, "kuyruk boşalmadı");
-        assert_eq!(idx.len_shared(), n, "mühürlemede veri kayboldu");
+        assert_eq!(idx.sealing_count(), 0, "the queue was not drained");
+        assert_eq!(idx.len_shared(), n, "data was lost during sealing");
     }
 
-    /// #53: backpressure kuyruğu sınırlar — yazma reddedilmez, yavaşlar.
+    /// #53: backpressure bounds the queue — writes are slowed, not rejected.
     ///
-    /// Eşik 2×tavan. Test hem sınırın tutulduğunu hem de stall'ün GERÇEKTEN
-    /// tetiklendiğini doğrular; tetiklenmezse sınır kendiliğinden tutmuş olur
-    /// ve test sessizce hiçbir şey ölçmez.
+    /// The test verifies both that the bound holds and that the stall was
+    /// ACTUALLY triggered; if it never triggers, the bound holds by itself and
+    /// the test silently measures nothing.
     #[test]
     fn backpressure_bounds_the_sealing_queue() {
         let n = 8_000;
         let vecs = random_vectors(n, 16, 7);
         let mut idx = SegmentedIndex::new(16, Metric::L2, HnswParams::default(), 100);
         idx.set_max_segments(2);
-        let limit = 2; // kuyruk eşiği (#56: sinyal segment sayısı DEĞİL)
+        let limit = 2; // the queue threshold (#56: the signal is NOT the segment count)
         let mut max_queue = 0;
         for (i, v) in vecs.iter().enumerate() {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
             max_queue = max_queue.max(idx.sealing_count());
         }
         let (stalls, stall_us) = idx.stall_stats();
-        assert!(stalls > 0, "backpressure hiç devreye girmedi: test zayıf");
-        assert!(stall_us > 0, "stall süresi ölçülmedi");
-        // Bekleme mühürlemeden SONRA yapıldığı için sınır bir eleman aşılabilir.
+        assert!(stalls > 0, "backpressure never kicked in: the test is weak");
+        assert!(stall_us > 0, "stall duration was not measured");
+        // Since the wait happens AFTER sealing, the bound can be exceeded by one.
         assert!(
             max_queue <= limit + 1,
-            "kuyruk sınırı aşıldı: {max_queue} > {}",
+            "queue bound exceeded: {max_queue} > {}",
             limit + 1
         );
         idx.wait_for_background();
-        assert_eq!(idx.len_shared(), n, "backpressure altında veri kayboldu");
+        assert_eq!(idx.len_shared(), n, "data was lost under backpressure");
     }
 
-    /// #61 regresyonu: buffer'ı eşik kadar ÖNCEDEN ayırmak, eşiğin
-    /// "pratikte mühürleme yok" anlamında `usize::MAX` verildiği yerlerde
-    /// kapasite taşmasıyla panik veriyordu. Ayırma bayt cinsinden sınırlı.
+    /// A #61 regression: pre-allocating the buffer up to the threshold panicked
+    /// with a capacity overflow wherever the threshold is given as `usize::MAX`
+    /// to mean "no sealing in practice". The allocation is now bounded in bytes.
     #[test]
     fn huge_seal_threshold_does_not_panic() {
         let idx = SegmentedIndex::new(128, Metric::L2, HnswParams::default(), usize::MAX);
@@ -2080,8 +2085,8 @@ mod tests {
         assert_eq!(idx.len_shared(), 1);
     }
 
-    /// Aşırı seçici filtre (tek eşleşme): fallback doğrusal tarama devreye
-    /// girmeli ve o tek kaydı bulmalı.
+    /// A highly selective filter (a single match): the fallback linear scan must
+    /// kick in and find that one record.
     #[test]
     fn highly_selective_filter_falls_back_to_exact() {
         let vecs = random_vectors(2_000, 8, 42);
@@ -2099,7 +2104,7 @@ mod tests {
         let res = idx.search_filtered(&random_vectors(1, 8, 43)[0], 5, &filter);
         assert_eq!(res.len(), 1);
         assert_eq!(res[0].id, VectorId(1_234));
-        // hiç eşleşme yoksa boş dönmeli
+        // must return empty when there is no match at all
         let none = Filter {
             must: vec![Predicate::Eq {
                 key: "yok".into(),
@@ -2109,7 +2114,8 @@ mod tests {
         assert!(idx.search_filtered(&vecs[0].clone(), 5, &none).is_empty());
     }
 
-    /// Silinen kaydın metadata'sı düşer; aynı id yeni metadata ile dönebilir.
+    /// A deleted record's metadata is dropped; the same id can come back with
+    /// new metadata.
     #[test]
     fn delete_drops_metadata_reinsert_gets_fresh() {
         let vecs = random_vectors(100, 4, 42);
@@ -2136,14 +2142,15 @@ mod tests {
         assert_eq!(res[0].id, VectorId(7));
     }
 
-    // ---- 9a-2: arka plan mühürleme + "iki buffer" durumu ----
+    // ---- 9a-2: background sealing + the "two buffers" state ----
 
-    /// 9a-2'nin yapısal riski (DECISIONS #50): mühürleme arka plana geçince
-    /// mühürlenmekte olan buffer ile yeni buffer birlikte yaşar. ÜÇ yol da
-    /// bu kaynağı gezmeli: arama, duplicate-id ve delete.
+    /// The structural risk of 9a-2 (DECISIONS #50): once sealing moves to the
+    /// background, the buffer being sealed and the new buffer coexist. ALL THREE
+    /// paths must walk this source: search, duplicate-id and delete.
     ///
-    /// Test 9a-1 kalıbında: "iki buffer durumu gerçekten oluştu mu" içeride
-    /// doğrulanır (`seal_in_flight() > 0`), aksi halde test sessizce zayıflar.
+    /// The test follows the 9a-1 pattern: "did the two-buffer state actually
+    /// occur" is asserted inside (`seal_in_flight() > 0`), otherwise the test
+    /// silently weakens.
     #[test]
     fn sealing_window_covers_search_duplicate_and_delete() {
         let vecs = random_vectors(6_000, 16, 42);
@@ -2151,41 +2158,53 @@ mod tests {
         for (i, v) in vecs.iter().take(5_000).enumerate() {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
         }
-        // 5.000'inci insert mühürlemeyi tetikledi; inşa arka planda sürüyor.
+        // The 5,000th insert triggered sealing; the build is running in the
+        // background.
         assert!(
             idx.seal_in_flight() > 0,
-            "iki buffer durumu OLUŞMADI — test sessizce zayıflamış"
+            "the two-buffer state did NOT occur — the test has silently weakened"
         );
-        assert_eq!(idx.sealing_count(), 1, "mühürlenen buffer görünmüyor");
+        assert_eq!(
+            idx.sealing_count(),
+            1,
+            "the buffer being sealed is not visible"
+        );
 
-        // (a) ARAMA: mühürlenmekte olan veri görünür kalmalı.
+        // (a) SEARCH: the data being sealed must stay visible.
         let res = idx.search_shared(&vecs[42], 1);
         assert_eq!(
             res[0].id,
             VectorId(42),
-            "mühürleme penceresinde veri görünmez oldu"
+            "data became invisible during the sealing window"
         );
-        assert_eq!(idx.len(), 5_000, "mühürlenen kayıtlar sayımdan düştü");
+        assert_eq!(
+            idx.len(),
+            5_000,
+            "records being sealed dropped out of the count"
+        );
 
-        // (b) DUPLICATE-ID (en sinsisi): mühürlenmekte olan buffer'daki id
+        // (b) DUPLICATE-ID (the sneakiest): an id in the buffer being sealed
         // yeni buffer'a ikinci kez eklenememeli.
         assert!(
             matches!(
                 idx.insert_shared(VectorId(42), &vecs[42]),
                 Err(IndexError::DuplicateId(_))
             ),
-            "mühürlenen buffer'daki id yeniden eklendi — çakışma mühürleme              bitince ortaya çıkardı ve iki kopya da kalıcı olurdu"
+            "an id from the buffer being sealed was re-inserted — the collision \
+             would only surface once sealing finished, and both copies would be \
+             permanent"
         );
 
-        // (c) DELETE: mühürlenmekte olan kayıt silinebilmeli ve silme
-        // inşa bitince diff-replay ile birleşiğe taşınmalı.
+        // (c) DELETE: a record being sealed must be deletable, and the deletion
+        // must be carried into the merged segment by diff-replay once the build
+        // finishes.
         idx.delete_shared(VectorId(100)).unwrap();
         assert_eq!(idx.len(), 4_999);
         // Yeni buffer'a yazmaya devam edilebilmeli.
         idx.insert_shared(VectorId(9_000), &vecs[5_500]).unwrap();
 
         idx.wait_for_background();
-        assert_eq!(idx.sealing_count(), 0, "mühürleme listesi boşalmadı");
+        assert_eq!(idx.sealing_count(), 0, "the sealing list was not drained");
         let all: HashSet<VectorId> = idx
             .search_shared(&vecs[100], 6_000)
             .iter()
@@ -2193,14 +2212,18 @@ mod tests {
             .collect();
         assert!(
             !all.contains(&VectorId(100)),
-            "mühürleme sırasında yapılan silme diff-replay'de KAYBOLDU"
+            "a deletion made during sealing was LOST in diff-replay"
         );
-        assert!(all.contains(&VectorId(9_000)), "yeni buffer kaydı kayboldu");
+        assert!(
+            all.contains(&VectorId(9_000)),
+            "a record from the new buffer was lost"
+        );
         assert_eq!(idx.len(), 5_000); // 5000 - 1 silme + 1 yeni
     }
 
-    /// Mühürleme sürerken sürekli arama: sonuçlar hiçbir anda kaybolmamalı
-    /// (okuyucu ya mühürlenen buffer'ı ya oluşan segmenti görür).
+    /// Continuous searching while sealing is in progress: results must never
+    /// disappear at any instant (a reader sees either the buffer being sealed or
+    /// the segment it becomes).
     #[test]
     fn searches_never_lose_data_during_sealing() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2214,7 +2237,10 @@ mod tests {
         for (i, v) in vecs.iter().take(3_000).enumerate() {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
         }
-        assert!(idx.seal_in_flight() > 0, "mühürleme penceresi yakalanamadı");
+        assert!(
+            idx.seal_in_flight() > 0,
+            "the sealing window was not caught"
+        );
         let stop = AtomicBool::new(false);
         let missing = AtomicUsize::new(0);
         let saw_sealing = AtomicUsize::new(0);
@@ -2241,26 +2267,27 @@ mod tests {
         });
         assert!(
             saw_sealing.load(Ordering::Relaxed) > 0,
-            "okuyucular mühürleme penceresini hiç görmedi — test zayıf"
+            "the readers never saw the sealing window — the test is weak"
         );
         assert_eq!(
             missing.load(Ordering::Relaxed),
             0,
-            "mühürleme sırasında kayıt geçici olarak KAYBOLDU"
+            "a record temporarily DISAPPEARED during sealing"
         );
     }
 
-    // ---- 9a-1: arka plan merge + tombstone yarışı ----
+    // ---- 9a-1: background merge + the tombstone race ----
 
-    /// 9a-1'in ASIL kabul kriteri: merge SÜRERKEN kaynak segmentlere düşen
-    /// tombstone'lar kaybolmamalı. Merge inşası kaynakların o anki canlı
-    /// kayıtlarını kopyalar; inşa sırasında silinen kayıtlar birleşiğe canlı
-    /// olarak geçer ve diff-replay onları tombstone'lamazsa **sessizce geri
-    /// gelir**. Latency ölçümü bunu asla yakalamaz.
+    /// The REAL acceptance criterion of 9a-1: tombstones landing on the source
+    /// segments WHILE a merge runs must not be lost. The merge rebuild copies the
+    /// sources' live records as of that moment; records deleted during the build
+    /// pass into the merged segment as live, and unless diff-replay tombstones
+    /// them they **silently come back**. A latency measurement would never catch
+    /// this.
     #[test]
     fn merge_carries_tombstones_created_during_build() {
-        // Merge'i uzun tutmak için görece büyük segmentler; silmeleri merge
-        // penceresine denk getirmek için yazıcı thread'i merge başladıktan
+        // Relatively large segments so the merge takes a while; to land the
+        // deletions inside the merge window, the writer thread
         // sonra siler.
         let vecs = random_vectors(3_000, 16, 42);
         let mut idx = SegmentedIndex::new(16, Metric::L2, HnswParams::default(), 500);
@@ -2269,15 +2296,16 @@ mod tests {
         for (i, v) in vecs.iter().enumerate() {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
         }
-        // 9a-2: mühürlemeler de arka planda. Merge ancak segmentler oluşunca
-        // tetiklenir, o yüzden önce mühürlemelerin bitmesini bekliyoruz.
+        // 9a-2: sealing runs in the background too. A merge is only triggered
+        // once segments exist, so we first wait for the sealings to finish.
         idx.wait_for_seal();
-        // Bu noktada 6 segment mühürlendi, tavan 4 → merge arka planda başladı.
-        // Merge sürerken sil: kurbanlar en küçük iki segment, hangi id'lerin
-        // onlara düştüğünü bilmediğimiz için geniş bir aralığı siliyoruz.
+        // At this point 6 segments were sealed and the ceiling is 4 → a merge has
+        // started in the background. Delete while it runs: the victims are the two
+        // smallest segments, and since we do not know which ids landed in them we
+        // delete over a wide range.
         let mut deleted: Vec<VectorId> = Vec::new();
         let mut i = 0u64;
-        let mut during_merge = 0usize; // yarışın gerçekten tetiklendiğini doğrular
+        let mut during_merge = 0usize; // proves the race was actually triggered
         while idx.merge_in_flight() && i < 400 {
             during_merge += 1;
             let id = VectorId(i);
@@ -2286,8 +2314,8 @@ mod tests {
             }
             i += 1;
         }
-        // Merge devam etmiyorsa da en az birkaç silme yapalım (yarış her
-        // koşuda tetiklenmeyebilir; test yine de doğruluğu sınar).
+        // Do at least a few deletions even if no merge is running (the race may
+        // not trigger on every run; the test still checks correctness).
         for extra in i..(i + 50).min(3_000) {
             let id = VectorId(extra);
             if idx.delete_shared(id).is_ok() {
@@ -2296,12 +2324,12 @@ mod tests {
         }
         idx.wait_for_merge();
 
-        assert!(!deleted.is_empty(), "hiç silme yapılamadı");
+        assert!(!deleted.is_empty(), "no deletion could be performed");
         assert!(
             during_merge > 0,
-            "merge penceresi yakalanamadı — yarış SINANMADI, test sessizce zayıflamış"
+            "the merge window was not caught — the race was NOT exercised, the test has silently weakened"
         );
-        // 1) Silinenlerin HİÇBİRİ aramada dönmemeli.
+        // 1) NONE of the deleted ids may come back in a search.
         let all: HashSet<VectorId> = idx
             .search_shared(&vecs[0], 3_000)
             .iter()
@@ -2310,23 +2338,27 @@ mod tests {
         for id in &deleted {
             assert!(
                 !all.contains(id),
-                "silinen {id:?} merge sonrası geri geldi (diff-replay kaçağı)"
+                "deleted {id:?} came back after the merge (a diff-replay leak)"
             );
         }
-        // 2) len tutarlı olmalı.
-        assert_eq!(idx.len(), 3_000 - deleted.len(), "canlı sayı tutarsız");
-        // 3) Silinmeyenler hâlâ bulunabilmeli.
+        // 2) len must be consistent.
+        assert_eq!(
+            idx.len(),
+            3_000 - deleted.len(),
+            "the live count is inconsistent"
+        );
+        // 3) The non-deleted ones must still be findable.
         let deleted_set: HashSet<VectorId> = deleted.iter().copied().collect();
         let survivor = (0..3_000u64)
             .map(VectorId)
             .find(|id| !deleted_set.contains(id))
             .expect("hayatta kalan yok");
         let res = idx.search_shared(&vecs[survivor.0 as usize], 1);
-        assert_eq!(res[0].id, survivor, "hayatta kalan kayıt kayboldu");
+        assert_eq!(res[0].id, survivor, "a surviving record disappeared");
     }
 
-    /// Merge arka planda çalışırken aramalar durmamalı ve tutarlı sonuç
-    /// vermeli (okuyucular ya eski ikiliyi ya birleşiği görür).
+    /// While a merge runs in the background, searches must not stop and must
+    /// stay consistent (readers see either the old pair or the merged segment).
     #[test]
     fn searches_stay_consistent_during_background_merge() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -2345,7 +2377,7 @@ mod tests {
                 let vecs = &vecs;
                 sc.spawn(move || {
                     while !stop.load(Ordering::Relaxed) {
-                        // Her sorgunun kendi vektörü ilk sırada dönmeli
+                        // each query's own vector must come back first
                         for probe in [7usize, 500, 1200, 2400] {
                             let r = idx.search_shared(&vecs[probe], 1);
                             if r.is_empty() || r[0].id != VectorId(probe as u64) {
@@ -2361,12 +2393,12 @@ mod tests {
         assert_eq!(
             mismatch.load(Ordering::Relaxed),
             0,
-            "merge sırasında arama tutarsız sonuç verdi"
+            "a search returned an inconsistent result during the merge"
         );
         assert_eq!(idx.len(), 2_500);
     }
 
-    // ---- Kalıcılık: soğuk yol testleri (Aşama 7a) ----
+    // ---- Persistence: cold-path tests (phase 7a) ----
 
     fn meta_of(i: usize) -> Metadata {
         [
@@ -2397,16 +2429,20 @@ mod tests {
             let before: Vec<Vec<SearchResult>> =
                 queries.iter().map(|q| idx.search_shared(q, 10)).collect();
             let gen = idx.checkpoint().unwrap();
-            // checkpoint mühürlemesi sonuçları değiştirmemeli
+            // the sealing done by a checkpoint must not change results
             for (q, b) in queries.iter().zip(&before) {
-                assert_eq!(&idx.search_shared(q, 10), b, "checkpoint sonuçları bozdu");
+                assert_eq!(
+                    &idx.search_shared(q, 10),
+                    b,
+                    "the checkpoint corrupted the results"
+                );
             }
             gen
         };
-        // yeniden aç
+        // reopen
         let idx = SegmentedIndex::open_or_create(
             dir.clone(),
-            999, // yanlış dim: manifest'teki kazanmalı
+            999, // a wrong dim: the manifest's value must win
             Metric::Dot,
             HnswParams::default(),
             1,
@@ -2414,8 +2450,12 @@ mod tests {
         .unwrap();
         assert_eq!(idx.generation(), gen);
         assert_eq!(idx.len(), 800);
-        assert_eq!(idx.shape().1, 0, "checkpoint sonrası buffer boş olmalı");
-        // Aynı sorgular birebir aynı sonuçları vermeli
+        assert_eq!(
+            idx.shape().1,
+            0,
+            "the buffer must be empty after a checkpoint"
+        );
+        // The same queries must give exactly the same results
         let fresh = SegmentedIndex::new(8, Metric::L2, HnswParams::default(), 200);
         for (i, v) in vecs.iter().enumerate() {
             fresh
@@ -2426,7 +2466,7 @@ mod tests {
         for q in &queries {
             assert_eq!(idx.search_shared(q, 10), fresh.search_shared(q, 10));
         }
-        // türetilmiş indeksler yeniden kurulmuş olmalı: Eq + Range filtreleri
+        // the derived indexes must have been rebuilt: Eq + Range filters
         let f_eq = Filter {
             must: vec![Predicate::Eq {
                 key: "grup".into(),
@@ -2437,7 +2477,7 @@ mod tests {
         assert_eq!(res.len(), 10);
         assert!(
             res.iter().all(|r| r.id.0 % 4 == 2),
-            "Eq posting yeniden kurulmadı"
+            "the Eq posting list was not rebuilt"
         );
         let f_range = Filter {
             must: vec![Predicate::Range {
@@ -2473,7 +2513,8 @@ mod tests {
                 n.starts_with("segment-").then_some(n)
             })
             .collect();
-        // ikinci tur: yeni veri → yeni segment, eskiler AYNI dosyada kalmalı
+        // second round: new data → a new segment, the old ones must stay in the
+        // SAME files
         for (i, v) in vecs.iter().enumerate().skip(400) {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
         }
@@ -2489,10 +2530,10 @@ mod tests {
         for f in &first {
             assert!(
                 second.contains(f),
-                "eski segment yeniden yazıldı/silindi: {f} (değişmezlik ihlali)"
+                "an old segment was rewritten/deleted: {f} (immutability violation)"
             );
         }
-        assert!(second.len() > first.len(), "yeni segment yazılmadı");
+        assert!(second.len() > first.len(), "no new segment was written");
     }
 
     #[test]
@@ -2525,7 +2566,10 @@ mod tests {
             .iter()
             .map(|r| r.id)
             .collect();
-        assert!(!all.contains(&VectorId(7)), "tombstone kurtarılmadı");
+        assert!(
+            !all.contains(&VectorId(7)),
+            "the tombstone was not recovered"
+        );
         assert!(!all.contains(&VectorId(200)));
         // silinen metadata da geri gelmemeli
         let f = Filter {
@@ -2562,15 +2606,15 @@ mod tests {
                 p.file_name()
                     .is_some_and(|n| n.to_string_lossy().starts_with("segment-"))
             })
-            .expect("segment dosyası");
+            .expect("segment file");
         let mut bytes = std::fs::read(&seg_file).unwrap();
         let mid = bytes.len() / 2;
         bytes[mid] ^= 0xff;
         std::fs::write(&seg_file, &bytes).unwrap();
         let err =
             SegmentedIndex::open_or_create(dir.clone(), 4, Metric::L2, HnswParams::default(), 100);
-        assert!(err.is_err(), "bozuk segment yakalanmalıydı");
-        // kesik dosya da panic üretmemeli
+        assert!(err.is_err(), "a corrupt segment should have been caught");
+        // a truncated file must not panic either
         std::fs::write(&seg_file, &bytes[..bytes.len() / 3]).unwrap();
         assert!(
             SegmentedIndex::open_or_create(dir, 4, Metric::L2, HnswParams::default(), 100).is_err()
@@ -2595,13 +2639,13 @@ mod tests {
                 idx.insert_shared(VectorId(i as u64), v).unwrap();
             }
             idx.checkpoint().unwrap();
-            // merge'ler tavanı korumuş olmalı
+            // the merges must have kept the ceiling
             idx.wait_for_merge(); // 9a-1: merge arka planda, bekle
             assert!(idx.shape().0 <= 4);
             let g = idx.checkpoint().unwrap();
             (idx.len(), g)
         };
-        // GC: manifest'te olmayan segment dosyası kalmamalı
+        // GC: no segment file absent from the manifest may remain
         let manifest = Manifest::read(&dir).unwrap().unwrap();
         assert_eq!(manifest.generation, gen);
         let on_disk: Vec<String> = std::fs::read_dir(&dir)
@@ -2614,7 +2658,7 @@ mod tests {
         assert_eq!(
             on_disk.len(),
             manifest.segments.len(),
-            "yetim segment dosyası kaldı: {on_disk:?}"
+            "an orphaned segment file remained: {on_disk:?}"
         );
         let idx =
             SegmentedIndex::open_or_create(dir, 4, Metric::L2, HnswParams::default(), 100).unwrap();
@@ -2627,7 +2671,7 @@ mod tests {
         assert!(idx.checkpoint().is_err());
     }
 
-    // ---- Segment tavanı / merge testleri ----
+    // ---- Segment ceiling / merge tests ----
 
     #[test]
     fn merge_guard_enforces_ceiling() {
@@ -2637,14 +2681,18 @@ mod tests {
         for (i, v) in vecs.iter().enumerate() {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
         }
-        // 9a-1: merge artık arka planda. Mühürleme merge'den hızlı olduğu
-        // için segment sayısı GEÇİCİ olarak tavanı aşabilir; yazma durunca
-        // worker tavana indirir. Tavan kontrolü bu yüzden bekleyerek yapılır.
+        // 9a-1: merging now runs in the background. Because sealing is faster
+        // than merging, the segment count can TEMPORARILY exceed the ceiling; once
+        // writing stops the worker brings it back down. So the ceiling check waits
+        // first.
         idx.wait_for_merge();
         let (n_seg, _) = idx.shape();
-        assert!(n_seg <= 4, "merge bitince tavan korunmalı: {n_seg}");
-        assert_eq!(idx.len(), 1_200, "merge kayıt kaybetti");
-        // doğruluk: exact referansla örtüşme
+        assert!(
+            n_seg <= 4,
+            "the ceiling must hold once merging finishes: {n_seg}"
+        );
+        assert_eq!(idx.len(), 1_200, "the merge lost records");
+        // correctness: agreement with the exact reference
         let queries = random_vectors(20, 8, 43);
         let mut hits = 0;
         for q in &queries {
@@ -2660,7 +2708,7 @@ mod tests {
         }
         assert!(
             hits as f64 / 200.0 >= 0.95,
-            "merge sonrası recall: {hits}/200"
+            "recall after merge: {hits}/200"
         );
     }
 
@@ -2672,19 +2720,20 @@ mod tests {
         for (i, v) in vecs.iter().take(300).enumerate() {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
         }
-        // segmentlere düşmüş kayıtlardan sil + birini yeni vektörle geri ekle
+        // delete records that landed in segments + re-insert one with a new vector
         idx.delete_shared(VectorId(5)).unwrap();
         idx.delete_shared(VectorId(50)).unwrap();
         idx.insert_shared(VectorId(5), &[9.0; 4]).unwrap();
-        // tavanı zorlayacak kadar ekle → merge'ler tetiklenir
+        // insert enough to press against the ceiling → merges are triggered
         for (i, v) in vecs.iter().enumerate().skip(300) {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
         }
         idx.wait_for_merge(); // merge arka planda (9a-1)
         let (n_seg, _) = idx.shape();
         assert!(n_seg <= 3);
-        assert_eq!(idx.len(), 599); // 600 - 1 kalıcı silme
-                                    // silinen id dönmüyor, yeniden eklenen yeni vektörüyle dönüyor
+        assert_eq!(idx.len(), 599); // 600 - 1 permanent deletion
+                                    // the deleted id does not come back; the
+                                    // re-inserted one returns with its new vector
         let all: Vec<_> = idx
             .search_shared(&[9.0; 4], 599)
             .iter()
@@ -2694,9 +2743,10 @@ mod tests {
         assert_eq!(idx.search_shared(&[9.0; 4], 1)[0].id, VectorId(5));
     }
 
-    /// Kabul kriteri (DECISIONS #31): Range'li sorgularda seçilen kol, gerçek
-    /// kardinaliteyle seçilecek kolla örtüşmeli. Sınırlı sayım tasarımı bunu
-    /// scan sınırında yapısal olarak garanti eder; test yine de belgeler.
+    /// Acceptance criterion (DECISIONS #31): for queries with a Range, the arm
+    /// chosen must agree with the arm that the true cardinality would select. The
+    /// bounded-counting design guarantees this structurally at the scan boundary;
+    /// the test documents it anyway.
     #[test]
     fn range_planner_arm_matches_oracle() {
         let vecs = random_vectors(2_000, 4, 42);
@@ -2723,7 +2773,7 @@ mod tests {
             };
             let oracle = if m <= scan_limit { "scan" } else { "post" };
             assert_eq!(idx.debug_plan_arm(&f, k), oracle, "m={m}");
-            // ve sonuçlar exact referansla doğru
+            // and the results are correct against the exact reference
             let allow = |id: VectorId| (id.0 as usize) < m;
             let q = &vecs[m / 2];
             let truth: Vec<_> = {
@@ -2740,7 +2790,7 @@ mod tests {
             let hit = got.iter().filter(|id| truth.contains(id)).count();
             assert!(hit * 10 >= truth.len() * 9, "m={m}: {hit}/{}", truth.len());
         }
-        // Range'de sıfır eşleşme → boş
+        // zero matches in the Range → empty
         let f_empty = Filter {
             must: vec![Predicate::Range {
                 key: "v".into(),
@@ -2754,7 +2804,7 @@ mod tests {
     }
 
     /// Posting-list'ler her mutasyon dizisinden sonra metadata deposuyla
-    /// birebir tutarlı olmalı (planlayıcının tahmini buna dayanıyor).
+    /// must stay exactly consistent (the planner's estimate rests on it).
     #[test]
     fn postings_consistent_after_insert_delete_reinsert() {
         let vecs = random_vectors(200, 4, 42);
@@ -2766,7 +2816,7 @@ mod tests {
         for i in (0..200).step_by(3) {
             idx.delete_shared(VectorId(i)).unwrap();
         }
-        // birkaç yeniden ekleme, farklı grupla
+        // a few re-insertions, with a different group
         for i in (0..30).step_by(3) {
             idx.insert_with_meta(
                 VectorId(i),
@@ -2775,7 +2825,7 @@ mod tests {
             )
             .unwrap();
         }
-        // yeniden say ve karşılaştır
+        // recount and compare
         let meta_store = idx.metadata.read().unwrap();
         let postings = idx.postings.read().unwrap();
         for ((key, mk), list) in postings.iter() {
@@ -2785,10 +2835,10 @@ mod tests {
                 .map(|(id, _)| id)
                 .collect();
             recount.sort();
-            // Sıralı olduğu da doğrulanıyor: ikili arama buna dayanıyor.
-            assert_eq!(*list, recount, "posting tutarsız: {key}/{mk:?}");
+            // Sortedness is verified too: binary search depends on it.
+            assert_eq!(*list, recount, "posting list inconsistent: {key}/{mk:?}");
         }
-        // tahmin, gerçek eşleşme sayısına eşit (tek Eq'de kesin)
+        // the estimate equals the true match count (exact for a single Eq)
         let f = Filter {
             must: vec![Predicate::Eq {
                 key: "g".into(),
@@ -2800,9 +2850,10 @@ mod tests {
         assert_eq!(cands.len(), 10);
     }
 
-    /// Stres testi: çok okuyucu + tek yazıcı. Yazıcı insert+delete yaparken
-    /// okuyucular sürekli arar; hiçbir panic olmamalı ve sonuçlar temel
-    /// tutarlılık kurallarına uymalı (dup id yok, NaN yok, k aşımı yok).
+    /// Stress test: many readers + a single writer. While the writer inserts and
+    /// deletes, the readers search continuously; nothing may panic and the results
+    /// must obey the basic consistency rules (no duplicate ids, no NaN, never more
+    /// than k).
     #[test]
     fn stress_concurrent_readers_single_writer() {
         let dim = 16;
@@ -2810,13 +2861,14 @@ mod tests {
             dim,
             Metric::L2,
             HnswParams {
-                ef_construction: 40, // stres testinde inşa hızı > graf kalitesi
+                ef_construction: 40, // in a stress test build speed matters more
+                // than graph quality
                 ..Default::default()
             },
             500,
         ));
         let vecs = random_vectors(4_000, dim, 42);
-        // başlangıç yükü
+        // initial load
         for (i, v) in vecs.iter().take(1_000).enumerate() {
             idx.insert_shared(VectorId(i as u64), v).unwrap();
         }
@@ -2838,9 +2890,9 @@ mod tests {
                         let mut seen = HashSet::new();
                         for r in &res {
                             assert!(!r.distance.is_nan());
-                            assert!(seen.insert(r.id), "duplicate id sonuçta");
+                            assert!(seen.insert(r.id), "duplicate id in the results");
                         }
-                        // sonuçlar artan mesafeli olmalı
+                        // results must be in ascending distance order
                         for w in res.windows(2) {
                             assert!(w[0].distance <= w[1].distance);
                         }
@@ -2849,26 +2901,27 @@ mod tests {
                     assert!(iters > 0);
                 });
             }
-            // tek yazıcı: 3.000 insert (5+ mühürleme tetikler) + aralıklı silme
+            // a single writer: 3,000 inserts (triggering 5+ sealings) plus
+            // intermittent deletions
             for (i, v) in vecs.iter().enumerate().skip(1_000) {
                 idx.insert_shared(VectorId(i as u64), v).unwrap();
                 if i % 7 == 0 {
-                    // daha önce eklenmiş bir id'yi sil
+                    // delete a previously inserted id
                     let victim = VectorId((i / 2) as u64);
-                    let _ = idx.delete_shared(victim); // zaten silinmişse NotFound: sorun değil
+                    let _ = idx.delete_shared(victim); // NotFound if already gone: fine
                 }
             }
-            // 9a-2: yazma yolu artık mühürlemeyi beklemediği için 2.000 insert
-            // milisaniyelerde bitiyor ve okuyucular hiç iş yapamadan test
-            // sonlanıyordu (iters == 0). Okuyuculara pencere bırak.
+            // 9a-2: since the write path no longer waits for sealing, 2,000
+            // inserts finish in milliseconds and the test used to end before the
+            // readers did any work at all (iters == 0). Leave them a window.
             std::thread::sleep(std::time::Duration::from_millis(50));
             stop.store(true, Ordering::Relaxed);
         });
 
         idx.wait_for_background();
         let (n_seg, _) = idx.shape();
-        assert!(n_seg >= 3, "mühürleme hiç tetiklenmemiş: {n_seg}");
-        // yazıcı bittikten sonra arama deterministik ve sağlıklı
+        assert!(n_seg >= 3, "sealing was never triggered: {n_seg}");
+        // after the writer finishes, searching is deterministic and healthy
         let res = idx.search_shared(&queries[0], 10);
         assert_eq!(res.len(), 10);
     }
